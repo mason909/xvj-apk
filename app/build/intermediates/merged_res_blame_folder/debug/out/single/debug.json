@@ -1,0 +1,42 @@
+[
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/mipmap-anydpi-v26_ic_launcher_foreground.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/mipmap-anydpi-v26/ic_launcher_foreground.xml"
+    },
+    {
+        "merged": "com.xvj.app-merged_res-35:/layout_activity_main.xml.flat",
+        "source": "com.xvj.app-main-37:/layout/activity_main.xml"
+    },
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/layout_item_folder.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/layout/item_folder.xml"
+    },
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/layout_activity_main.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/layout/activity_main.xml"
+    },
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/mipmap-anydpi-v26_ic_launcher.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/mipmap-anydpi-v26/ic_launcher.xml"
+    },
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/drawable_circle_button_bg.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/drawable/circle_button_bg.xml"
+    },
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/layout_activity_settings.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/layout/activity_settings.xml"
+    },
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/mipmap-anydpi-v26_ic_launcher_round.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/mipmap-anydpi-v26/ic_launcher_round.xml"
+    },
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/drawable_ic_launcher_foreground.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/drawable/ic_launcher_foreground.xml"
+    },
+    {
+        "merged": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-merged_res-35:/layout_activity_folder_manager.xml.flat",
+        "source": "/home/minimax/.gradle/daemon/8.2/com.xvj.app-main-37:/layout/activity_folder_manager.xml"
+    }
+]
