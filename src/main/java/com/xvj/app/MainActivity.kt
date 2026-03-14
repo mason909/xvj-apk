@@ -295,15 +295,23 @@ class MainActivity : AppCompatActivity() {
             try {
                 Log.d(TAG, "Connecting to MQTT: $mqttServer")
                 logToFile("MQTT connecting to $mqttServer...")
+                
                 mqttClient = MqttClient(mqttServer, mqttClientId, null)
-                val commandTopic = "xvj/device/$deviceId/command"
                 val options = MqttConnectOptions()
                 options.isCleanSession = true
                 options.connectionTimeout = 30
                 options.keepAliveInterval = 60
-                // Paho MQTT库的setWill是protected，暂不使用离线消息功能
+                
+                // 设置will消息 - 设备离线时通知
+                val willTopic = "xvj/device/$deviceId/status"
+                val willMessage = MqttMessage("{\"status\":\"offline\",\"fingerprint\":\"$deviceFingerprint\"}".toByteArray())
+                // will消息已移除 - 避免protected方法访问问题
+                // options.setWill(willTopic, willMessage, 1, false)
                 
                 mqttClient?.connect(options)
+                
+                // 订阅设备命令主题
+                val commandTopic = "xvj/device/$deviceId/command"
                 mqttClient?.subscribe(commandTopic, 0)
                 
                 // 订阅授权响应主题
@@ -374,7 +382,7 @@ class MainActivity : AppCompatActivity() {
                 put("mac", getMacAddress())
                 put("timestamp", System.currentTimeMillis())
             }
-            mqttClient?.publish(registerTopic, payload.toString().toByteArray(), 1, false)
+            mqttClient?.publish(registerTopic, payload.toString(), 1, false)
             Log.d(TAG, "Device registration sent: $deviceId")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register device: ${e.message}")
@@ -762,7 +770,7 @@ class MainActivity : AppCompatActivity() {
         try {
             // 发送离线消息
             val offlineTopic = "xvj/device/$deviceId/status"
-            mqttClient?.publish(offlineTopic, "{\"status\":\"offline\"}".toByteArray(), 1, false)
+            mqttClient?.publish(offlineTopic, "{\"status\":\"offline\"}", 1, false)
             mqttClient?.disconnect()
             mqttClient?.close()
         } catch (e: Exception) {}

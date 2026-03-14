@@ -22,11 +22,11 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
     }
     kotlinOptions {
-        jvmTarget = '1.8'
+        jvmTarget = '21'
     }
     buildFeatures {
         viewBinding true
@@ -40,6 +40,9 @@ dependencies {
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation 'androidx.recyclerview:recyclerview:1.3.2'
     implementation 'com.google.android.exoplayer:exoplayer:2.19.1'
+    
+    // Lifecycle for Service
+    implementation 'androidx.lifecycle:lifecycle-service:2.7.0'
     
     // MQTT for cloud connection
     implementation 'org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5'
