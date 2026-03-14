@@ -10,18 +10,42 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
     
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
         distribution: 'temurin'
+        cache: 'gradle'
+    
+    - name: Set up Android SDK
+      uses: android-actions/setup-android@v3
+    
+    - name: Create local.properties
+      run: |
+        echo "sdk.dir=$ANDROID_HOME" > local.properties
+    
+    - name: Fix repositories for CI
+      run: |
+        # Replace Aliyun mirrors with standard repositories in settings.gradle
+        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/google'\'' }|google()|g' settings.gradle
+        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/central'\'' }|mavenCentral()|g' settings.gradle
+        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/gradle-plugin'\'' }|gradlePluginPortal()|g' settings.gradle
+        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/public'\'' }|mavenCentral()|g' settings.gradle
+        
+        # Also fix build.gradle if it has any Aliyun mirrors
+        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/google'\'' }|google()|g' build.gradle
+        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/central'\'' }|mavenCentral()|g' build.gradle
+        
+        cat settings.gradle
+    
+    - name: Grant execute permission for Gradle wrapper
+      run: chmod +x gradlew
     
     - name: Build with Gradle
-      run: |
-        chmod +x gradlew
-        ./gradlew assembleDebug
+      run: ./gradlew assembleDebug --no-daemon --warning-mode=all
     
     - name: Upload APK
       uses: actions/upload-artifact@v4
@@ -33,6 +57,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
     steps:
     - name: Download APK
@@ -41,7 +66,7 @@ jobs:
         name: app-debug
     
     - name: Create Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: app-debug.apk
         generate_release_notes: true
