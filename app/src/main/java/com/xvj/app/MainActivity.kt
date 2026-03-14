@@ -47,7 +47,9 @@ class MainActivity : AppCompatActivity() {
     private var deviceId: String = ""
     private var mqttClient: MqttClient? = null
     private val mqttHandler = Handler(Looper.getMainLooper())
+    private val statusHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
+    private var statusTimerRunnable: Runnable? = null
     
     // 下载的视频缓存目录
     private val downloadDir by lazy { File(filesDir, "videos") }
@@ -376,8 +378,58 @@ class MainActivity : AppCompatActivity() {
             }
             mqttClient?.publish(registerTopic, payload.toString().toByteArray(), 1, false)
             Log.d(TAG, "Device registration sent: $deviceId")
+            
+            // 注册成功后发送在线状态
+            sendStatus("online")
+            // 启动定时发送状态
+            startStatusTimer()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register device: ${e.message}")
+        }
+    }
+    
+    /**
+     * 发送设备状态到MQTT
+     */
+    private fun sendStatus(status: String) {
+        try {
+            val deviceId = prefs.getString("device_id", null) ?: return
+            val statusTopic = "xvj/device/$deviceId/status"
+            val payload = JSONObject().apply {
+                put("status", status)
+                put("timestamp", System.currentTimeMillis())
+            }
+            mqttClient?.publish(statusTopic, payload.toString().toByteArray(), 1, false)
+            Log.d(TAG, "Status sent: $status")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send status: ${e.message}")
+        }
+    }
+    
+    /**
+     * 启动定时发送状态
+     */
+    private fun startStatusTimer() {
+        statusTimerRunnable?.let { statusHandler.removeCallbacks(it) }
+        statusTimerRunnable = object : Runnable {
+            override fun run() {
+                if (mqttClient?.isConnected == true) {
+                    sendStatus("online")
+                }
+                statusHandler.postDelayed(this, 30000) // 每30秒发送一次
+            }
+        }
+        statusHandler.post(statusTimerRunnable!!)
+    }
+    
+    /**
+     * 停止定时发送状态
+     */
+    private fun stopStatusTimer() {
+        statusTimerRunnable?.let {
+            statusHandler.removeCallbacks(it)
+            // 发送离线状态
+            sendStatus("offline")
         }
     }
     
@@ -759,10 +811,9 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         releasePlayer()
+        // 停止定时器并发送离线状态
+        stopStatusTimer()
         try {
-            // 发送离线消息
-            val offlineTopic = "xvj/device/$deviceId/status"
-            mqttClient?.publish(offlineTopic, "{\"status\":\"offline\"}".toByteArray(), 1, false)
             mqttClient?.disconnect()
             mqttClient?.close()
         } catch (e: Exception) {}
