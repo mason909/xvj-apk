@@ -1,4 +1,4 @@
-name: Build and Release APK
+name: Build APK
 
 on:
   push:
@@ -29,46 +29,21 @@ jobs:
     
     - name: Fix repositories for CI
       run: |
-        # Replace Aliyun mirrors with standard repositories in settings.gradle
         sed -i 's|maven { url '\''https://maven.aliyun.com/repository/google'\'' }|google()|g' settings.gradle
         sed -i 's|maven { url '\''https://maven.aliyun.com/repository/central'\'' }|mavenCentral()|g' settings.gradle
         sed -i 's|maven { url '\''https://maven.aliyun.com/repository/gradle-plugin'\'' }|gradlePluginPortal()|g' settings.gradle
         sed -i 's|maven { url '\''https://maven.aliyun.com/repository/public'\'' }|mavenCentral()|g' settings.gradle
-        
-        # Also fix build.gradle if it has any Aliyun mirrors
         sed -i 's|maven { url '\''https://maven.aliyun.com/repository/google'\'' }|google()|g' build.gradle
         sed -i 's|maven { url '\''https://maven.aliyun.com/repository/central'\'' }|mavenCentral()|g' build.gradle
-        
-        cat settings.gradle
-    
-    - name: Grant execute permission for Gradle wrapper
-      run: chmod +x gradlew
     
     - name: Build with Gradle
-      run: ./gradlew assembleDebug --no-daemon --warning-mode=all
+      run: |
+        chmod +x gradlew
+        ./gradlew assembleDebug --no-daemon
     
     - name: Upload APK
       uses: actions/upload-artifact@v4
       if: success()
       with:
-        name: app-debug
+        name: xvj-apk
         path: app/build/outputs/apk/debug/app-debug.apk
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
-    steps:
-    - name: Download APK
-      uses: actions/download-artifact@v4
-      with:
-        name: app-debug
-    
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: app-debug.apk
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
