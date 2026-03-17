@@ -931,3 +931,4 @@ class MainActivity : AppCompatActivity() {
             logToFile("下载APK失败: ${e.message}")
         }
     }
+}
