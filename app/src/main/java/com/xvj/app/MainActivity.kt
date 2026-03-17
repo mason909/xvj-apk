@@ -494,15 +494,13 @@ class MainActivity : AppCompatActivity() {
      */
     private fun playWelcomeVideo() {
         try {
-            val videoView = findViewById<android.widget.VideoView>(R.id.videoView)
-            val afd = assets.openFd("welcome.mp4")
-            videoView?.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+            val afd = assets.openFd("welcome.mpk")
+            val mediaPlayer = android.media.MediaPlayer()
+            mediaPlayer.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
             afd.close()
-            videoView?.setOnPreparedListener { mp ->
-                mp.isLooping = true
-                mp.start()
-            }
-            videoView?.prepareAsync()
+            mediaPlayer.isLooping = true
+            mediaPlayer.prepare()
+            mediaPlayer.start()
         } catch (e: Exception) {
             Log.e(TAG, "播放欢迎视频失败: ${e.message}")
         }
