@@ -861,7 +861,6 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Failed to create material folders: ${e.message}")
         }
     }
-}
 
     /**
      * 检查更新 - 延迟5秒后执行
