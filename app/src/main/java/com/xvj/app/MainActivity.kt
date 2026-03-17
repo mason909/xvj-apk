@@ -14,7 +14,6 @@ import com.google.android.exoplayer2.MediaItem
 import com.google.android.exoplayer2.Player
 import com.xvj.app.databinding.ActivityMainBinding
 import org.eclipse.paho.client.mqttv3.*
-import org.json.JSONObject
 import java.io.File
 import java.io.FileWriter
 import java.io.PrintWriter
