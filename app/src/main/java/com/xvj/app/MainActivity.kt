@@ -477,16 +477,34 @@ class MainActivity : AppCompatActivity() {
     }
     
     /**
-     * 显示未授权提示
+     * 显示未授权提示并播放欢迎视频
      */
     private fun showUnauthorizedAlert(message: String) {
         mqttHandler.post {
             try {
-                // 显示一个全屏的未授权提示
-                // 这里可以启动一个显示错误信息的Activity
-                // 暂时只显示在状态栏
+                // 播放欢迎视频循环
+                playWelcomeVideo()
                 Log.w(TAG, "UNAUTHORIZED: $message")
             } catch (e: Exception) {}
+        }
+    }
+    
+    /**
+     * 播放欢迎视频（循环）
+     */
+    private fun playWelcomeVideo() {
+        try {
+            val videoView = findViewById<android.widget.VideoView>(R.id.videoView)
+            val afd = assets.openFd("welcome.mp4")
+            videoView?.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+            afd.close()
+            videoView?.setOnPreparedListener { mp ->
+                mp.isLooping = true
+                mp.start()
+            }
+            videoView?.prepareAsync()
+        } catch (e: Exception) {
+            Log.e(TAG, "播放欢迎视频失败: ${e.message}")
         }
     }
     
