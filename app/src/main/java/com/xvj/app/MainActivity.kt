@@ -59,6 +59,9 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "XVJPlayer"
+        const val VERSION = "1.2.0"
+        const val VERSION_CODE = 3
+        const val APK_URL = "http://47.102.106.237"
         private const val MQTT_TOPIC = "xvj/device/+/command"
         private const val AUTH_TOPIC = "xvj/auth/response"
     }
@@ -114,6 +117,7 @@ class MainActivity : AppCompatActivity() {
         
         // 连接MQTT
         connectMQTT()
+        checkForUpdate() // 检查更新
     }
 
     /**
@@ -329,6 +333,7 @@ class MainActivity : AppCompatActivity() {
                             binding.statusText?.text = "连接断开,重连中..."
                         }
                         reconnectMQTT()
+        checkForUpdate() // 检查更新
                     }
                     
                     override fun messageArrived(topic: String?, message: MqttMessage?) {
@@ -491,6 +496,7 @@ class MainActivity : AppCompatActivity() {
                 mqttClient?.close()
             } catch (e: Exception) {}
             connectMQTT()
+        checkForUpdate() // 检查更新
         }, 5000)
     }
     
@@ -856,3 +862,73 @@ class MainActivity : AppCompatActivity() {
         }
     }
 }
+
+    /**
+     * 检查更新 - 延迟5秒后执行
+     */
+    private fun checkForUpdate() {
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                Thread {
+                    try {
+                        val url = java.net.URL("$APK_URL/api/version/latest")
+                        val connection = url.openConnection()
+                        connection.connectTimeout = 10000
+                        connection.readTimeout = 10000
+                        val response = connection.inputStream.bufferedReader().readText()
+                        
+                        val json = org.json.JSONObject(response)
+                        if (json.has("version_code")) {
+                            val serverCode = json.getInt("version_code")
+                            if (serverCode > VERSION_CODE) {
+                                val serverVersion = json.optString("version", "")
+                                val apkUrl = "$APK_URL${json.getString("filepath")}"
+                                logToFile("发现新版本: $serverVersion, 正在下载...")
+                                downloadAndInstall(apkUrl, serverVersion)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "Check update failed: ${e.message}")
+                    }
+                }.start()
+            } catch (e: Exception) {
+                Log.e(TAG, "Check update error: ${e.message}")
+            }
+        }, 5000)
+    }
+    
+    /**
+     * 下载并安装APK
+     */
+    private fun downloadAndInstall(apkUrl: String, version: String) {
+        try {
+            val url = java.net.URL(apkUrl)
+            val connection = url.openConnection()
+            connection.connectTimeout = 30000
+            connection.readTimeout = 30000
+            val apkFile = File(cacheDir, "xvj-update-$version.apk")
+            
+            val input = connection.getInputStream()
+            val output = java.io.FileOutputStream(apkFile)
+            val buffer = ByteArray(8192)
+            var bytesRead: Int
+            while (input.read(buffer).also { bytesRead = it } != -1) {
+                output.write(buffer, 0, bytesRead)
+            }
+            output.close()
+            input.close()
+            
+            logToFile("APK下载完成: ${apkFile.absolutePath}")
+            
+            // 安装APK
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW)
+            intent.setDataAndType(
+                android.net.Uri.fromFile(apkFile),
+                "application/vnd.android.package-archive"
+            )
+            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } catch (e: Exception) {
+            logToFile("下载APK失败: ${e.message}")
+        }
+    }
