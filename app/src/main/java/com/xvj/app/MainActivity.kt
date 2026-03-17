@@ -494,13 +494,16 @@ class MainActivity : AppCompatActivity() {
      */
     private fun playWelcomeVideo() {
         try {
-            val afd = assets.openFd("welcome.mpk")
-            val mediaPlayer = android.media.MediaPlayer()
-            mediaPlayer.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-            afd.close()
-            mediaPlayer.isLooping = true
-            mediaPlayer.prepare()
-            mediaPlayer.start()
+            releasePlayer()
+            player = com.google.android.exoplayer2.ExoPlayer.Builder(this).build().apply {
+                binding.playerView.player = this
+                val mediaItem = MediaItem.fromUri("asset://welcome.mpk")
+                setMediaItems(listOf(mediaItem))
+                repeatMode = Player.REPEAT_MODE_ALL
+                playWhenReady = true
+                prepare()
+            }
+            Log.d(TAG, "开始播放欢迎视频")
         } catch (e: Exception) {
             Log.e(TAG, "播放欢迎视频失败: ${e.message}")
         }
