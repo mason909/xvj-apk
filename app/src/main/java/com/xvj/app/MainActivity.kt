@@ -828,7 +828,7 @@ class MainActivity : AppCompatActivity() {
                 val prefsEditor = prefs.edit()
                 prefsEditor.putString("current_room_id", roomId)
                 prefsEditor.putString("room_folder_mappings", folderMappings.toString())
-                prefsEditor.commit()
+                prefsEditor.apply() // 异步写入
                 
                 Log.d(TAG, "Room materials config saved: room=$roomId, mappings=$folderMappings")
                 
@@ -886,26 +886,29 @@ class MainActivity : AppCompatActivity() {
     
     // 播放本地文件夹的视频
     private fun playFolderVideos(folderId: String) {
-        val folderDir = File(videoFolderPath, folderId)
-        if (!folderDir.exists() || !folderDir.isDirectory) {
-            Log.w(TAG, "文件夹不存在: $folderId")
-            return
-        }
-        
-        val videos = folderDir.listFiles()?.filter { 
-            it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
-        }?.sortedBy { it.name } ?: return
-        
-        if (videos.isEmpty()) {
-            Log.d(TAG, "文件夹为空: $folderId")
-            return
-        }
-        
-        videoList.clear()
-        videoList.addAll(videos)
-        
-        if (videoList.isNotEmpty()) {
-            playVideoList(videoList)
+        mqttHandler.post {
+            val folderDir = File(videoFolderPath, folderId)
+            if (!folderDir.exists() || !folderDir.isDirectory) {
+                binding.statusText?.text = "文件夹不存在: $folderId"
+                return@post
+            }
+            
+            val videos = folderDir.listFiles()?.filter { 
+                it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
+            }?.sortedBy { it.name } ?: return@post
+            
+            if (videos.isEmpty()) {
+                binding.statusText?.text = "文件夹为空: $folderId"
+                return@post
+            }
+            
+            videoList.clear()
+            videoList.addAll(videos)
+            
+            if (videoList.isNotEmpty()) {
+                playVideoList(videoList)
+                binding.statusText?.text = "正在播放: $folderId"
+            }
         }
     }
 
