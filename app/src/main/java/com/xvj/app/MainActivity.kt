@@ -606,6 +606,15 @@ class MainActivity : AppCompatActivity() {
                         syncRoomMaterials(roomId, folderMappings)
                     }
                 }
+                "update" -> {
+                    // 收到OTA更新推送
+                    val url = cmd.optString("url", "")
+                    val version = cmd.optString("version", "")
+                    if (url.isNotEmpty()) {
+                        logToFile("收到OTA更新推送: $version")
+                        downloadAndInstall(url, version)
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Command parse error: ${e.message}")
