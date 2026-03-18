@@ -1164,6 +1164,14 @@ class MainActivity : AppCompatActivity() {
     // 显示更新通知
     private fun showUpdateNotification(version: String) {
         try {
+            // Android 13+ 需要请求通知权限
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
+                    logToFile("请求通知权限")
+                }
+            }
+            
             val channel = android.app.NotificationChannel(
                 "update_channel", "更新",
                 android.app.NotificationManager.IMPORTANCE_HIGH
@@ -1172,20 +1180,26 @@ class MainActivity : AppCompatActivity() {
             val notificationManager = getSystemService(android.app.NotificationManager::class.java)
             notificationManager.createNotificationChannel(channel)
             
+            // 使用显式Intent
+            val intent = android.content.Intent(this, MainActivity::class.java)
+            val pendingIntent = android.app.PendingIntent.getActivity(
+                this, 0, intent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            
             val notification = android.app.Notification.Builder(this, "update_channel")
                 .setContentTitle("发现新版本 $version")
                 .setContentText("点击安装")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setAutoCancel(true)
-                .setContentIntent(android.app.PendingIntent.getActivity(
-                    this, 0,
-                    android.content.Intent(this, java.lang.Class.forName("com.xvj.app.MainActivity")),
-                    android.app.PendingIntent.FLAG_UPDATE_CURRENT
-                )).build()
+                .setContentIntent(pendingIntent)
+                .build()
             
             notificationManager.notify(1001, notification)
+            logToFile("通知已显示")
         } catch (e: Exception) {
             Log.e(TAG, "Show notification error: ${e.message}")
+            logToFile("通知错误: ${e.message}")
         }
     }
     
