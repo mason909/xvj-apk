@@ -585,6 +585,14 @@ class MainActivity : AppCompatActivity() {
                         syncPresetFolders(folders)
                     }
                 }
+                "sync_room_materials" -> {
+                    // 接收房间素材同步，下载到本地文件夹
+                    val roomId = cmd.optString("room_id", "")
+                    val folderMappings = cmd.optJSONObject("folder_mappings")
+                    if (folderMappings != null) {
+                        syncRoomMaterials(roomId, folderMappings)
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Command parse error: ${e.message}")
@@ -790,6 +798,114 @@ class MainActivity : AppCompatActivity() {
                     binding.statusText?.text = "预设素材同步失败"
                 }
             }
+        }
+    }
+    
+    // 同步房间素材到本地文件夹
+    private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
+        mqttHandler.post {
+            binding.statusText?.text = "同步房间素材中..."
+        }
+        
+        executor.execute {
+            try {
+                val downloadTasks = mutableListOf<Triple<String, String, String>>() // folderId, filename, url
+                
+                // 遍历文件夹映射
+                for (i in 0 until folderMappings.length()) {
+                    val folderId = folderMappings.names()?.getString(i) ?: continue
+                    val materialIds = folderMappings.getJSONArray(folderId)
+                    
+                    // 获取每个素材的URL
+                    for (j in 0 until materialIds.length()) {
+                        val materialId = materialIds.getString(j)
+                        // TODO: 调用API获取素材URL
+                        // 这里先假设素材URL可以从预设素材API获取
+                    }
+                }
+                
+                // 保存房间素材配置
+                val prefsEditor = prefs.edit()
+                prefsEditor.putString("current_room_id", roomId)
+                prefsEditor.putString("room_folder_mappings", folderMappings.toString())
+                prefsEditor.commit()
+                
+                Log.d(TAG, "Room materials config saved: room=$roomId, mappings=$folderMappings")
+                
+                // 开始下载并播放01文件夹
+                downloadAndPlayFolder("01")
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Room materials sync error: ${e.message}")
+                mqttHandler.post {
+                    binding.statusText?.text = "素材同步失败"
+                }
+            }
+        }
+    }
+    
+    // 下载并播放指定文件夹
+    private fun downloadAndPlayFolder(folderId: String) {
+        executor.execute {
+            try {
+                // 获取该文件夹的素材列表
+                val mappingsStr = prefs.getString("room_folder_mappings", "{}")
+                val mappings = org.json.JSONObject(mappingsStr)
+                val materialIds = mappings.optJSONArray(folderId)
+                
+                if (materialIds == null || materialIds.length() == 0) {
+                    Log.d(TAG, "文件夹 $folderId 没有素材")
+                    return@execute
+                }
+                
+                // 获取素材URL并下载
+                val videoList = mutableListOf<File>()
+                val folderDir = File(videoFolderPath, folderId)
+                if (!folderDir.exists()) {
+                    folderDir.mkdirs()
+                }
+                
+                for (i in 0 until materialIds.length()) {
+                    val materialId = materialIds.getString(i)
+                    // TODO: 从API获取素材详情（URL等）
+                    // 这里简化处理
+                    Log.d(TAG, "需要下载素材: $materialId 到文件夹 $folderId")
+                }
+                
+                // 播放01文件夹
+                mqttHandler.post {
+                    binding.statusText?.text = "播放文件夹: $folderId"
+                    playFolderVideos(folderId)
+                }
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Download folder error: ${e.message}")
+            }
+        }
+    }
+    
+    // 播放本地文件夹的视频
+    private fun playFolderVideos(folderId: String) {
+        val folderDir = File(videoFolderPath, folderId)
+        if (!folderDir.exists() || !folderDir.isDirectory) {
+            Log.w(TAG, "文件夹不存在: $folderId")
+            return
+        }
+        
+        val videos = folderDir.listFiles()?.filter { 
+            it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
+        }?.sortedBy { it.name } ?: return
+        
+        if (videos.isEmpty()) {
+            Log.d(TAG, "文件夹为空: $folderId")
+            return
+        }
+        
+        videoList.clear()
+        videoList.addAll(videos)
+        
+        if (videoList.isNotEmpty()) {
+            playVideoList(videoList)
         }
     }
 
