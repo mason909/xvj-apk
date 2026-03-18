@@ -63,7 +63,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "XVJPlayer"
         const val VERSION = "1.2.0"
-        const val VERSION_CODE = 11
+        const val VERSION_CODE = 12
         const val APK_URL = "http://47.102.106.237"
         private const val MQTT_TOPIC = "xvj/device/+/command"
         private const val AUTH_TOPIC = "xvj/auth/response"
@@ -117,12 +117,18 @@ class MainActivity : AppCompatActivity() {
         // 加载配置
         loadConfig()
         
-        // 扫描本地视频
-        scanLocalVideos()
-        
-        // 播放本地视频（如果有）
-        if (videoList.isNotEmpty()) {
-            startPlayback()
+        // 检查授权状态并播放
+        val isAuthorized = prefs.getBoolean("authorized", false)
+        if (isAuthorized) {
+            // 已授权，播放本地视频
+            scanLocalVideos()
+            if (videoList.isNotEmpty()) {
+                startPlayback()
+            }
+        } else {
+            // 未授权，播放欢迎视频
+            logToFile("本地存储为未授权，播放欢迎视频")
+            playWelcomeVideo()
         }
         
         // 连接MQTT
@@ -467,6 +473,11 @@ class MainActivity : AppCompatActivity() {
                         if (authorized) {
                             binding.statusText?.text = "设备已授权: $message"
                             prefs.edit().putBoolean("authorized", true).apply()
+                            // 切换到播放本地视频
+                            scanLocalVideos()
+                            if (videoList.isNotEmpty()) {
+                                startPlayback()
+                            }
                         } else {
                             binding.statusText?.text = "设备未授权: $message"
                             // 未授权，停止工作
