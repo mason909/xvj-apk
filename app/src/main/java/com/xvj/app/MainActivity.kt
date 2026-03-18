@@ -63,7 +63,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "XVJPlayer"
         const val VERSION = "1.2.0"
-        const val VERSION_CODE = 10
+        const val VERSION_CODE = 11
         const val APK_URL = "http://47.102.106.237"
         private const val MQTT_TOPIC = "xvj/device/+/command"
         private const val AUTH_TOPIC = "xvj/auth/response"
@@ -1218,38 +1218,60 @@ class MainActivity : AppCompatActivity() {
      * 下载并安装APK
      */
     private fun downloadAndInstall(apkUrl: String, version: String) {
-        try {
-            val url = java.net.URL(apkUrl)
-            val connection = url.openConnection()
-            connection.connectTimeout = 30000
-            connection.readTimeout = 30000
-            val apkFile = File(cacheDir, "xvj-update-$version.apk")
-            
-            val input = connection.getInputStream()
-            val output = java.io.FileOutputStream(apkFile)
-            val buffer = ByteArray(8192)
-            var bytesRead: Int
-            while (input.read(buffer).also { bytesRead = it } != -1) {
-                output.write(buffer, 0, bytesRead)
+        // 异步下载APK
+        Thread {
+            try {
+                logToFile("开始下载APK: $apkUrl")
+                mqttHandler.post {
+                    try {
+                        android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_SHORT).show()
+                    } catch(e: Exception) {}
+                }
+                
+                val url = java.net.URL(apkUrl)
+                val connection = url.openConnection()
+                connection.connectTimeout = 30000
+                connection.readTimeout = 30000
+                val apkFile = File(cacheDir, "xvj-update-$version.apk")
+                
+                connection.getInputStream().use { input ->
+                    java.io.FileOutputStream(apkFile).use { output ->
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                        }
+                    }
+                }
+                
+                logToFile("APK下载完成: ${apkFile.absolutePath}")
+                
+                // 提示用户点击安装
+                mqttHandler.post {
+                    try {
+                        android.widget.Toast.makeText(this, "更新已下载，点这里安装", android.widget.Toast.LENGTH_LONG).show()
+                    } catch(e: Exception) {}
+                }
+                
+                // 启动安装
+                val apkUri = androidx.core.content.FileProvider.getUriForFile(
+                    this, "${packageName}.fileprovider", apkFile
+                )
+                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                    setDataAndType(apkUri, "application/vnd.android.package-archive")
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(intent)
+                
+            } catch (e: Exception) {
+                logToFile("下载APK失败: ${e.message}")
+                mqttHandler.post {
+                    try {
+                        android.widget.Toast.makeText(this, "更新下载失败: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                    } catch(e: Exception) {}
+                }
             }
-            output.close()
-            input.close()
-            
-            logToFile("APK下载完成: ${apkFile.absolutePath}")
-            
-            // 安装APK - 使用FileProvider (Android 7+)
-            val apkUri = androidx.core.content.FileProvider.getUriForFile(
-                this,
-                "${packageName}.fileprovider",
-                apkFile
-            )
-            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW)
-            intent.setDataAndType(apkUri, "application/vnd.android.package-archive")
-            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            startActivity(intent)
-        } catch (e: Exception) {
-            logToFile("下载APK失败: ${e.message}")
-        }
+        }.start()
     }
 }
