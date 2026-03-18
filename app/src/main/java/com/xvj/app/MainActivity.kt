@@ -10,8 +10,8 @@ import android.util.Log
 import android.view.View
 import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
-import androidx.media3.MediaItem
-import androidx.media3.Player
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
 import com.xvj.app.databinding.ActivityMainBinding
 import org.eclipse.paho.client.mqttv3.*
 import org.json.JSONObject
