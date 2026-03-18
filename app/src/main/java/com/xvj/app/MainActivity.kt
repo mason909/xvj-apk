@@ -935,7 +935,7 @@ class MainActivity : AppCompatActivity() {
     private fun checkStoragePermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // Android 11+ 需要 MANAGE_EXTERNAL_STORAGE
-            if (!environment.isExternalStorageManager()) {
+            if (!Environment.isExternalStorageManager()) {
                 try {
                     val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
                     intent.data = android.net.Uri.parse("package:$packageName")
