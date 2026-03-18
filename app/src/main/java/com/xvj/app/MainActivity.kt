@@ -63,7 +63,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "XVJPlayer"
         const val VERSION = "1.2.0"
-        const val VERSION_CODE = 3
+        const val VERSION_CODE = 4
         const val APK_URL = "http://47.102.106.237"
         private const val MQTT_TOPIC = "xvj/device/+/command"
         private const val AUTH_TOPIC = "xvj/auth/response"
