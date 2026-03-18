@@ -511,7 +511,7 @@ class MainActivity : AppCompatActivity() {
             releasePlayer()
             player = ExoPlayer.Builder(this).build().apply {
                 binding.playerView.player = this
-                val mediaItem = MediaItem.fromUri("asset://welcome.mpk")
+                val mediaItem = MediaItem.fromUri("asset://welcome.mp4")
                 setMediaItems(listOf(mediaItem))
                 repeatMode = Player.REPEAT_MODE_ALL
                 playWhenReady = true
