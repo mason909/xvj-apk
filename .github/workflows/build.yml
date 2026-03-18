@@ -26,10 +26,15 @@ jobs:
       run: |
         echo "sdk.dir=$ANDROID_HOME" > local.properties
     
-    - name: Build with Gradle
+    - name: Check dependencies
       run: |
         chmod +x gradlew
-        ./gradlew assembleDebug --no-daemon --no-build-cache --refresh-dependencies
+        ./gradlew app:dependencies --configuration releaseRuntimeClasspath --no-daemon --no-build-cache --refresh-dependencies 2>&1 | tee deps.log
+        grep -i "media3" deps.log || echo "No Media3 found in deps"
+    
+    - name: Build with Gradle
+      run: |
+        ./gradlew assembleDebug --no-daemon --no-build-cache --refresh-dependencies --stacktrace
     
     - name: Upload APK
       uses: actions/upload-artifact@v4
