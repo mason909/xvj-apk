@@ -906,8 +906,18 @@ class MainActivity : AppCompatActivity() {
             videoList.addAll(videos)
             
             if (videoList.isNotEmpty()) {
-                playVideoList(videoList)
-                binding.statusText?.text = "正在播放: $folderId"
+                // 直接设置播放列表
+                mqttHandler.post {
+                    releasePlayer()
+                    player = ExoPlayer.Builder(this).build().apply {
+                        binding.playerView.player = this
+                        val mediaItems = videoList.map { MediaItem.fromUri(android.net.Uri.fromFile(it)) }
+                        setMediaItems(mediaItems)
+                        repeatMode = Player.REPEAT_MODE_ALL
+                        playWhenReady = true
+                        prepare()
+                    }
+                }
             }
         }
     }
