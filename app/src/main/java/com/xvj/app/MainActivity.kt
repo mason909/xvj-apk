@@ -95,9 +95,8 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         
-        // 使用 app 外部存储目录存放视频
-        val externalDir = getExternalFilesDir(null)
-        videoFolderPath = externalDir?.absolutePath ?: filesDir.absolutePath
+        // 使用 app 内部存储目录存放视频（不需要权限）
+        videoFolderPath = filesDir.absolutePath
         
         logToFile("=== XVJ App Starting ===")
         logToFile("Video folder: $videoFolderPath")
@@ -287,10 +286,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadConfig() {
-        // 优先使用 app 外部存储目录，不被旧配置覆盖
+        // 使用 app 内部存储目录，不需要权限
         if (videoFolderPath.isEmpty()) {
-            val externalDir = getExternalFilesDir(null)
-            videoFolderPath = externalDir?.absolutePath ?: filesDir.absolutePath
+            videoFolderPath = filesDir.absolutePath
         }
         
         // 本地配置
