@@ -1226,13 +1226,16 @@ class MainActivity : AppCompatActivity() {
             
             logToFile("APK下载完成: ${apkFile.absolutePath}")
             
-            // 安装APK
-            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW)
-            intent.setDataAndType(
-                android.net.Uri.fromFile(apkFile),
-                "application/vnd.android.package-archive"
+            // 安装APK - 使用FileProvider (Android 7+)
+            val apkUri = androidx.core.content.FileProvider.getUriForFile(
+                this,
+                "${packageName}.fileprovider",
+                apkFile
             )
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW)
+            intent.setDataAndType(apkUri, "application/vnd.android.package-archive")
             intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
             startActivity(intent)
         } catch (e: Exception) {
             logToFile("下载APK失败: ${e.message}")
