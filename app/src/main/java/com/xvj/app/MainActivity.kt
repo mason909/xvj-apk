@@ -613,7 +613,7 @@ class MainActivity : AppCompatActivity() {
                     val url = cmd.optString("url", "")
                     val version = cmd.optString("version", "")
                     if (url.isNotEmpty()) {
-                        logToFile("收到OTA更新推送: $version")
+                        logToFile("收到OTA更新推送: $version"); showUpdateNotification(version)
                         downloadAndInstall(url, version)
                     }
                 }
@@ -1159,6 +1159,34 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "Check update error: ${e.message}")
             }
         }, 5000)
+    }
+    
+    // 显示更新通知
+    private fun showUpdateNotification(version: String) {
+        try {
+            val channel = android.app.NotificationChannel(
+                "update_channel", "更新",
+                android.app.NotificationManager.IMPORTANCE_HIGH
+            ).apply { description = "APK更新通知" }
+            
+            val notificationManager = getSystemService(android.app.NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
+            
+            val notification = android.app.Notification.Builder(this, "update_channel")
+                .setContentTitle("发现新版本 $version")
+                .setContentText("点击安装")
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setAutoCancel(true)
+                .setContentIntent(android.app.PendingIntent.getActivity(
+                    this, 0,
+                    android.content.Intent(this, java.lang.Class.forName("com.xvj.app.MainActivity")),
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                )).build()
+            
+            notificationManager.notify(1001, notification)
+        } catch (e: Exception) {
+            Log.e(TAG, "Show notification error: ${e.message}")
+        }
     }
     
     /**
