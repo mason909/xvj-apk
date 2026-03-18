@@ -12,6 +12,7 @@ import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import com.xvj.app.databinding.ActivityMainBinding
 import org.eclipse.paho.client.mqttv3.*
 import org.json.JSONObject
@@ -32,7 +33,7 @@ import java.util.concurrent.Executors
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
-    private var player: androidx.media3.ExoPlayer? = null
+    private var player: ExoPlayer? = null
     private var videoList: MutableList<File> = mutableListOf()
     
     // 配置项
@@ -495,7 +496,7 @@ class MainActivity : AppCompatActivity() {
     private fun playWelcomeVideo() {
         try {
             releasePlayer()
-            player = androidx.media3.ExoPlayer.Builder(this).build().apply {
+            player = ExoPlayer.Builder(this).build().apply {
                 binding.playerView.player = this
                 val mediaItem = MediaItem.fromUri("asset://welcome.mpk")
                 setMediaItems(listOf(mediaItem))
@@ -587,7 +588,7 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "Playing from URL: $url")
         mqttHandler.post {
             releasePlayer()
-            player = androidx.media3.ExoPlayer.Builder(this).build().apply {
+            player = ExoPlayer.Builder(this).build().apply {
                 binding.playerView.player = this
                 val mediaItem = MediaItem.fromUri(url)
                 setMediaItems(listOf(mediaItem))
@@ -644,7 +645,7 @@ class MainActivity : AppCompatActivity() {
         
         mqttHandler.post {
             releasePlayer()
-            player = androidx.media3.ExoPlayer.Builder(this).build().apply {
+            player = ExoPlayer.Builder(this).build().apply {
                 binding.playerView.player = this
                 val mediaItem = MediaItem.fromUri(android.net.Uri.fromFile(videoFile))
                 setMediaItems(listOf(mediaItem))
@@ -797,7 +798,7 @@ class MainActivity : AppCompatActivity() {
     private fun startPlayback() {
         releasePlayer()
         
-        player = androidx.media3.ExoPlayer.Builder(this).build().apply {
+        player = ExoPlayer.Builder(this).build().apply {
             binding.playerView.player = this
             
             val mediaItems = videoList.map { MediaItem.fromUri(it.toURI().toString()) }
