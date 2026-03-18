@@ -578,6 +578,13 @@ class MainActivity : AppCompatActivity() {
                 "sync" -> {
                     syncFromCloud()
                 }
+                "preset_sync" -> {
+                    // 接收预设素材同步
+                    val folders = cmd.optJSONArray("folders")
+                    if (folders != null) {
+                        syncPresetFolders(folders)
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Command parse error: ${e.message}")
@@ -730,6 +737,57 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "Sync error: ${e.message}")
                 mqttHandler.post {
                     binding.statusText?.text = "同步失败"
+                }
+            }
+        }
+    }
+    
+    // 同步预设素材文件夹
+    private fun syncPresetFolders(folders: org.json.JSONArray) {
+        mqttHandler.post {
+            binding.statusText?.text = "同步预设素材(${folders.length()}个文件夹)..."
+        }
+        
+        executor.execute {
+            try {
+                val folderList = mutableListOf<Pair<String, String>>() // folderId to folderName
+                
+                for (i in 0 until folders.length()) {
+                    try {
+                        val item = folders.get(i)
+                        if (item is org.json.JSONObject) {
+                            val id = item.optString("id", "").take(20)
+                            val name = item.optString("name", "").take(100)
+                            // 过滤特殊字符
+                            val safeId = id.replace(Regex("[^a-zA-Z0-9_-]"), "")
+                            val safeName = name.replace(Regex("[^\\w\\s-]"), "")
+                            if (safeId.isNotEmpty()) {
+                                folderList.add(Pair(safeId, safeName))
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Skipping invalid folder at index $i: ${e.message}")
+                    }
+                }
+                
+                // 保存文件夹配置到本地
+                val prefsEditor = prefs.edit()
+                val folderJson = org.json.JSONObject()
+                folderList.forEach { (id, name) ->
+                    folderJson.put(id, name)
+                }
+                prefsEditor.putString("preset_folders", folderJson.toString())
+                prefsEditor.commit() // 同步写入，确保保存成功
+                
+                Log.d(TAG, "Preset folders saved: $folderList")
+                
+                mqttHandler.post {
+                    binding.statusText?.text = "预设素材同步完成"
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Preset sync error: ${e.message}")
+                mqttHandler.post {
+                    binding.statusText?.text = "预设素材同步失败"
                 }
             }
         }
