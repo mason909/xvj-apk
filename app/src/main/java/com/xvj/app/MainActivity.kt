@@ -63,7 +63,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "XVJPlayer"
         const val VERSION = "1.2.0"
-        const val VERSION_CODE = 9
+        const val VERSION_CODE = 10
         const val APK_URL = "http://47.102.106.237"
         private const val MQTT_TOPIC = "xvj/device/+/command"
         private const val AUTH_TOPIC = "xvj/auth/response"
@@ -621,10 +621,10 @@ class MainActivity : AppCompatActivity() {
                         // 用Handler在主线程显示Toast
                         mqttHandler.post {
                             try {
-                                android.widget.Toast.makeText(this, "收到更新: $version", android.widget.Toast.LENGTH_LONG).show()
+                                android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_LONG).show()
                             } catch(e: Exception) {}
                         }
-                        showUpdateNotification(version)
+                        // 直接下载并提示用户安装
                         downloadAndInstall(url, version)
                     }
                 }
