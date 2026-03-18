@@ -18,7 +18,6 @@ jobs:
       with:
         java-version: '17'
         distribution: 'temurin'
-        cache: 'gradle'
     
     - name: Set up Android SDK
       uses: android-actions/setup-android@v3
@@ -27,19 +26,10 @@ jobs:
       run: |
         echo "sdk.dir=$ANDROID_HOME" > local.properties
     
-    - name: Fix repositories for CI
-      run: |
-        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/google'\'' }|google()|g' settings.gradle
-        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/central'\'' }|mavenCentral()|g' settings.gradle
-        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/gradle-plugin'\'' }|gradlePluginPortal()|g' settings.gradle
-        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/public'\'' }|mavenCentral()|g' settings.gradle
-        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/google'\'' }|google()|g' build.gradle
-        sed -i 's|maven { url '\''https://maven.aliyun.com/repository/central'\'' }|mavenCentral()|g' build.gradle
-    
     - name: Build with Gradle
       run: |
         chmod +x gradlew
-        ./gradlew assembleDebug --no-daemon
+        ./gradlew assembleDebug --no-daemon --no-build-cache
     
     - name: Upload APK
       uses: actions/upload-artifact@v4
