@@ -39,7 +39,8 @@ class MainActivity : AppCompatActivity() {
     
     // 配置项
     private val prefs by lazy { getSharedPreferences("xvj_prefs", MODE_PRIVATE) }
-    private var videoFolderPath: String = "/storage/emulated/0"
+    // 使用 app 内部存储目录，确保可写
+    private var videoFolderPath: String = ""
     private var loopPlay: Boolean = true
     private var autoPlay: Boolean = true
     
@@ -94,7 +95,12 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         
+        // 使用 app 外部存储目录存放视频
+        val externalDir = getExternalFilesDir(null)
+        videoFolderPath = externalDir?.absolutePath ?: filesDir.absolutePath
+        
         logToFile("=== XVJ App Starting ===")
+        logToFile("Video folder: $videoFolderPath")
 
         // 确保下载目录存在
         if (!downloadDir.exists()) {
@@ -281,8 +287,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadConfig() {
+        // 优先使用 app 外部存储目录，不被旧配置覆盖
+        if (videoFolderPath.isEmpty()) {
+            val externalDir = getExternalFilesDir(null)
+            videoFolderPath = externalDir?.absolutePath ?: filesDir.absolutePath
+        }
+        
         // 本地配置
-        videoFolderPath = prefs.getString("video_folder", "/storage/emulated/0") ?: "/storage/emulated/0"
         loopPlay = prefs.getBoolean("loop_play", true)
         autoPlay = prefs.getBoolean("auto_play", true)
         mqttServer = prefs.getString("mqtt_server", "tcp://47.102.106.237:1883") ?: "tcp://47.102.106.237:1883"
