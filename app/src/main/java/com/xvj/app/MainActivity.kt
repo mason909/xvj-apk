@@ -891,9 +891,14 @@ class MainActivity : AppCompatActivity() {
     // 播放本地文件夹的视频
     private fun playFolderVideos(folderId: String) {
         mqttHandler.post {
+            // 确保文件夹存在
             val folderDir = File(videoFolderPath, folderId)
+            if (!folderDir.exists()) {
+                folderDir.mkdirs()
+            }
+            
             if (!folderDir.exists() || !folderDir.isDirectory) {
-                binding.statusText?.text = "文件夹不存在: $folderId"
+                binding.statusText?.text = "无法创建文件夹: $folderId"
                 return@post
             }
             
