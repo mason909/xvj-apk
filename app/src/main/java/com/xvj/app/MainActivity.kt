@@ -503,34 +503,36 @@ class MainActivity : AppCompatActivity() {
      * 显示未授权提示并播放欢迎视频
      */
     private fun showUnauthorizedAlert(message: String) {
-        mqttHandler.post {
-            try {
-                // 播放欢迎视频循环
-                playWelcomeVideo()
-                Log.w(TAG, "UNAUTHORIZED: $message")
-            } catch (e: Exception) {}
-        }
+        // 停止当前播放并切换到欢迎视频
+        stopPlayback()
+        playWelcomeVideo()
+        Log.w(TAG, "UNAUTHORIZED: $message")
     }
-
+    
     /**
      * 播放欢迎视频（循环）
      */
     private fun playWelcomeVideo() {
-        try {
-            releasePlayer()
-            player = ExoPlayer.Builder(this).build().apply {
-                binding.playerView.player = this
-                // 使用 Android resource URI 访问 raw 资源
-                val uri = android.net.Uri.parse("android.resource://${packageName}/raw/welcome")
-                val mediaItem = MediaItem.fromUri(uri)
-                setMediaItems(listOf(mediaItem))
-                repeatMode = Player.REPEAT_MODE_ALL
-                playWhenReady = true
-                prepare()
+        mqttHandler.post {
+            try {
+                // 先释放旧播放器
+                releasePlayer()
+                
+                // 创建新播放器播放欢迎视频
+                player = ExoPlayer.Builder(this@MainActivity).build().apply {
+                    binding.playerView.player = this
+                    // 使用 Android resource URI 访问 raw 资源
+                    val uri = android.net.Uri.parse("android.resource://${packageName}/raw/welcome")
+                    val mediaItem = MediaItem.fromUri(uri)
+                    setMediaItems(listOf(mediaItem))
+                    repeatMode = Player.REPEAT_MODE_ALL
+                    playWhenReady = true
+                    prepare()
+                }
+                Log.d(TAG, "开始播放欢迎视频")
+            } catch (e: Exception) {
+                Log.e(TAG, "播放欢迎视频失败: ${e.message}")
             }
-            Log.d(TAG, "开始播放欢迎视频")
-        } catch (e: Exception) {
-            Log.e(TAG, "播放欢迎视频失败: ${e.message}")
         }
     }
 
@@ -963,30 +965,30 @@ class MainActivity : AppCompatActivity() {
         mqttHandler.post {
             // 先释放旧播放器
             releasePlayer()
-            
+
             // 确保文件夹存在
             val folderDir = File(videoFolderPath, folderId)
             if (!folderDir.exists()) {
                 folderDir.mkdirs()
             }
-            
+
             if (!folderDir.exists() || !folderDir.isDirectory) {
                 binding.statusText?.text = "无法创建文件夹: $folderId"
                 return@post
             }
-            
-            val videos = folderDir.listFiles()?.filter { 
+
+            val videos = folderDir.listFiles()?.filter {
                 it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
             }?.sortedBy { it.name } ?: return@post
-            
+
             if (videos.isEmpty()) {
                 binding.statusText?.text = "文件夹为空: $folderId"
                 return@post
             }
-            
+
             videoList.clear()
             videoList.addAll(videos)
-            
+
             if (videoList.isNotEmpty()) {
                 // 直接创建新播放器播放
                 player = ExoPlayer.Builder(this@MainActivity).build().apply {
