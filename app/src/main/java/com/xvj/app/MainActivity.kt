@@ -466,13 +466,27 @@ class MainActivity : AppCompatActivity() {
                 "auth_result" -> {
                     val authorized = resp.getBoolean("authorized")
                     val message = resp.optString("message", "")
+                    // 提取房间信息
+                    val roomId = resp.optString("room_id", "")
+                    val folderMappings = resp.optJSONObject("folder_mappings")
 
                     mqttHandler.post {
                         if (authorized) {
                             binding.statusText?.text = "设备已授权: $message"
-                            prefs.edit().putBoolean("authorized", true).apply()
-                            // 先停止当前播放，再切换到folder01
+                            // 保存授权状态和房间信息
+                            prefs.edit()
+                                .putBoolean("authorized", true)
+                                .putString("room_id", roomId)
+                                .apply()
+                            // 保存folder_mappings到本地
+                            if (folderMappings != null) {
+                                prefs.edit().putString("folder_mappings", folderMappings.toString()).apply()
+                            }
+                            Log.d(TAG, "授权成功: room_id=$roomId, folder_mappings=$folderMappings")
+                            
+                            // 先停止当前播放
                             stopPlayback()
+                            // 播放默认folder01（实际播放由RS485/DMX信号决定）
                             playFolderVideos("01")
                         } else {
                             binding.statusText?.text = "设备未授权: $message"
@@ -487,7 +501,11 @@ class MainActivity : AppCompatActivity() {
                     // 被远程废掉
                     mqttHandler.post {
                         binding.statusText?.text = "设备已被废止"
-                        prefs.edit().putBoolean("authorized", false).apply()
+                        prefs.edit()
+                            .putBoolean("authorized", false)
+                            .remove("room_id")
+                            .remove("folder_mappings")
+                            .apply()
                         // 先停止当前播放
                         stopPlayback()
                         showUnauthorizedAlert("设备已被远程废止，请联系管理员")
