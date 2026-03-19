@@ -120,11 +120,9 @@ class MainActivity : AppCompatActivity() {
         // 检查授权状态并播放
         val isAuthorized = prefs.getBoolean("authorized", false)
         if (isAuthorized) {
-            // 已授权，播放本地视频
-            scanLocalVideos()
-            if (videoList.isNotEmpty()) {
-                startPlayback()
-            }
+            // 已授权，播放01文件夹视频
+            logToFile("已授权，播放文件夹01")
+            playFolderVideos("01")
         } else {
             // 未授权，播放欢迎视频
             logToFile("本地存储为未授权，播放欢迎视频")
@@ -473,11 +471,9 @@ class MainActivity : AppCompatActivity() {
                         if (authorized) {
                             binding.statusText?.text = "设备已授权: $message"
                             prefs.edit().putBoolean("authorized", true).apply()
-                            // 切换到播放本地视频
-                            scanLocalVideos()
-                            if (videoList.isNotEmpty()) {
-                                startPlayback()
-                            }
+                            // 先停止当前播放，再切换到folder01
+                            stopPlayback()
+                            playFolderVideos("01")
                         } else {
                             binding.statusText?.text = "设备未授权: $message"
                             // 未授权，停止工作
@@ -492,6 +488,8 @@ class MainActivity : AppCompatActivity() {
                     mqttHandler.post {
                         binding.statusText?.text = "设备已被废止"
                         prefs.edit().putBoolean("authorized", false).apply()
+                        // 先停止当前播放
+                        stopPlayback()
                         showUnauthorizedAlert("设备已被远程废止，请联系管理员")
                     }
                 }
@@ -543,7 +541,24 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {}
             connectMQTT()
         checkForUpdate() // 检查更新
+        // 请求同步授权状态
+        requestAuthSync()
         }, 5000)
+    }
+    
+    // 请求同步授权状态
+    private fun requestAuthSync() {
+        try {
+            val topic = "xvj/auth/request"
+            val payload = JSONObject().apply {
+                put("device_id", deviceId)
+                put("fingerprint", deviceFingerprint)
+            }
+            mqttClient?.publish(topic, payload.toString().toByteArray(), 1, false)
+            Log.d(TAG, "请求授权状态同步")
+        } catch (e: Exception) {
+            Log.e(TAG, "请求授权同步失败: ${e.message}")
+        }
     }
     
     private fun handleCommand(json: String) {
