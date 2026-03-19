@@ -36,14 +36,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var player: ExoPlayer? = null
     private var videoList: MutableList<File> = mutableListOf()
-    
+
     // 配置项
     private val prefs by lazy { getSharedPreferences("xvj_prefs", MODE_PRIVATE) }
     // 使用 app 内部存储目录，确保可写
     private var videoFolderPath: String = ""
     private var loopPlay: Boolean = true
     private var autoPlay: Boolean = true
-    
+
     // MQTT配置 - 云端地址
     private var mqttServer = "tcp://47.102.106.237:1883"
     private var mqttClientId = ""
@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity() {
     private val statusHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
     private var statusTimerRunnable: Runnable? = null
-    
+
     // 下载的视频缓存目录
     private val downloadDir by lazy { File(filesDir, "videos") }
 
@@ -79,25 +79,25 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
+
         // 检查并申请存储权限
         checkStoragePermission()
-        
+
         // 强制横屏
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        
+
         // 保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        
+
         // 隐藏系统UI - 纯播放模式
         hideSystemUI()
-        
+
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        
+
         // 使用 app 内部存储目录存放视频（不需要权限）
         videoFolderPath = filesDir.absolutePath
-        
+
         logToFile("=== XVJ App Starting ===")
         logToFile("Video folder: $videoFolderPath")
 
@@ -105,18 +105,18 @@ class MainActivity : AppCompatActivity() {
         if (!downloadDir.exists()) {
             downloadDir.mkdirs()
         }
-        
+
         // 创建20个素材文件夹 (01-20)
         createMaterialFolders()
-        
+
         // 生成设备指纹
         deviceFingerprint = generateDeviceFingerprint()
         Log.d(TAG, "Device Fingerprint: $deviceFingerprint")
         logToFile("Fingerprint: $deviceFingerprint")
-        
+
         // 加载配置
         loadConfig()
-        
+
         // 检查授权状态并播放
         val isAuthorized = prefs.getBoolean("authorized", false)
         if (isAuthorized) {
@@ -128,7 +128,7 @@ class MainActivity : AppCompatActivity() {
             logToFile("本地存储为未授权，播放欢迎视频")
             playWelcomeVideo()
         }
-        
+
         // 连接MQTT
         connectMQTT()
         checkForUpdate() // 检查更新
@@ -140,7 +140,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun generateDeviceFingerprint(): String {
         val sb = StringBuilder()
-        
+
         // 1. CPU ID (RK3588 Security ID - 最可靠)
         try {
             val cpuId = readCpuId()
@@ -150,7 +150,7 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to read CPU ID: ${e.message}")
         }
-        
+
         // 2. MAC地址
         try {
             val mac = getMacAddress()
@@ -161,11 +161,11 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to read MAC: ${e.message}")
         }
-        
+
         // 3. Android ID (可重置但作为辅助)
         try {
             val androidId = android.provider.Settings.Secure.getString(
-                contentResolver, 
+                contentResolver,
                 android.provider.Settings.Secure.ANDROID_ID
             )
             if (androidId.isNotEmpty()) {
@@ -175,7 +175,7 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to read Android ID: ${e.message}")
         }
-        
+
         // 4. 设备序列号 (作为备用)
         try {
             val serial = Build.SERIAL
@@ -184,21 +184,21 @@ class MainActivity : AppCompatActivity() {
                 sb.append("serial:$serial")
             }
         } catch (e: Exception) {}
-        
+
         // 5. 设备型号
         try {
             val model = Build.MODEL
             if (sb.isNotEmpty()) sb.append("|")
             sb.append("model:${model.replace(" ", "_")}")
         } catch (e: Exception) {}
-        
+
         // 6. 硬件ID (RK3588特有)
         try {
             val hardware = Build.HARDWARE
             if (sb.isNotEmpty()) sb.append("|")
             sb.append("hw:$hardware")
         } catch (e: Exception) {}
-        
+
         // 返回SHA256哈希作为最终指纹
         val raw = sb.toString()
         return if (raw.isNotEmpty()) {
@@ -208,7 +208,7 @@ class MainActivity : AppCompatActivity() {
             "fallback_${System.currentTimeMillis()}_${(Math.random() * 10000).toInt()}"
         }
     }
-    
+
     /**
      * 读取RK3588 CPU ID
      * 通过读取 /proc/cpuinfo 或 sysfs
@@ -222,7 +222,7 @@ class MainActivity : AppCompatActivity() {
                 if (id.isNotEmpty()) return id
             }
         } catch (e: Exception) {}
-        
+
         // 方法2: 尝试读取 /proc/cpuinfo 中的 Serial
         try {
             val cpuInfo = RandomAccessFile("/proc/cpuinfo", "r")
@@ -239,7 +239,7 @@ class MainActivity : AppCompatActivity() {
             }
             cpuInfo.close()
         } catch (e: Exception) {}
-        
+
         // 方法3: 使用 Build.getSerial() (需要权限)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -249,10 +249,10 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } catch (e: Exception) {}
-        
+
         return ""
     }
-    
+
     /**
      * 获取MAC地址
      */
@@ -266,7 +266,7 @@ class MainActivity : AppCompatActivity() {
                     return mac
                 }
             }
-            
+
             // 尝试读取以太网MAC
             val ethFile = File("/sys/class/net/eth0/address")
             if (ethFile.exists()) {
@@ -276,10 +276,10 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } catch (e: Exception) {}
-        
+
         return ""
     }
-    
+
     /**
      * SHA256哈希
      */
@@ -294,21 +294,21 @@ class MainActivity : AppCompatActivity() {
         if (videoFolderPath.isEmpty()) {
             videoFolderPath = filesDir.absolutePath
         }
-        
+
         // 本地配置
         loopPlay = prefs.getBoolean("loop_play", true)
         autoPlay = prefs.getBoolean("auto_play", true)
         mqttServer = prefs.getString("mqtt_server", "tcp://47.102.106.237:1883") ?: "tcp://47.102.106.237:1883"
-        
+
         // 使用设备指纹作为ID
         deviceId = prefs.getString("device_id", "") ?: ""
         if (deviceId.isEmpty()) {
             deviceId = deviceFingerprint
             prefs.edit().putString("device_id", deviceId).apply()
         }
-        
+
         mqttClientId = "xvj_device_$deviceId"
-        
+
         Log.d(TAG, "Device ID: $deviceId")
         Log.d(TAG, "MQTT Server: $mqttServer")
         logToFile("DeviceID: $deviceId, MQTT: $mqttServer")
@@ -326,23 +326,23 @@ class MainActivity : AppCompatActivity() {
                 options.connectionTimeout = 30
                 options.keepAliveInterval = 60
                 // Paho MQTT库的setWill是protected，暂不使用离线消息功能
-                
+
                 mqttClient?.connect(options)
                 mqttClient?.subscribe(commandTopic, 0)
-                
+
                 // 订阅授权响应主题
                 mqttClient?.subscribe(AUTH_TOPIC, 0)
-                
+
                 Log.d(TAG, "MQTT Connected! Subscribed to: $commandTopic")
                 logToFile("MQTT Connected OK!")
-                
+
                 // 发送设备注册/认证请求
                 registerDevice()
-                
+
                 mqttHandler.post {
                     binding.statusText?.text = "云端已连接"
                 }
-                
+
                 // 设置消息回调
                 mqttClient?.setCallback(object : MqttCallback {
                     override fun connectionLost(cause: Throwable?) {
@@ -353,12 +353,12 @@ class MainActivity : AppCompatActivity() {
                         reconnectMQTT()
         checkForUpdate() // 检查更新
                     }
-                    
+
                     override fun messageArrived(topic: String?, message: MqttMessage?) {
                         try {
                             val payload = String(message?.payload ?: ByteArray(0))
                             Log.d(TAG, "Received: $topic -> $payload")
-                            
+
                             // 处理授权响应
                             if (topic == AUTH_TOPIC) {
                                 handleAuthResponse(payload)
@@ -369,10 +369,10 @@ class MainActivity : AppCompatActivity() {
                             Log.e(TAG, "Error handling message: ${e.message}")
                         }
                     }
-                    
+
                     override fun deliveryComplete(token: IMqttDeliveryToken?) {}
                 })
-                
+
             } catch (e: Exception) {
                 Log.e(TAG, "MQTT Connection Error: ${e.message}")
                 logToFile("MQTT Error: ${e.message}")
@@ -382,7 +382,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    
+
     /**
      * 向云端注册设备
      */
@@ -401,7 +401,7 @@ class MainActivity : AppCompatActivity() {
             }
             mqttClient?.publish(registerTopic, payload.toString().toByteArray(), 1, false)
             Log.d(TAG, "Device registration sent: $deviceId")
-            
+
             // 注册成功后发送在线状态
             sendStatus("online")
             // 启动定时发送状态
@@ -410,7 +410,7 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Failed to register device: ${e.message}")
         }
     }
-    
+
     /**
      * 发送设备状态到MQTT
      */
@@ -428,7 +428,7 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Failed to send status: ${e.message}")
         }
     }
-    
+
     /**
      * 启动定时发送状态
      */
@@ -444,7 +444,7 @@ class MainActivity : AppCompatActivity() {
         }
         statusHandler.post(statusTimerRunnable!!)
     }
-    
+
     /**
      * 停止定时发送状态
      */
@@ -455,7 +455,7 @@ class MainActivity : AppCompatActivity() {
             sendStatus("offline")
         }
     }
-    
+
     /**
      * 处理授权响应
      */
@@ -466,7 +466,7 @@ class MainActivity : AppCompatActivity() {
                 "auth_result" -> {
                     val authorized = resp.getBoolean("authorized")
                     val message = resp.optString("message", "")
-                    
+
                     mqttHandler.post {
                         if (authorized) {
                             binding.statusText?.text = "设备已授权: $message"
@@ -498,7 +498,7 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Auth response parse error: ${e.message}")
         }
     }
-    
+
     /**
      * 显示未授权提示并播放欢迎视频
      */
@@ -511,7 +511,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {}
         }
     }
-    
+
     /**
      * 播放欢迎视频（循环）
      */
@@ -533,7 +533,7 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "播放欢迎视频失败: ${e.message}")
         }
     }
-    
+
     private fun reconnectMQTT() {
         mqttHandler.postDelayed({
             try {
@@ -545,7 +545,7 @@ class MainActivity : AppCompatActivity() {
         requestAuthSync()
         }, 5000)
     }
-    
+
     // 请求同步授权状态
     private fun requestAuthSync() {
         try {
@@ -560,12 +560,12 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "请求授权同步失败: ${e.message}")
         }
     }
-    
+
     private fun handleCommand(json: String) {
         try {
             val cmd = JSONObject(json)
             val action = cmd.getString("action")
-            
+
             when (action) {
                 "play" -> {
                     val url = cmd.optString("url", "")
@@ -641,7 +641,7 @@ class MainActivity : AppCompatActivity() {
                     val version = cmd.optString("version", "")
                     val serverCode = cmd.optInt("version_code", 0)
                     Log.w(TAG, "OTA: url=$url, version=$version, serverCode=$serverCode, localCode=$VERSION_CODE")
-                    
+
                     // 安全校验：版本号校验 + URL来源验证
                     if (url.isNotEmpty() && serverCode > VERSION_CODE) {
                         // 验证URL来自可信服务器（使用startsWith防止绕过）
@@ -652,7 +652,7 @@ class MainActivity : AppCompatActivity() {
                                 android.widget.Toast.makeText(this, "更新来源不明，已拒绝", android.widget.Toast.LENGTH_LONG).show()
                             }
                         }
-                        
+
                         logToFile("收到OTA更新推送: $version")
                         // 用Handler在主线程显示Toast
                         mqttHandler.post {
@@ -671,7 +671,7 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Command parse error: ${e.message}")
         }
     }
-    
+
     private fun playFromUrl(url: String) {
         Log.d(TAG, "Playing from URL: $url")
         mqttHandler.post {
@@ -687,13 +687,13 @@ class MainActivity : AppCompatActivity() {
             binding.statusText?.text = "播放: $url"
         }
     }
-    
+
     private fun playFromCloud(videoId: String) {
         Log.d(TAG, "Playing from cloud: $videoId")
         mqttHandler.post {
             binding.statusText?.text = "下载中: $videoId"
         }
-        
+
         executor.execute {
             try {
                 val apiUrl = "http://47.102.106.237/api/materials/$videoId"
@@ -703,7 +703,7 @@ class MainActivity : AppCompatActivity() {
                 val json = JSONObject(response)
                 val url = json.getString("url")
                 val videoUrl = "http://47.102.106.237$url"
-                
+
                 playFromUrl(videoUrl)
             } catch (e: Exception) {
                 Log.e(TAG, "Play from cloud error: ${e.message}")
@@ -713,7 +713,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    
+
     /**
      * 播放本地视频
      * @param folder 文件夹名 (01-20)
@@ -722,7 +722,7 @@ class MainActivity : AppCompatActivity() {
     private fun playLocalVideo(folder: String, filename: String) {
         val videoFile = File(videoFolderPath, "$folder/$filename")
         Log.d(TAG, "Playing local: ${videoFile.absolutePath}")
-        
+
         if (!videoFile.exists()) {
             Log.e(TAG, "File not found: ${videoFile.absolutePath}")
             mqttHandler.post {
@@ -730,7 +730,7 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        
+
         mqttHandler.post {
             releasePlayer()
             player = ExoPlayer.Builder(this).build().apply {
@@ -744,7 +744,7 @@ class MainActivity : AppCompatActivity() {
             binding.statusText?.text = "播放: $folder/$filename"
         }
     }
-    
+
     /**
      * 下载文件并播放
      * @param folder 文件夹名 (01-20)
@@ -754,12 +754,12 @@ class MainActivity : AppCompatActivity() {
     private fun downloadAndPlay(folder: String, filename: String, url: String) {
         val serverUrl = if (url.startsWith("http")) url else "http://47.102.106.237$url"
         val localFile = File(videoFolderPath, "$folder/$filename")
-        
+
         Log.d(TAG, "Downloading: $serverUrl -> ${localFile.absolutePath}")
         mqttHandler.post {
             binding.statusText?.text = "下载中: $filename"
         }
-        
+
         executor.execute {
             try {
                 // 确保文件夹存在
@@ -767,7 +767,7 @@ class MainActivity : AppCompatActivity() {
                 if (!folderDir.exists()) {
                     folderDir.mkdirs()
                 }
-                
+
                 // 下载文件
                 val connection = java.net.URL(serverUrl).openConnection()
                 connection.connectTimeout = 30000
@@ -781,15 +781,15 @@ class MainActivity : AppCompatActivity() {
                 }
                 output.close()
                 input.close()
-                
+
                 Log.d(TAG, "Download complete: ${localFile.absolutePath}")
-                
+
                 // 下载完成后播放
                 mqttHandler.post {
                     binding.statusText?.text = "下载完成，播放: $filename"
                 }
                 playLocalVideo(folder, filename)
-                
+
             } catch (e: Exception) {
                 Log.e(TAG, "Download error: ${e.message}")
                 mqttHandler.post {
@@ -798,19 +798,19 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    
+
     private fun syncFromCloud() {
         mqttHandler.post {
             binding.statusText?.text = "同步中..."
         }
-        
+
         executor.execute {
             try {
                 val apiUrl = "http://47.102.106.237/api/materials"
                 val connection = java.net.URL(apiUrl).openConnection()
                 val response = connection.getInputStream().bufferedReader().readText()
                 Log.d(TAG, "Materials: $response")
-                
+
                 mqttHandler.post {
                     binding.statusText?.text = "同步完成"
                 }
@@ -822,17 +822,17 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    
+
     // 同步预设素材文件夹
     private fun syncPresetFolders(folders: org.json.JSONArray) {
         mqttHandler.post {
             binding.statusText?.text = "同步预设素材(${folders.length()}个文件夹)..."
         }
-        
+
         executor.execute {
             try {
                 val folderList = mutableListOf<Pair<String, String>>() // folderId to folderName
-                
+
                 for (i in 0 until folders.length()) {
                     try {
                         val item = folders.get(i)
@@ -850,7 +850,7 @@ class MainActivity : AppCompatActivity() {
                         Log.w(TAG, "Skipping invalid folder at index $i: ${e.message}")
                     }
                 }
-                
+
                 // 保存文件夹配置到本地
                 val prefsEditor = prefs.edit()
                 val folderJson = org.json.JSONObject()
@@ -859,9 +859,9 @@ class MainActivity : AppCompatActivity() {
                 }
                 prefsEditor.putString("preset_folders", folderJson.toString())
                 prefsEditor.commit() // 同步写入，确保保存成功
-                
+
                 Log.d(TAG, "Preset folders saved: $folderList")
-                
+
                 mqttHandler.post {
                     binding.statusText?.text = "预设素材同步完成"
                 }
@@ -873,22 +873,22 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    
+
     // 同步房间素材到本地文件夹
     private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
         }
-        
+
         executor.execute {
             try {
                 val downloadTasks = mutableListOf<Triple<String, String, String>>() // folderId, filename, url
-                
+
                 // 遍历文件夹映射
                 for (i in 0 until folderMappings.length()) {
                     val folderId = folderMappings.names()?.getString(i) ?: continue
                     val materialIds = folderMappings.getJSONArray(folderId)
-                    
+
                     // 获取每个素材的URL
                     for (j in 0 until materialIds.length()) {
                         val materialId = materialIds.getString(j)
@@ -896,18 +896,18 @@ class MainActivity : AppCompatActivity() {
                         // 这里先假设素材URL可以从预设素材API获取
                     }
                 }
-                
+
                 // 保存房间素材配置
                 val prefsEditor = prefs.edit()
                 prefsEditor.putString("current_room_id", roomId)
                 prefsEditor.putString("room_folder_mappings", folderMappings.toString())
                 prefsEditor.apply() // 异步写入
-                
+
                 Log.d(TAG, "Room materials config saved: room=$roomId, mappings=$folderMappings")
-                
+
                 // 开始下载并播放01文件夹
                 downloadAndPlayFolder("01")
-                
+
             } catch (e: Exception) {
                 Log.e(TAG, "Room materials sync error: ${e.message}")
                 mqttHandler.post {
@@ -916,7 +916,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    
+
     // 下载并播放指定文件夹
     private fun downloadAndPlayFolder(folderId: String) {
         executor.execute {
@@ -925,41 +925,45 @@ class MainActivity : AppCompatActivity() {
                 val mappingsStr = prefs.getString("room_folder_mappings", "{}")
                 val mappings = org.json.JSONObject(mappingsStr)
                 val materialIds = mappings.optJSONArray(folderId)
-                
+
                 if (materialIds == null || materialIds.length() == 0) {
                     Log.d(TAG, "文件夹 $folderId 没有素材")
                     return@execute
                 }
-                
+
                 // 获取素材URL并下载
                 val videoList = mutableListOf<File>()
                 val folderDir = File(videoFolderPath, folderId)
                 if (!folderDir.exists()) {
                     folderDir.mkdirs()
                 }
-                
+
                 for (i in 0 until materialIds.length()) {
                     val materialId = materialIds.getString(i)
                     // TODO: 从API获取素材详情（URL等）
                     // 这里简化处理
                     Log.d(TAG, "需要下载素材: $materialId 到文件夹 $folderId")
                 }
-                
+
                 // 播放01文件夹
                 mqttHandler.post {
                     binding.statusText?.text = "播放文件夹: $folderId"
                     playFolderVideos(folderId)
                 }
-                
+
             } catch (e: Exception) {
                 Log.e(TAG, "Download folder error: ${e.message}")
             }
         }
     }
-    
+
     // 播放本地文件夹的视频
     private fun playFolderVideos(folderId: String) {
+        // 确保在主线程执行
         mqttHandler.post {
+            // 先释放旧播放器
+            releasePlayer()
+            
             // 确保文件夹存在
             val folderDir = File(videoFolderPath, folderId)
             if (!folderDir.exists()) {
@@ -984,18 +988,16 @@ class MainActivity : AppCompatActivity() {
             videoList.addAll(videos)
             
             if (videoList.isNotEmpty()) {
-                // 直接设置播放列表
-                mqttHandler.post {
-                    releasePlayer()
-                    player = ExoPlayer.Builder(this).build().apply {
-                        binding.playerView.player = this
-                        val mediaItems = videoList.map { MediaItem.fromUri(android.net.Uri.fromFile(it)) }
-                        setMediaItems(mediaItems)
-                        repeatMode = Player.REPEAT_MODE_ALL
-                        playWhenReady = true
-                        prepare()
-                    }
+                // 直接创建新播放器播放
+                player = ExoPlayer.Builder(this@MainActivity).build().apply {
+                    binding.playerView.player = this
+                    val mediaItems = videoList.map { MediaItem.fromUri(android.net.Uri.fromFile(it)) }
+                    setMediaItems(mediaItems)
+                    repeatMode = Player.REPEAT_MODE_ALL
+                    playWhenReady = true
+                    prepare()
                 }
+                binding.statusText?.text = "播放文件夹$folderId: ${videoList.size}个视频"
             }
         }
     }
@@ -1028,7 +1030,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    
+
     private fun hideSystemUI() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
             window.decorView.systemUiVisibility = (
@@ -1049,25 +1051,25 @@ class MainActivity : AppCompatActivity() {
 
     private fun scanLocalVideos() {
         val dir = File(videoFolderPath)
-        
+
         if (!dir.exists() || !dir.isDirectory) {
             scanDefaultPaths()
             return
         }
-        
+
         loadVideosFromFolder(dir)
     }
 
     private fun scanDefaultPaths() {
         val defaultPaths = listOf(
             "/storage/emulated/0/DCIM",
-            "/storage/emulated/0/Movies", 
+            "/storage/emulated/0/Movies",
             "/storage/emulated/0/Video",
             "/storage/emulated/0/VIDEOS",
             "/storage/emulated/0/Download",
             "/storage/emulated/0"
         )
-        
+
         for (path in defaultPaths) {
             val dir = File(path)
             if (dir.exists() && dir.isDirectory) {
@@ -1080,7 +1082,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadVideosFromFolder(dir: File) {
-        videoList = dir.listFiles()?.filter { 
+        videoList = dir.listFiles()?.filter {
             it.isFile && isVideoFile(it.extension)
         }?.sortedBy { it.name }?.toMutableList() ?: mutableListOf()
     }
@@ -1091,22 +1093,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun startPlayback() {
         releasePlayer()
-        
+
         player = ExoPlayer.Builder(this).build().apply {
             binding.playerView.player = this
-            
+
             val mediaItems = videoList.map { MediaItem.fromUri(it.toURI().toString()) }
             setMediaItems(mediaItems)
-            
+
             repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
             playWhenReady = autoPlay
-            
+
             prepare()
         }
-        
+
         binding.statusText?.text = "播放本地视频: ${videoList.size}个"
     }
-    
+
     private fun stopPlayback() {
         releasePlayer()
         binding.statusText?.text = "已停止"
@@ -1150,7 +1152,7 @@ class MainActivity : AppCompatActivity() {
         intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         startActivity(intent)
     }
-    
+
     /**
      * 创建20个素材文件夹 (01-20)
      * 与后台文件夹对应
@@ -1161,7 +1163,7 @@ class MainActivity : AppCompatActivity() {
             if (!baseDir.exists()) {
                 baseDir.mkdirs()
             }
-            
+
             for (i in 1..20) {
                 val folderName = String.format("%02d", i)
                 val folder = File(baseDir, folderName)
@@ -1189,7 +1191,7 @@ class MainActivity : AppCompatActivity() {
                         connection.connectTimeout = 10000
                         connection.readTimeout = 10000
                         val response = connection.inputStream.bufferedReader().readText()
-                        
+
                         val json = org.json.JSONObject(response)
                         if (json.has("version_code")) {
                             val serverCode = json.getInt("version_code")
@@ -1216,7 +1218,7 @@ class MainActivity : AppCompatActivity() {
             }
         }, 5000)
     }
-    
+
     // 显示更新通知
     private fun showUpdateNotification(version: String) {
         try {
@@ -1227,22 +1229,22 @@ class MainActivity : AppCompatActivity() {
                     logToFile("请求通知权限")
                 }
             }
-            
+
             val channel = android.app.NotificationChannel(
                 "update_channel", "更新",
                 android.app.NotificationManager.IMPORTANCE_HIGH
             ).apply { description = "APK更新通知" }
-            
+
             val notificationManager = getSystemService(android.app.NotificationManager::class.java)
             notificationManager.createNotificationChannel(channel)
-            
+
             // 使用显式Intent
             val intent = android.content.Intent(this, MainActivity::class.java)
             val pendingIntent = android.app.PendingIntent.getActivity(
                 this, 0, intent,
                 android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
             )
-            
+
             val notification = android.app.Notification.Builder(this, "update_channel")
                 .setContentTitle("发现新版本 $version")
                 .setContentText("点击安装")
@@ -1250,7 +1252,7 @@ class MainActivity : AppCompatActivity() {
                 .setAutoCancel(true)
                 .setContentIntent(pendingIntent)
                 .build()
-            
+
             notificationManager.notify(1001, notification)
             logToFile("通知已显示")
         } catch (e: Exception) {
@@ -1258,7 +1260,7 @@ class MainActivity : AppCompatActivity() {
             logToFile("通知错误: ${e.message}")
         }
     }
-    
+
     /**
      * 下载并安装APK
      */
@@ -1271,7 +1273,7 @@ class MainActivity : AppCompatActivity() {
             }
             return
         }
-        
+
         // 异步下载APK
         Thread {
             try {
@@ -1281,18 +1283,18 @@ class MainActivity : AppCompatActivity() {
                         android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_SHORT).show()
                     } catch(e: Exception) {}
                 }
-                
+
                 val url = java.net.URL(apkUrl)
                 val connection = url.openConnection()
                 connection.connectTimeout = 30000
                 connection.readTimeout = 30000
                 val apkFile = File(cacheDir, "xvj-update-$version.apk")
-                
+
                 // 如果已存在，先删除（避免残留问题）
                 if (apkFile.exists()) {
                     apkFile.delete()
                 }
-                
+
                 connection.getInputStream().use { input ->
                     java.io.FileOutputStream(apkFile).use { output ->
                         val buffer = ByteArray(8192)
@@ -1302,9 +1304,9 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
-                
+
                 logToFile("APK下载完成: ${apkFile.absolutePath}, 大小: ${apkFile.length()} bytes")
-                
+
                 // 验证APK文件有效性（真实APK通常>1MB）
                 if (apkFile.length() < 1_000_000) {
                     logToFile("APK文件过小，可能下载失败")
@@ -1313,7 +1315,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     return@Thread
                 }
-                
+
                 // MD5校验（如果提供了MD5）
                 if (!expectedMd5.isNullOrEmpty()) {
                     val actualMd5 = apkFile.inputStream().use { input ->
@@ -1335,7 +1337,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     logToFile("APK MD5校验通过: $actualMd5")
                 }
-                
+
                 // 使用对话框让用户确认安装
                 mqttHandler.post {
                     try {
@@ -1363,7 +1365,7 @@ class MainActivity : AppCompatActivity() {
                         android.widget.Toast.makeText(this, "更新已下载，请手动安装", android.widget.Toast.LENGTH_LONG).show()
                     }
                 }
-                
+
             } catch (e: Exception) {
                 logToFile("下载APK失败: ${e.message}")
                 mqttHandler.post {
