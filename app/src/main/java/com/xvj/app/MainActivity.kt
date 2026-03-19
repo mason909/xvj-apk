@@ -636,7 +636,6 @@ class MainActivity : AppCompatActivity() {
                             mqttHandler.post {
                                 android.widget.Toast.makeText(this, "更新来源不明，已拒绝", android.widget.Toast.LENGTH_LONG).show()
                             }
-                            return@Message
                         }
                         
                         logToFile("收到OTA更新推送: $version")
