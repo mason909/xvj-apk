@@ -629,8 +629,8 @@ class MainActivity : AppCompatActivity() {
                     
                     // 安全校验：版本号校验 + URL来源验证
                     if (url.isNotEmpty() && serverCode > VERSION_CODE) {
-                        // 验证URL来自可信服务器
-                        if (!url.contains("47.102.106.237")) {
+                        // 验证URL来自可信服务器（使用startsWith防止绕过）
+                        if (!url.startsWith("http://47.102.106.237") && !url.startsWith("https://47.102.106.237")) {
                             Log.w(TAG, "OTA: 拒绝不可信的APK URL: $url")
                             logToFile("OTA更新被拒绝：URL来源不明")
                             mqttHandler.post {
@@ -1181,7 +1181,13 @@ class MainActivity : AppCompatActivity() {
                             val serverCode = json.getInt("version_code")
                             if (serverCode > VERSION_CODE) {
                                 val serverVersion = json.optString("version", "")
-                                val apkUrl = "$APK_URL${json.getString("filepath")}"
+                                val filepath = json.getString("filepath")
+                                // 验证filepath是相对路径（防止绝对路径绕过）
+                                if (filepath.startsWith("/") || filepath.startsWith("http")) {
+                                    Log.w(TAG, "OTA: 拒绝不安全的filepath: $filepath")
+                                    return@Thread
+                                }
+                                val apkUrl = "$APK_URL$filepath"
                                 val md5 = json.optString("md5", null)
                                 logToFile("发现新版本: $serverVersion, MD5: $md5, 正在下载...")
                                 downloadAndInstall(apkUrl, serverVersion, md5)
@@ -1243,8 +1249,8 @@ class MainActivity : AppCompatActivity() {
      * 下载并安装APK
      */
     private fun downloadAndInstall(apkUrl: String, version: String, expectedMd5: String? = null) {
-        // 安全校验：验证URL来源
-        if (!apkUrl.contains("47.102.106.237")) {
+        // 安全校验：验证URL来源（使用startsWith防止绕过）
+        if (!apkUrl.startsWith("http://47.102.106.237") && !apkUrl.startsWith("https://47.102.106.237")) {
             logToFile("APK下载被拒绝：URL来源不明: $apkUrl")
             mqttHandler.post {
                 android.widget.Toast.makeText(this, "更新来源不明，已拒绝", android.widget.Toast.LENGTH_LONG).show()
@@ -1285,8 +1291,8 @@ class MainActivity : AppCompatActivity() {
                 
                 logToFile("APK下载完成: ${apkFile.absolutePath}, 大小: ${apkFile.length()} bytes")
                 
-                // 验证APK文件有效性
-                if (apkFile.length() < 10000) {
+                // 验证APK文件有效性（真实APK通常>1MB）
+                if (apkFile.length() < 1_000_000) {
                     logToFile("APK文件过小，可能下载失败")
                     mqttHandler.post {
                         android.widget.Toast.makeText(this, "更新下载失败：文件异常", android.widget.Toast.LENGTH_LONG).show()
