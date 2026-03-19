@@ -1319,6 +1319,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 // MD5校验（如果提供了MD5）
+                val finalApkFile = apkFile  // 捕获最终变量供lambda使用
                 if (!expectedMd5.isNullOrEmpty()) {
                     val actualMd5 = apkFile.inputStream().use { input ->
                         val digest = java.security.MessageDigest.getInstance("MD5")
@@ -1341,6 +1342,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 // 使用对话框让用户确认安装
+                val installFile = finalApkFile  // 传递文件引用到Dialog
                 mqttHandler.post {
                     try {
                         android.app.AlertDialog.Builder(this)
@@ -1349,7 +1351,7 @@ class MainActivity : AppCompatActivity() {
                             .setPositiveButton("确定") { _, _ ->
                                 // 启动安装
                                 val apkUri = androidx.core.content.FileProvider.getUriForFile(
-                                    this, "${packageName}.fileprovider", apkFile
+                                    this, "${packageName}.fileprovider", installFile
                                 )
                                 val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
                                     setDataAndType(apkUri, "application/vnd.android.package-archive")
