@@ -627,7 +627,18 @@ class MainActivity : AppCompatActivity() {
                     val serverCode = cmd.optInt("version_code", 0)
                     Log.w(TAG, "OTA: url=$url, version=$version, serverCode=$serverCode, localCode=$VERSION_CODE")
                     
-                    if (url.isNotEmpty()) {
+                    // 安全校验：版本号校验 + URL来源验证
+                    if (url.isNotEmpty() && serverCode > VERSION_CODE) {
+                        // 验证URL来自可信服务器
+                        if (!url.contains("47.102.106.237")) {
+                            Log.w(TAG, "OTA: 拒绝不可信的APK URL: $url")
+                            logToFile("OTA更新被拒绝：URL来源不明")
+                            mqttHandler.post {
+                                android.widget.Toast.makeText(this, "更新来源不明，已拒绝", android.widget.Toast.LENGTH_LONG).show()
+                            }
+                            return@Message
+                        }
+                        
                         logToFile("收到OTA更新推送: $version")
                         // 用Handler在主线程显示Toast
                         mqttHandler.post {
@@ -635,8 +646,10 @@ class MainActivity : AppCompatActivity() {
                                 android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_LONG).show()
                             } catch(e: Exception) {}
                         }
-                        // 直接下载并提示用户安装
+                        // 下载并提示用户安装
                         downloadAndInstall(url, version)
+                    } else if (serverCode <= VERSION_CODE) {
+                        Log.d(TAG, "OTA: 当前已是最新版本 ($VERSION_CODE >= $serverCode)")
                     }
                 }
             }
@@ -1169,8 +1182,9 @@ class MainActivity : AppCompatActivity() {
                             if (serverCode > VERSION_CODE) {
                                 val serverVersion = json.optString("version", "")
                                 val apkUrl = "$APK_URL${json.getString("filepath")}"
-                                logToFile("发现新版本: $serverVersion, 正在下载...")
-                                downloadAndInstall(apkUrl, serverVersion)
+                                val md5 = json.optString("md5", null)
+                                logToFile("发现新版本: $serverVersion, MD5: $md5, 正在下载...")
+                                downloadAndInstall(apkUrl, serverVersion, md5)
                             }
                         }
                     } catch (e: Exception) {
@@ -1228,7 +1242,16 @@ class MainActivity : AppCompatActivity() {
     /**
      * 下载并安装APK
      */
-    private fun downloadAndInstall(apkUrl: String, version: String) {
+    private fun downloadAndInstall(apkUrl: String, version: String, expectedMd5: String? = null) {
+        // 安全校验：验证URL来源
+        if (!apkUrl.contains("47.102.106.237")) {
+            logToFile("APK下载被拒绝：URL来源不明: $apkUrl")
+            mqttHandler.post {
+                android.widget.Toast.makeText(this, "更新来源不明，已拒绝", android.widget.Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        
         // 异步下载APK
         Thread {
             try {
@@ -1245,6 +1268,11 @@ class MainActivity : AppCompatActivity() {
                 connection.readTimeout = 30000
                 val apkFile = File(cacheDir, "xvj-update-$version.apk")
                 
+                // 如果已存在，先删除（避免残留问题）
+                if (apkFile.exists()) {
+                    apkFile.delete()
+                }
+                
                 connection.getInputStream().use { input ->
                     java.io.FileOutputStream(apkFile).use { output ->
                         val buffer = ByteArray(8192)
@@ -1255,7 +1283,38 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 
-                logToFile("APK下载完成: ${apkFile.absolutePath}")
+                logToFile("APK下载完成: ${apkFile.absolutePath}, 大小: ${apkFile.length()} bytes")
+                
+                // 验证APK文件有效性
+                if (apkFile.length() < 10000) {
+                    logToFile("APK文件过小，可能下载失败")
+                    mqttHandler.post {
+                        android.widget.Toast.makeText(this, "更新下载失败：文件异常", android.widget.Toast.LENGTH_LONG).show()
+                    }
+                    return@Thread
+                }
+                
+                // MD5校验（如果提供了MD5）
+                if (!expectedMd5.isNullOrEmpty()) {
+                    val actualMd5 = apkFile.inputStream().use { input ->
+                        val digest = java.security.MessageDigest.getInstance("MD5")
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            digest.update(buffer, 0, bytesRead)
+                        }
+                        digest.digest().joinToString("") { "%02x".format(it) }
+                    }
+                    if (actualMd5 != expectedMd5) {
+                        logToFile("APK MD5校验失败！期望: $expectedMd5, 实际: $actualMd5")
+                        mqttHandler.post {
+                            android.widget.Toast.makeText(this, "更新校验失败，请重新尝试", android.widget.Toast.LENGTH_LONG).show()
+                        }
+                        apkFile.delete()
+                        return@Thread
+                    }
+                    logToFile("APK MD5校验通过: $actualMd5")
+                }
                 
                 // 使用对话框让用户确认安装
                 mqttHandler.post {
