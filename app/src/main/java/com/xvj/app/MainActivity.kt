@@ -486,6 +486,13 @@ class MainActivity : AppCompatActivity() {
                             
                             // 先停止当前播放
                             stopPlayback()
+                            
+                            // 开始同步素材
+                            if (folderMappings != null) {
+                                logToFile("开始根据房间配置同步素材...")
+                                syncMaterials()
+                            }
+                            
                             // 播放默认folder01（实际播放由RS485/DMX信号决定）
                             playFolderVideos("01")
                         } else {
@@ -1213,6 +1220,113 @@ class MainActivity : AppCompatActivity() {
     /**
      * 检查更新 - 延迟5秒后执行
      */
+    // 素材同步：根据folder_mappings从云端同步素材
+    private fun syncMaterials() {
+        logToFile("开始同步素材...")
+        
+        val mappingsStr = prefs.getString("room_folder_mappings", "{}")
+        if (mappingsStr.isNullOrEmpty()) {
+            logToFile("无素材映射配置，跳过同步")
+            return
+        }
+        
+        try {
+            val mappings = org.json.JSONObject(mappingsStr)
+            val keys = mappings.keys()
+            
+            while (keys.hasNext()) {
+                val sceneId = keys.next()
+                val folderId = mappings.getString(sceneId)
+                logToFile("同步场景$sceneId -> 文件夹$folderId")
+                syncFolder(folderId)
+            }
+            
+            logToFile("素材同步完成")
+        } catch (e: Exception) {
+            Log.e(TAG, "素材同步失败: ${e.message}")
+            logToFile("素材同步失败: ${e.message}")
+        }
+    }
+    
+    // 同步单个文件夹
+    private fun syncFolder(folderId: String) {
+        Thread {
+            try {
+                // 获取云端该文件夹的文件列表
+                val url = java.net.URL("$APK_URL/api/materials?folder=$folderId")
+                val connection = url.openConnection()
+                connection.connectTimeout = 10000
+                connection.readTimeout = 30000
+                val response = connection.inputStream.bufferedReader().readText()
+                val json = org.json.JSONArray(response)
+                
+                val localFolder = File(videoFolderPath, folderId)
+                if (!localFolder.exists()) {
+                    localFolder.mkdirs()
+                }
+                
+                for (i in 0 until json.length()) {
+                    val file = json.getJSONObject(i)
+                    val filename = file.getString("filename")
+                    val md5 = file.optString("md5", "")
+                    val urlPath = file.getString("url")
+                    
+                    val localFile = File(localFolder, filename)
+                    
+                    // 检查是否需要下载
+                    if (localFile.exists() && md5.isNotEmpty()) {
+                        val localMd5 = calculateMd5(localFile)
+                        if (localMd5 == md5) {
+                            Log.d(TAG, "文件已存在且MD5一致: $filename")
+                            continue
+                        }
+                    }
+                    
+                    // 下载文件
+                    logToFile("下载素材: $filename")
+                    downloadFile("$APK_URL$urlPath", localFile)
+                }
+                
+                logToFile("文件夹$folderId 同步完成")
+            } catch (e: Exception) {
+                Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
+            }
+        }.start()
+    }
+    
+    // 计算文件MD5
+    private fun calculateMd5(file: File): String {
+        return try {
+            val digest = java.security.MessageDigest.getInstance("MD5")
+            val bytes = file.inputStream().use { it.readBytes() }
+            digest.digest(bytes).joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+    
+    // 下载文件
+    private fun downloadFile(urlStr: String, destFile: File) {
+        try {
+            val url = java.net.URL(urlStr)
+            val connection = url.openConnection()
+            connection.connectTimeout = 30000
+            connection.readTimeout = 30000
+            connection.getInputStream().use { input ->
+                FileOutputStream(destFile).use { output ->
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                    }
+                }
+            }
+            Log.d(TAG, "下载完成: ${destFile.name}")
+        } catch (e: Exception) {
+            Log.e(TAG, "下载失败: ${e.message}")
+        }
+    }
+    
     private fun checkForUpdate() {
         Handler(Looper.getMainLooper()).postDelayed({
             try {
