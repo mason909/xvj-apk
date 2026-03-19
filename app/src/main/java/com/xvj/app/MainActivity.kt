@@ -961,27 +961,36 @@ class MainActivity : AppCompatActivity() {
 
     // 播放本地文件夹的视频
     private fun playFolderVideos(folderId: String) {
+        Log.d(TAG, "playFolderVideos called: folderId=$folderId")
+        
         // 已经在主线程执行，直接处理
         // 先释放旧播放器
         releasePlayer()
         
         // 确保文件夹存在
         val folderDir = File(videoFolderPath, folderId)
+        Log.d(TAG, "Video folder path: ${folderDir.absolutePath}")
+        
         if (!folderDir.exists()) {
             folderDir.mkdirs()
+            Log.d(TAG, "Created folder: ${folderDir.absolutePath}")
         }
         
         if (!folderDir.exists() || !folderDir.isDirectory) {
             binding.statusText?.text = "无法创建文件夹: $folderId"
+            Log.e(TAG, "Cannot create folder: $folderId")
             return
         }
         
         val videos = folderDir.listFiles()?.filter { 
             it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
-        }?.sortedBy { it.name } ?: return
+        }?.sortedBy { it.name } ?: emptyList()
+        
+        Log.d(TAG, "Found videos: ${videos.size}")
         
         if (videos.isEmpty()) {
             binding.statusText?.text = "文件夹为空: $folderId"
+            Log.w(TAG, "Folder is empty: $folderId")
             return
         }
         
@@ -990,6 +999,7 @@ class MainActivity : AppCompatActivity() {
         
         if (videoList.isNotEmpty()) {
             // 直接创建新播放器播放
+            Log.d(TAG, "Creating new player for folder $folderId")
             player = ExoPlayer.Builder(this).build().apply {
                 binding.playerView.player = this
                 val mediaItems = videoList.map { MediaItem.fromUri(android.net.Uri.fromFile(it)) }
@@ -999,7 +1009,7 @@ class MainActivity : AppCompatActivity() {
                 prepare()
             }
             binding.statusText?.text = "播放文件夹$folderId: ${videoList.size}个视频"
-            Log.d(TAG, "开始播放文件夹$folderId: ${videoList.size}个视频")
+            Log.d(TAG, "Player created, 开始播放文件夹$folderId")
         }
     }
 
@@ -1111,13 +1121,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopPlayback() {
+        Log.d(TAG, "stopPlayback called")
         releasePlayer()
         binding.statusText?.text = "已停止"
     }
 
     private fun releasePlayer() {
+        Log.d(TAG, "releasePlayer called, current player: $player")
         player?.release()
         player = null
+        binding.playerView.player = null
     }
 
     override fun onResume() {
