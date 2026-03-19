@@ -508,7 +508,7 @@ class MainActivity : AppCompatActivity() {
         playWelcomeVideo()
         Log.w(TAG, "UNAUTHORIZED: $message")
     }
-    
+
     /**
      * 播放欢迎视频（循环）
      */
@@ -517,7 +517,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 // 先释放旧播放器
                 releasePlayer()
-                
+
                 // 创建新播放器播放欢迎视频
                 player = ExoPlayer.Builder(this@MainActivity).build().apply {
                     binding.playerView.player = this
@@ -961,46 +961,45 @@ class MainActivity : AppCompatActivity() {
 
     // 播放本地文件夹的视频
     private fun playFolderVideos(folderId: String) {
-        // 确保在主线程执行
-        mqttHandler.post {
-            // 先释放旧播放器
-            releasePlayer()
-
-            // 确保文件夹存在
-            val folderDir = File(videoFolderPath, folderId)
-            if (!folderDir.exists()) {
-                folderDir.mkdirs()
+        // 已经在主线程执行，直接处理
+        // 先释放旧播放器
+        releasePlayer()
+        
+        // 确保文件夹存在
+        val folderDir = File(videoFolderPath, folderId)
+        if (!folderDir.exists()) {
+            folderDir.mkdirs()
+        }
+        
+        if (!folderDir.exists() || !folderDir.isDirectory) {
+            binding.statusText?.text = "无法创建文件夹: $folderId"
+            return
+        }
+        
+        val videos = folderDir.listFiles()?.filter { 
+            it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
+        }?.sortedBy { it.name } ?: return
+        
+        if (videos.isEmpty()) {
+            binding.statusText?.text = "文件夹为空: $folderId"
+            return
+        }
+        
+        videoList.clear()
+        videoList.addAll(videos)
+        
+        if (videoList.isNotEmpty()) {
+            // 直接创建新播放器播放
+            player = ExoPlayer.Builder(this).build().apply {
+                binding.playerView.player = this
+                val mediaItems = videoList.map { MediaItem.fromUri(android.net.Uri.fromFile(it)) }
+                setMediaItems(mediaItems)
+                repeatMode = Player.REPEAT_MODE_ALL
+                playWhenReady = true
+                prepare()
             }
-
-            if (!folderDir.exists() || !folderDir.isDirectory) {
-                binding.statusText?.text = "无法创建文件夹: $folderId"
-                return@post
-            }
-
-            val videos = folderDir.listFiles()?.filter {
-                it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
-            }?.sortedBy { it.name } ?: return@post
-
-            if (videos.isEmpty()) {
-                binding.statusText?.text = "文件夹为空: $folderId"
-                return@post
-            }
-
-            videoList.clear()
-            videoList.addAll(videos)
-
-            if (videoList.isNotEmpty()) {
-                // 直接创建新播放器播放
-                player = ExoPlayer.Builder(this@MainActivity).build().apply {
-                    binding.playerView.player = this
-                    val mediaItems = videoList.map { MediaItem.fromUri(android.net.Uri.fromFile(it)) }
-                    setMediaItems(mediaItems)
-                    repeatMode = Player.REPEAT_MODE_ALL
-                    playWhenReady = true
-                    prepare()
-                }
-                binding.statusText?.text = "播放文件夹$folderId: ${videoList.size}个视频"
-            }
+            binding.statusText?.text = "播放文件夹$folderId: ${videoList.size}个视频"
+            Log.d(TAG, "开始播放文件夹$folderId: ${videoList.size}个视频")
         }
     }
 
