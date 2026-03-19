@@ -1257,23 +1257,33 @@ class MainActivity : AppCompatActivity() {
                 
                 logToFile("APK下载完成: ${apkFile.absolutePath}")
                 
-                // 提示用户点击安装
+                // 使用对话框让用户确认安装
                 mqttHandler.post {
                     try {
-                        android.widget.Toast.makeText(this, "更新已下载，点这里安装", android.widget.Toast.LENGTH_LONG).show()
-                    } catch(e: Exception) {}
+                        android.app.AlertDialog.Builder(this)
+                            .setTitle("更新已下载")
+                            .setMessage("版本: $version\n点击确定开始安装")
+                            .setPositiveButton("确定") { _, _ ->
+                                // 启动安装
+                                val apkUri = androidx.core.content.FileProvider.getUriForFile(
+                                    this, "${packageName}.fileprovider", apkFile
+                                )
+                                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                                    setDataAndType(apkUri, "application/vnd.android.package-archive")
+                                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                startActivity(intent)
+                            }
+                            .setNegativeButton("取消", null)
+                            .setCancelable(false)
+                            .show()
+                    } catch(e: Exception) {
+                        Log.e(TAG, "Show install dialog error: ${e.message}")
+                        // 回退到Toast
+                        android.widget.Toast.makeText(this, "更新已下载，请手动安装", android.widget.Toast.LENGTH_LONG).show()
+                    }
                 }
-                
-                // 启动安装
-                val apkUri = androidx.core.content.FileProvider.getUriForFile(
-                    this, "${packageName}.fileprovider", apkFile
-                )
-                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                    setDataAndType(apkUri, "application/vnd.android.package-archive")
-                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                }
-                startActivity(intent)
                 
             } catch (e: Exception) {
                 logToFile("下载APK失败: ${e.message}")
