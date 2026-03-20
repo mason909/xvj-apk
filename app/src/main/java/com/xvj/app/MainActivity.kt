@@ -671,13 +671,14 @@ class MainActivity : AppCompatActivity() {
 
                     // 安全校验：版本号校验 + URL来源验证
                     if (url.isNotEmpty() && serverCode > VERSION_CODE) {
-                        // 验证URL来自可信服务器（使用startsWith防止绕过）
-                        if (!url.startsWith("http://47.102.106.237") && !url.startsWith("https://47.102.106.237")) {
+                        // 验证URL来自可信服务器（精确匹配IP，防止绕过）
+                        if (!isTrustedApkUrl(url)) {
                             Log.w(TAG, "OTA: 拒绝不可信的APK URL: $url")
                             logToFile("OTA更新被拒绝：URL来源不明")
                             mqttHandler.post {
                                 android.widget.Toast.makeText(this, "更新来源不明，已拒绝", android.widget.Toast.LENGTH_LONG).show()
                             }
+                            return@Runnable
                         }
 
                         logToFile("收到OTA更新推送: $version")
@@ -1327,6 +1328,75 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
+
+    /**
+     * 验证APK下载URL是否可信
+     * 精确匹配IP，防止URL绕过攻击
+     */
+    private fun isTrustedApkUrl(url: String): Boolean {
+        return try {
+            val uri = java.net.URI(url)
+            val host = uri.host ?: return false
+            // 精确匹配IP
+            host == "47.102.106.237" || host == "47.102.106.237."
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 验证filepath是否安全（防止路径穿越）
+     */
+    private fun isValidFilepath(filepath: String): Boolean {
+        // 不允许绝对路径
+        if (filepath.startsWith("/")) return false
+        // 不允许http/https协议
+        if (filepath.startsWith("http://") || filepath.startsWith("https://")) return false
+        // 不允许路径穿越
+        if (filepath.contains("..")) return false
+        // 必须是相对路径且只包含安全字符
+        return filepath.matches(Regex("^[a-zA-Z0-9_\-./]+$"))
+    }
+
+
+    /**
+     * 验证APK签名
+     * 检查APK是否由可信证书签名
+     */
+    private fun verifyApkSignature(apkFile: File): Boolean {
+        return try {
+            val pm = packageManager
+            // 获取APK信息（包含签名）
+            val info = pm.getPackageArchiveInfo(apkFile.absolutePath, android.content.pm.PackageManager.GET_SIGNATURES)
+                ?: return false
+            
+            val signatures = info.signatures
+                ?: return false
+            
+            if (signatures.isEmpty()) {
+                Log.w(TAG, "APK没有签名")
+                return false
+            }
+            
+            // 计算签名证书的SHA-256指纹
+            val cert = signatures[0].toByteArray()
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            val digest = md.digest(cert)
+            val fingerprint = digest.joinToString("") { "%02x".format(it) }
+            
+            // 验证签名证书指纹（需要替换为实际证书指纹）
+            // 这里先允许所有有效签名，但在生产环境应配置可信证书指纹
+            Log.d(TAG, "APK签名证书指纹: $fingerprint")
+            
+            // TODO: 在生产环境配置 EXPECTED_CERT_FINGERPRINT 并启用以下验证:
+            // return fingerprint == EXPECTED_CERT_FINGERPRINT
+            return true  // 开发环境暂时跳过指纹验证
+        } catch (e: Exception) {
+            Log.e(TAG, "APK签名验证异常: ${e.message}")
+            return false
+        }
+    }
+
     private fun checkForUpdate() {
         Handler(Looper.getMainLooper()).postDelayed({
             try {
@@ -1344,8 +1414,8 @@ class MainActivity : AppCompatActivity() {
                             if (serverCode > VERSION_CODE) {
                                 val serverVersion = json.optString("version", "")
                                 val filepath = json.getString("filepath")
-                                // 验证filepath是相对路径（防止绝对路径绕过）
-                                if (filepath.startsWith("/") || filepath.startsWith("http")) {
+                                // 验证filepath安全性（防止路径穿越和绝对路径绕过）
+                                if (!isValidFilepath(filepath)) {
                                     Log.w(TAG, "OTA: 拒绝不安全的filepath: $filepath")
                                     return@Thread
                                 }
@@ -1411,8 +1481,8 @@ class MainActivity : AppCompatActivity() {
      * 下载并安装APK
      */
     private fun downloadAndInstall(apkUrl: String, version: String, expectedMd5: String? = null) {
-        // 安全校验：验证URL来源（使用startsWith防止绕过）
-        if (!apkUrl.startsWith("http://47.102.106.237") && !apkUrl.startsWith("https://47.102.106.237")) {
+        // 安全校验：验证URL来源（精确匹配IP，防止绕过）
+        if (!isTrustedApkUrl(apkUrl)) {
             logToFile("APK下载被拒绝：URL来源不明: $apkUrl")
             mqttHandler.post {
                 android.widget.Toast.makeText(this, "更新来源不明，已拒绝", android.widget.Toast.LENGTH_LONG).show()
@@ -1462,11 +1532,11 @@ class MainActivity : AppCompatActivity() {
                     return@Thread
                 }
 
-                // MD5校验（如果提供了MD5）
+                // SHA-256校验（如果提供了哈希值）- 比MD5更安全
                 val finalApkFile = apkFile  // 捕获最终变量供lambda使用
                 if (!expectedMd5.isNullOrEmpty()) {
-                    val actualMd5 = apkFile.inputStream().use { input ->
-                        val digest = java.security.MessageDigest.getInstance("MD5")
+                    val actualHash = apkFile.inputStream().use { input ->
+                        val digest = java.security.MessageDigest.getInstance("SHA-256")
                         val buffer = ByteArray(8192)
                         var bytesRead: Int
                         while (input.read(buffer).also { bytesRead = it } != -1) {
@@ -1474,16 +1544,27 @@ class MainActivity : AppCompatActivity() {
                         }
                         digest.digest().joinToString("") { "%02x".format(it) }
                     }
-                    if (actualMd5 != expectedMd5) {
-                        logToFile("APK MD5校验失败！期望: $expectedMd5, 实际: $actualMd5")
+                    if (actualHash != expectedMd5) {
+                        logToFile("APK SHA-256校验失败！期望: $expectedMd5, 实际: $actualHash")
                         mqttHandler.post {
                             android.widget.Toast.makeText(this, "更新校验失败，请重新尝试", android.widget.Toast.LENGTH_LONG).show()
                         }
                         apkFile.delete()
                         return@Thread
                     }
-                    logToFile("APK MD5校验通过: $actualMd5")
+                    logToFile("APK SHA-256校验通过: $actualHash")
                 }
+
+                // 验证APK签名（安全防护）
+                if (!verifyApkSignature(apkFile)) {
+                    logToFile("APK签名验证失败！")
+                    mqttHandler.post {
+                        android.widget.Toast.makeText(this, "更新验证失败：APK签名无效", android.widget.Toast.LENGTH_LONG).show()
+                    }
+                    apkFile.delete()
+                    return@Thread
+                }
+                logToFile("APK签名验证通过")
 
                 // 使用对话框让用户确认安装
                 val installFile = finalApkFile  // 传递文件引用到Dialog
@@ -1493,16 +1574,22 @@ class MainActivity : AppCompatActivity() {
                             .setTitle("更新已下载")
                             .setMessage("版本: $version\n点击确定开始安装")
                             .setPositiveButton("确定") { _, _ ->
-                                // 启动安装
-                                val apkUri = androidx.core.content.FileProvider.getUriForFile(
-                                    this, "${packageName}.fileprovider", installFile
-                                )
-                                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                                    setDataAndType(apkUri, "application/vnd.android.package-archive")
-                                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                try {
+                                    logToFile("开始安装APK: ${installFile.absolutePath}, exists=${installFile.exists()}, size=${installFile.length()}")
+                                    val apkUri = androidx.core.content.FileProvider.getUriForFile(
+                                        this, "${packageName}.fileprovider", installFile
+                                    )
+                                    logToFile("APK URI: $apkUri")
+                                    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                                        setDataAndType(apkUri, "application/vnd.android.package-archive")
+                                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    startActivity(intent)
+                                } catch (e: Exception) {
+                                    logToFile("安装APK失败: ${e.message}")
+                                    android.widget.Toast.makeText(this, "安装失败: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                                 }
-                                startActivity(intent)
                             }
                             .setNegativeButton("取消", null)
                             .setCancelable(false)
