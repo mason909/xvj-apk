@@ -645,7 +645,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "sync" -> {
-                    syncFromCloud()
+                    // 手动同步 - 同步所有30个文件夹
+                    syncAllFolders()
                 }
                 "preset_sync" -> {
                     // 接收预设素材同步
@@ -1206,7 +1207,7 @@ class MainActivity : AppCompatActivity() {
                 baseDir.mkdirs()
             }
 
-            for (i in 1..20) {
+            for (i in 1..30) {
                 val folderName = String.format("%02d", i)
                 val folder = File(baseDir, folderName)
                 if (!folder.exists()) {
@@ -1250,9 +1251,40 @@ class MainActivity : AppCompatActivity() {
             logToFile("素材同步失败: ${e.message}")
         }
     }
+
+    /**
+     * 手动同步所有30个文件夹
+     */
+    private fun syncAllFolders() {
+        logToFile("开始手动同步所有30个文件夹...")
+        mqttHandler.post {
+            binding.statusText?.text = "同步中: 0/30"
+        }
+        
+        Thread {
+            var completed = 0
+            for (i in 1..30) {
+                val folderId = String.format("%02d", i)
+                try {
+                    syncFolderBlocking(folderId)
+                } catch (e: Exception) {
+                    Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
+                }
+                completed++
+                val progress = completed
+                mqttHandler.post {
+                    binding.statusText?.text = "同步中: $progress/30"
+                }
+            }
+            logToFile("所有30个文件夹同步完成")
+            mqttHandler.post {
+                binding.statusText?.text = "同步完成: 30/30"
+            }
+        }.start()
+    }
     
-    // 同步单个文件夹
-    private fun syncFolder(folderId: String) {
+    // 同步单个文件夹（阻塞式）
+    private fun syncFolderBlocking(folderId: String) {
         Thread {
             try {
                 // 获取云端该文件夹的文件列表
