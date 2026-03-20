@@ -18,6 +18,7 @@ import com.xvj.app.databinding.ActivityMainBinding
 import org.eclipse.paho.client.mqttv3.*
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.io.FileWriter
 import java.io.PrintWriter
 import java.io.RandomAccessFile
@@ -678,7 +679,7 @@ class MainActivity : AppCompatActivity() {
                             mqttHandler.post {
                                 android.widget.Toast.makeText(this, "更新来源不明，已拒绝", android.widget.Toast.LENGTH_LONG).show()
                             }
-                            return@Runnable
+                            return@post
                         }
 
                         logToFile("收到OTA更新推送: $version")
@@ -1355,7 +1356,7 @@ class MainActivity : AppCompatActivity() {
         // 不允许路径穿越
         if (filepath.contains("..")) return false
         // 必须是相对路径且只包含安全字符
-        return filepath.matches(Regex("^[a-zA-Z0-9_\-./]+$"))
+        return filepath.matches(Regex("^[a-zA-Z0-9_./-]+$"))
     }
 
 
