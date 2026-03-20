@@ -18,7 +18,6 @@ import com.xvj.app.databinding.ActivityMainBinding
 import org.eclipse.paho.client.mqttv3.*
 import org.json.JSONObject
 import java.io.File
-import java.util.concurrent.CountDownLatch
 import java.io.FileOutputStream
 import java.io.FileWriter
 import java.io.PrintWriter
@@ -646,8 +645,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "sync" -> {
-                    // 手动同步 - 同步所有30个文件夹
-                    syncAllFolders()
+                    syncFromCloud()
                 }
                 "preset_sync" -> {
                     // 接收预设素材同步
@@ -833,24 +831,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun syncFromCloud() {
         mqttHandler.post {
-            binding.statusText?.text = "同步中..."
+            binding.statusText?.text = "同步中: 0/30"
         }
 
         executor.execute {
-            try {
-                val apiUrl = "http://47.102.106.237/api/materials"
-                val connection = java.net.URL(apiUrl).openConnection()
-                val response = connection.getInputStream().bufferedReader().readText()
-                Log.d(TAG, "Materials: $response")
-
-                mqttHandler.post {
-                    binding.statusText?.text = "同步完成"
+            var completed = 0
+            for (i in 1..30) {
+                val folderId = String.format("%02d", i)
+                try {
+                    syncFolder(folderId)
+                } catch (e: Exception) {
+                    Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Sync error: ${e.message}")
+                completed++
+                val progress = completed
                 mqttHandler.post {
-                    binding.statusText?.text = "同步失败"
+                    binding.statusText?.text = "同步中: $progress/30"
                 }
+            }
+            mqttHandler.post {
+                binding.statusText?.text = "同步完成: 30/30"
+                // 同步完成后自动播放01文件夹
+                playFolderVideos("01")
             }
         }
     }
@@ -1208,7 +1210,7 @@ class MainActivity : AppCompatActivity() {
                 baseDir.mkdirs()
             }
 
-            for (i in 1..30) {
+            for (i in 1..20) {
                 val folderName = String.format("%02d", i)
                 val folder = File(baseDir, folderName)
                 if (!folder.exists()) {
@@ -1243,7 +1245,7 @@ class MainActivity : AppCompatActivity() {
                 val sceneId = keys.next()
                 val folderId = mappings.getString(sceneId)
                 logToFile("同步场景$sceneId -> 文件夹$folderId")
-                syncFolderBlocking(folderId)
+                syncFolder(folderId)
             }
             
             logToFile("素材同步完成")
@@ -1252,98 +1254,11 @@ class MainActivity : AppCompatActivity() {
             logToFile("素材同步失败: ${e.message}")
         }
     }
-
-    /**
-     * 手动同步所有30个文件夹（顺序执行）
-     */
-    private fun syncAllFolders() {
-        logToFile("开始手动同步所有30个文件夹...")
-        binding.statusText?.text = "同步中: 0/30"
-        
-        Thread {
-            var completed = 0
-            for (i in 1..30) {
-                val folderId = String.format("%02d", i)
-                try {
-                    // 同步完成一个文件夹后再进行下一个
-                    syncFolderSync(folderId)
-                } catch (e: Exception) {
-                    Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
-                }
-                completed++
-                val progress = completed
-                mqttHandler.post {
-                    binding.statusText?.text = "同步中: $progress/30"
-                }
-            }
-            logToFile("所有30个文件夹同步完成")
-            mqttHandler.post {
-                binding.statusText?.text = "同步完成: 30/30"
-                // 同步完成后自动播放01文件夹
-                playFolderVideos("01")
-            }
-        }.start()
-    }
     
-    // 同步单个文件夹（真正阻塞等待完成）
-    private fun syncFolderSync(folderId: String) {
-        val latch = CountDownLatch(1)
-        var error: Exception? = null
-        
+    // 同步单个文件夹（阻塞等待完成）
+    private fun syncFolder(folderId: String) {
+        val latch = java.util.concurrent.CountDownLatch(1)
         Thread {
-            try {
-                // 获取云端该文件夹的文件列表
-                val url = java.net.URL("$APK_URL/api/materials?folder=$folderId")
-                val connection = url.openConnection()
-                connection.connectTimeout = 10000
-                connection.readTimeout = 30000
-                val stream = connection.getInputStream()
-                val reader = BufferedReader(InputStreamReader(stream))
-                val response = reader.readText()
-                reader.close()
-                
-                val json = org.json.JSONArray(response)
-                Log.d(TAG, "云端 $folderId 文件夹有 ${json.length()} 个文件")
-                
-                for (i in 0 until json.length()) {
-                    val file = json.getJSONObject(i)
-                    val filename = file.getString("filename")
-                    val fileUrl = file.getString("url")
-                    val md5 = file.optString("md5", "")
-                    
-                    // 检查本地是否已存在
-                    val localFile = File(videoFolderPath + "/" + folderId, filename)
-                    if (localFile.exists() && localFile.length() > 0) {
-                        if (md5.isNotEmpty()) {
-                            // 验证MD5
-                            val localMd5 = calculateMd5(localFile)
-                            if (localMd5 == md5) {
-                                Log.d(TAG, "文件已存在且MD5匹配: $filename")
-                                continue
-                            }
-                        } else {
-                            Log.d(TAG, "文件已存在: $filename")
-                            continue
-                        }
-                    }
-                    
-                    // 下载文件
-                    val downloadUrl = if (fileUrl.startsWith("http")) fileUrl else "$APK_URL$fileUrl"
-                    downloadFile(downloadUrl, localFile)
-                    Log.d(TAG, "下载完成: $filename")
-                }
-            } catch (e: Exception) {
-                error = e
-                Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
-            } finally {
-                latch.countDown()
-            }
-        }.start()
-        
-        // 等待本次同步完成
-        latch.await()
-        error?.let { throw it }
-    }
             try {
                 // 获取云端该文件夹的文件列表
                 val url = java.net.URL("$APK_URL/api/materials?folder=$folderId")
@@ -1352,11 +1267,44 @@ class MainActivity : AppCompatActivity() {
                 connection.readTimeout = 30000
                 val response = connection.inputStream.bufferedReader().readText()
                 val json = org.json.JSONArray(response)
+                Log.d(TAG, "云端 $folderId 文件夹有 ${json.length()} 个文件")
                 
                 val localFolder = File(videoFolderPath, folderId)
                 if (!localFolder.exists()) {
                     localFolder.mkdirs()
                 }
+                
+                for (i in 0 until json.length()) {
+                    val file = json.getJSONObject(i)
+                    val filename = file.getString("filename")
+                    val md5 = file.optString("md5", "")
+                    val urlPath = file.getString("url")
+                    
+                    val localFile = File(localFolder, filename)
+                    
+                    // 检查是否需要下载
+                    if (localFile.exists() && md5.isNotEmpty()) {
+                        val localMd5 = calculateMd5(localFile)
+                        if (localMd5 == md5) {
+                            Log.d(TAG, "文件已存在且MD5一致: $filename")
+                            continue
+                        }
+                    }
+                    
+                    // 下载文件
+                    val downloadUrl = if (urlPath.startsWith("http")) urlPath else "$APK_URL$urlPath"
+                    downloadFile(downloadUrl, localFile)
+                    Log.d(TAG, "下载完成: $filename")
+                }
+                Log.d(TAG, "文件夹 $folderId 同步完成")
+            } catch (e: Exception) {
+                Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
+            } finally {
+                latch.countDown()
+            }
+        }.start()
+        latch.await()
+    }
                 
                 for (i in 0 until json.length()) {
                     val file = json.getJSONObject(i)
@@ -1417,6 +1365,8 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "下载完成: ${destFile.name}")
         } catch (e: Exception) {
             Log.e(TAG, "下载失败: ${e.message}")
+        } finally {
+            latch.countDown()
         }
     }
     
