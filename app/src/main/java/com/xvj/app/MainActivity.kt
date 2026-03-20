@@ -1242,7 +1242,7 @@ class MainActivity : AppCompatActivity() {
                 val sceneId = keys.next()
                 val folderId = mappings.getString(sceneId)
                 logToFile("同步场景$sceneId -> 文件夹$folderId")
-                syncFolder(folderId)
+                syncFolderBlocking(folderId)
             }
             
             logToFile("素材同步完成")
