@@ -829,76 +829,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-
-    private fun syncFromCloud() {
-        mqttHandler.post {
-            binding.statusText?.text = "同步中: 0/30"
-        }
-
-        executor.execute {
-            var completed = 0
-            for (i in 1..30) {
-                val folderId = String.format("%02d", i)
-                try {
-                    syncFolderInternal(folderId)
-                } catch (e: Exception) {
-                    Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
-                }
-                completed++
-                val progress = completed
-                mqttHandler.post {
-                    binding.statusText?.text = "同步中: $progress/30"
-                }
-            }
-            mqttHandler.post {
-                binding.statusText?.text = "同步完成: 30/30"
-                playFolderVideos("01")
-            }
-        }
-    }
-
-    // 内部同步文件夹函数
-    private fun syncFolderInternal(folderId: String) {
-        try {
-            val url = java.net.URL("$APK_URL/api/materials?folder=$folderId")
-            val connection = url.openConnection()
-            connection.connectTimeout = 10000
-            connection.readTimeout = 30000
-            val response = connection.inputStream.bufferedReader().readText()
-            val json = org.json.JSONArray(response)
-            Log.d(TAG, "云端 $folderId 文件夹有 ${json.length()} 个文件")
-            
-            val localFolder = File(videoFolderPath, folderId)
-            if (!localFolder.exists()) {
-                localFolder.mkdirs()
-            }
-            
-            for (i in 0 until json.length()) {
-                val file = json.getJSONObject(i)
-                val filename = file.getString("filename")
-                val md5 = file.optString("md5", "")
-                val urlPath = file.getString("url")
-                
-                val localFile = File(localFolder, filename)
-                
-                if (localFile.exists() && md5.isNotEmpty()) {
-                    val localMd5 = calculateMd5(localFile)
-                    if (localMd5 == md5) {
-                        Log.d(TAG, "文件已存在且MD5一致: $filename")
-                        continue
-                    }
-                }
-                
-                val downloadUrl = if (urlPath.startsWith("http")) urlPath else "$APK_URL$urlPath"
-                downloadFile(downloadUrl, localFile)
-                Log.d(TAG, "下载完成: $filename")
-            }
-            Log.d(TAG, "文件夹 $folderId 同步完成")
-        } catch (e: Exception) {
-            Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
-        }
-    }
-
     // 同步预设素材文件夹
     private fun syncPresetFolders(folders: org.json.JSONArray) {
         mqttHandler.post {
@@ -1422,50 +1352,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
-    // 同步单个文件夹
-    private fun syncFolder(folderId: String) {
-        Thread {
-            try {
-                // 获取云端该文件夹的文件列表
-                val url = java.net.URL("$APK_URL/api/materials?folder=$folderId")
-                val connection = url.openConnection()
-                connection.connectTimeout = 10000
-                connection.readTimeout = 30000
-                val response = connection.inputStream.bufferedReader().readText()
-                val json = org.json.JSONArray(response)
-                
-                val localFolder = File(videoFolderPath, folderId)
-                if (!localFolder.exists()) {
-                    localFolder.mkdirs()
-                }
-                
-                for (i in 0 until json.length()) {
-                    val file = json.getJSONObject(i)
-                    val filename = file.getString("filename")
-                    val md5 = file.optString("md5", "")
-                    val urlPath = file.getString("url")
-                    
-                    val localFile = File(localFolder, filename)
-                    
-                    // 检查是否需要下载
-                    if (localFile.exists() && md5.isNotEmpty()) {
-                        val localMd5 = calculateMd5(localFile)
-                        if (localMd5 == md5) {
-                            Log.d(TAG, "文件已存在且MD5一致: $filename")
-                            continue
-                        }
-                    }
-                    
-                    // 下载文件
-                    logToFile("下载素材: $filename")
-                    downloadFile("$APK_URL$urlPath", localFile)
-                }
-                
-                logToFile("文件夹$folderId 同步完成")
-            } catch (e: Exception) {
-                Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
-            }
-        }.start()
     }
     
     // 计算文件MD5
