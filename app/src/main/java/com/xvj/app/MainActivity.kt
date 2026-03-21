@@ -951,6 +951,8 @@ class MainActivity : AppCompatActivity() {
 
     // 同步房间素材到本地文件夹
 
+
+    // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
     private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
@@ -963,11 +965,34 @@ class MainActivity : AppCompatActivity() {
                     .putString("room_folder_mappings", folderMappings.toString())
                     .apply()
 
+                // 一次性获取该房间所有素材（合并 materials + preset_materials）
+                val allMaterials = mutableMapOf<String, org.json.JSONArray>() // folderId -> materials[]
+                try {
+                    val apiUrl = java.net.URL(APK_URL + "/api/room-materials/" + roomId)
+                    val connection = apiUrl.openConnection()
+                    connection.connectTimeout = 15000
+                    connection.readTimeout = 30000
+                    val response = connection.inputStream.bufferedReader().readText()
+                    val resultJson = org.json.JSONObject(response)
+                    // 解析成 { "01": [{id,filename,url...}], "02": [...] } 结构
+                    val keys = resultJson.keys()
+                    while (keys.hasNext()) {
+                        val folderId = keys.next()
+                        allMaterials[folderId] = resultJson.getJSONArray(folderId)
+                    }
+                    logToFile("获取房间素材成功: " + allMaterials.size() + " 个文件夹")
+                } catch (e: Exception) {
+                    Log.e(TAG, "获取房间素材失败: " + e.message)
+                    logToFile("获取房间素材失败: " + e.message)
+                }
+
+                // 遍历30个文件夹
                 for (i in 1..30) {
                     val folderId = String.format("%02d", i)
                     val materialIds = folderMappings.optJSONArray(folderId)
                     if (materialIds != null && materialIds.length() > 0) {
-                        syncFolderWithIds(folderId, materialIds)
+                        val cloudList = allMaterials.optJSONArray(folderId)
+                        syncFolderWithIds(folderId, materialIds, cloudList)
                     } else {
                         deleteFolderFiles(folderId)
                     }
@@ -986,19 +1011,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray) {
+    // 按 material IDs 精确同步单个文件夹（传入预获取的云端素材列表，避免重复请求）
+    private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?) {
         try {
+            if (cloudList == null || cloudList.length() == 0) {
+                Log.d(TAG, "文件夹 " + folderId + " 无云端素材")
+                deleteFolderFiles(folderId)
+                return
+            }
+
             val idsSet = mutableSetOf<String>()
             for (i in 0 until materialIds.length()) {
                 idsSet.add(materialIds.getString(i))
             }
-
-            val apiUrl = java.net.URL(APK_URL + "/api/materials?folder=" + folderId)
-            val connection = apiUrl.openConnection()
-            connection.connectTimeout = 10000
-            connection.readTimeout = 30000
-            val response = connection.inputStream.bufferedReader().readText()
-            val cloudList = org.json.JSONArray(response)
 
             val localFolder = File(videoFolderPath, folderId)
             if (!localFolder.exists()) localFolder.mkdirs()
@@ -1014,7 +1039,7 @@ class MainActivity : AppCompatActivity() {
                 val cloudId = item.optString("id", "")
                 if (cloudId.isNotEmpty() && idsSet.contains(cloudId)) {
                     val filename = item.getString("filename")
-                    val urlPath = item.getString("url")
+                    val urlPath = item.optString("url", "")
                     shouldExist.add(filename)
                     val localFile = File(localFolder, filename)
                     val downloadUrl = if (urlPath.startsWith("http")) urlPath else APK_URL + urlPath
