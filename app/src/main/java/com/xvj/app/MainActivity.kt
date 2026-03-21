@@ -980,7 +980,7 @@ class MainActivity : AppCompatActivity() {
                         val folderId = keys.next()
                         allMaterials[folderId] = resultJson.getJSONArray(folderId)
                     }
-                    logToFile("获取房间素材成功: " + allMaterials.size() + " 个文件夹")
+                    logToFile("获取房间素材成功: " + allMaterials.size + " 个文件夹")
                 } catch (e: Exception) {
                     Log.e(TAG, "获取房间素材失败: " + e.message)
                     logToFile("获取房间素材失败: " + e.message)
@@ -1001,7 +1001,7 @@ class MainActivity : AppCompatActivity() {
                     val folderId = String.format("%02d", i)
                     val materialIds = folderMappings.optJSONArray(folderId)
                     if (materialIds != null && materialIds.length() > 0) {
-                        val cloudList = allMaterials.optJSONArray(folderId)
+                        val cloudList = allMaterials[folderId]
                         syncFolderWithIds(folderId, materialIds, cloudList)
                     } else {
                         deleteFolderFiles(folderId)
