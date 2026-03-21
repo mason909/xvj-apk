@@ -950,6 +950,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 同步房间素材到本地文件夹
+
     private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
@@ -957,38 +958,109 @@ class MainActivity : AppCompatActivity() {
 
         executor.execute {
             try {
-                val downloadTasks = mutableListOf<Triple<String, String, String>>() // folderId, filename, url
+                prefs.edit()
+                    .putString("current_room_id", roomId)
+                    .putString("room_folder_mappings", folderMappings.toString())
+                    .apply()
 
-                // 遍历文件夹映射
-                for (i in 0 until folderMappings.length()) {
-                    val folderId = folderMappings.names()?.getString(i) ?: continue
-                    val materialIds = folderMappings.getJSONArray(folderId)
-
-                    // 获取每个素材的URL
-                    for (j in 0 until materialIds.length()) {
-                        val materialId = materialIds.getString(j)
-                        // TODO: 调用API获取素材URL
-                        // 这里先假设素材URL可以从预设素材API获取
+                for (i in 1..30) {
+                    val folderId = String.format("%02d", i)
+                    val materialIds = folderMappings.optJSONArray(folderId)
+                    if (materialIds != null && materialIds.length() > 0) {
+                        syncFolderWithIds(folderId, materialIds)
+                    } else {
+                        deleteFolderFiles(folderId)
                     }
                 }
 
-                // 保存房间素材配置
-                val prefsEditor = prefs.edit()
-                prefsEditor.putString("current_room_id", roomId)
-                prefsEditor.putString("room_folder_mappings", folderMappings.toString())
-                prefsEditor.apply() // 异步写入
-
-                Log.d(TAG, "Room materials config saved: room=$roomId, mappings=$folderMappings")
-
-                // 开始下载并播放01文件夹
-                downloadAndPlayFolder("01")
-
+                mqttHandler.post {
+                    binding.statusText?.text = "素材同步完成"
+                }
+                logToFile("房间素材同步完成: " + roomId)
             } catch (e: Exception) {
-                Log.e(TAG, "Room materials sync error: ${e.message}")
+                Log.e(TAG, "Room materials sync error: " + e.message)
                 mqttHandler.post {
                     binding.statusText?.text = "素材同步失败"
                 }
             }
+        }
+    }
+
+    private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray) {
+        try {
+            val idsSet = mutableSetOf<String>()
+            for (i in 0 until materialIds.length()) {
+                idsSet.add(materialIds.getString(i))
+            }
+
+            val apiUrl = java.net.URL(APK_URL + "/api/materials?folder=" + folderId)
+            val connection = apiUrl.openConnection()
+            connection.connectTimeout = 10000
+            connection.readTimeout = 30000
+            val response = connection.inputStream.bufferedReader().readText()
+            val cloudList = org.json.JSONArray(response)
+
+            val localFolder = File(videoFolderPath, folderId)
+            if (!localFolder.exists()) localFolder.mkdirs()
+
+            val localFiles = localFolder.listFiles()?.filter {
+                it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
+            } ?: emptyList()
+
+            val shouldExist = mutableSetOf<String>()
+
+            for (i in 0 until cloudList.length()) {
+                val item = cloudList.getJSONObject(i)
+                val cloudId = item.optString("id", "")
+                if (cloudId.isNotEmpty() && idsSet.contains(cloudId)) {
+                    val filename = item.getString("filename")
+                    val urlPath = item.getString("url")
+                    shouldExist.add(filename)
+                    val localFile = File(localFolder, filename)
+                    val downloadUrl = if (urlPath.startsWith("http")) urlPath else APK_URL + urlPath
+
+                    val md5 = item.optString("md5", "")
+                    if (localFile.exists() && md5.isNotEmpty()) {
+                        val localMd5 = calculateMd5(localFile)
+                        if (localMd5 == md5) {
+                            Log.d(TAG, "文件已存在且MD5一致: " + filename)
+                            continue
+                        }
+                    }
+                    Log.d(TAG, "下载: " + filename)
+                    logToFile("下载: " + filename)
+                    downloadFile(downloadUrl, localFile)
+                }
+            }
+
+            for (file in localFiles) {
+                if (!shouldExist.contains(file.name)) {
+                    Log.d(TAG, "删除不在清单中的文件: " + file.name)
+                    logToFile("删除: " + file.name)
+                    file.delete()
+                }
+            }
+            Log.d(TAG, "文件夹 " + folderId + " 同步完成")
+        } catch (e: Exception) {
+            Log.e(TAG, "syncFolderWithIds " + folderId + " 失败: " + e.message)
+            logToFile("同步文件夹" + folderId + " 失败: " + e.message)
+        }
+    }
+
+    private fun deleteFolderFiles(folderId: String) {
+        try {
+            val localFolder = File(videoFolderPath, folderId)
+            if (!localFolder.exists()) return
+            val files = localFolder.listFiles()?.filter {
+                it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
+            } ?: emptyList()
+            for (file in files) {
+                Log.d(TAG, "清空文件夹" + folderId + "，删除: " + file.name)
+                logToFile("清空删除: " + file.name)
+                file.delete()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "deleteFolderFiles " + folderId + " 失败: " + e.message)
         }
     }
 
