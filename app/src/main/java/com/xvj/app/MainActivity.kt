@@ -986,6 +986,16 @@ class MainActivity : AppCompatActivity() {
                     logToFile("获取房间素材失败: " + e.message)
                 }
 
+                // 获取失败时，跳过同步（不删本地文件）
+                if (allMaterials.isEmpty()) {
+                    Log.w(TAG, "素材列表获取失败，跳过同步")
+                    logToFile("素材列表获取失败，跳过同步")
+                    mqttHandler.post {
+                        binding.statusText?.text = "同步失败：获取素材列表失败"
+                    }
+                    return@execute
+                }
+
                 // 遍历30个文件夹
                 for (i in 1..30) {
                     val folderId = String.format("%02d", i)
