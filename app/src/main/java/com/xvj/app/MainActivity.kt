@@ -645,7 +645,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "sync" -> {
-                    syncFromCloud()
+                    // 使用syncMaterials()——基于room_mappings的精确同步
+                    syncMaterials()
                 }
                 "preset_sync" -> {
                     // 接收预设素材同步
@@ -1378,28 +1379,46 @@ class MainActivity : AppCompatActivity() {
     // 素材同步：根据folder_mappings从云端同步素材
     private fun syncMaterials() {
         logToFile("开始同步素材...")
-        
-        val mappingsStr = prefs.getString("room_folder_mappings", "{}")
-        if (mappingsStr.isNullOrEmpty()) {
-            logToFile("无素材映射配置，跳过同步")
+        val roomId = prefs.getString("current_room_id", null)
+        if (roomId.isNullOrEmpty()) {
+            logToFile("无房间ID，跳过同步")
             return
         }
-        
-        try {
-            val mappings = org.json.JSONObject(mappingsStr)
-            val keys = mappings.keys()
-            
-            while (keys.hasNext()) {
-                val sceneId = keys.next()
-                val folderId = mappings.getString(sceneId)
-                logToFile("同步场景$sceneId -> 文件夹$folderId")
-                syncFolder(folderId)
+        // 使用room-materials API获取该房间精确的素材列表（按folder_mappings过滤）
+        executor.execute {
+            try {
+                val apiUrl = java.net.URL("$APK_URL/api/room-materials/$roomId")
+                val connection = apiUrl.openConnection()
+                connection.connectTimeout = 15000
+                connection.readTimeout = 30000
+                val response = connection.inputStream.bufferedReader().readText()
+                val allMaterials = org.json.JSONObject() // folderId -> materials[]
+                val resultJson = org.json.JSONObject(response)
+                val keys = resultJson.keys()
+                while (keys.hasNext()) {
+                    val folderId = keys.next()
+                    allMaterials.put(folderId, resultJson.getJSONArray(folderId))
+                }
+                logToFile("获取房间素材成功: " + allMaterials.length() + " 个文件夹")
+
+                val mappingsStr = prefs.getString("room_folder_mappings", "{}")
+                val mappings = org.json.JSONObject(mappingsStr)
+                val mapKeys = mappings.keys()
+                while (mapKeys.hasNext()) {
+                    val folderId = mapKeys.next()
+                    val materialIds = mappings.getJSONArray(folderId)
+                    val cloudList = allMaterials.optJSONArray(folderId)
+                    logToFile("同步文件夹$folderId -> " + (if (cloudList != null) cloudList.length().toString() + "个" else "无云端数据"))
+                    syncFolderWithIds(folderId, materialIds, cloudList)
+                }
+                logToFile("素材同步完成")
+                mqttHandler.post {
+                    binding.statusText?.text = "同步完成"
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "syncMaterials失败: ${e.message}")
+                logToFile("同步失败: ${e.message}")
             }
-            
-            logToFile("素材同步完成")
-        } catch (e: Exception) {
-            Log.e(TAG, "素材同步失败: ${e.message}")
-            logToFile("素材同步失败: ${e.message}")
         }
     }
     
