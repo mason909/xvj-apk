@@ -1381,6 +1381,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
+    // 素材同步性能优化 v2: 4线程并行 + ETag条件请求 + 64KB buffer
     /**
      * 带 ETag/Last-Modified 条件请求的文件下载
      * - 先发 HEAD 查文件是否有变化，有变化再下载
