@@ -485,7 +485,7 @@ class MainActivity : AppCompatActivity() {
                                 .apply()
                             // 保存folder_mappings到本地
                             if (folderMappings != null) {
-                                prefs.edit().putString("folder_mappings", folderMappings.toString()).apply()
+                                prefs.edit().putString("room_folder_mappings", folderMappings.toString()).apply()
                             }
                             Log.d(TAG, "授权成功: room_id=$roomId, folder_mappings=$folderMappings")
                             
