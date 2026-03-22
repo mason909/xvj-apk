@@ -65,7 +65,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "XVJPlayer"
         const val VERSION = "1.2.0"
-        const val VERSION_CODE = 12
+        const val VERSION_CODE = 159
         const val APK_URL = "http://47.102.106.237"
         private const val MQTT_TOPIC = "xvj/device/+/command"
         private const val AUTH_TOPIC = "xvj/auth/response"
@@ -203,6 +203,9 @@ class MainActivity : AppCompatActivity() {
             if (sb.isNotEmpty()) sb.append("|")
             sb.append("hw:$hardware")
         } catch (e: Exception) {}
+
+        // 7. APK版本号 — 不同版本号=不同设备，防止升级后被旧记录覆盖
+        sb.append("|vc:$VERSION_CODE")
 
         // 返回SHA256哈希作为最终指纹
         val raw = sb.toString()
