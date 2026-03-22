@@ -1704,11 +1704,11 @@ class MainActivity : AppCompatActivity() {
                     return@Thread
                 }
 
-                // SHA-256校验（如果提供了哈希值）- 比MD5更安全
+                // MD5校验
                 val finalApkFile = apkFile  // 捕获最终变量供lambda使用
                 if (!expectedMd5.isNullOrEmpty()) {
                     val actualHash = apkFile.inputStream().use { input ->
-                        val digest = java.security.MessageDigest.getInstance("SHA-256")
+                        val digest = java.security.MessageDigest.getInstance("MD5")
                         val buffer = ByteArray(8192)
                         var bytesRead: Int
                         while (input.read(buffer).also { bytesRead = it } != -1) {
@@ -1717,14 +1717,14 @@ class MainActivity : AppCompatActivity() {
                         digest.digest().joinToString("") { "%02x".format(it) }
                     }
                     if (actualHash != expectedMd5) {
-                        logToFile("APK SHA-256校验失败！期望: $expectedMd5, 实际: $actualHash")
+                        logToFile("APK MD5校验失败！期望: $expectedMd5, 实际: $actualHash")
                         mqttHandler.post {
                             android.widget.Toast.makeText(this, "更新校验失败，请重新尝试", android.widget.Toast.LENGTH_LONG).show()
                         }
                         apkFile.delete()
                         return@Thread
                     }
-                    logToFile("APK SHA-256校验通过: $actualHash")
+                    logToFile("APK MD5校验通过: $actualHash")
                 }
 
                 // 验证APK签名（安全防护）
