@@ -649,7 +649,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "sync" -> {
-                    syncFromCloud()
+                    syncMaterials()
                 }
                 "preset_sync" -> {
                     // 接收预设素材同步
