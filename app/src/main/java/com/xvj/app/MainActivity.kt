@@ -52,7 +52,8 @@ class MainActivity : AppCompatActivity() {
     private var mqttClient: MqttClient? = null
     private val mqttHandler = Handler(Looper.getMainLooper())
     private val statusHandler = Handler(Looper.getMainLooper())
-    private val executor = Executors.newSingleThreadExecutor()
+    // 4线程下载池，支持并行素材同步
+    private val downloadExecutor = Executors.newFixedThreadPool(4)
     private var statusTimerRunnable: Runnable? = null
 
     // 下载的视频缓存目录
@@ -68,6 +69,9 @@ class MainActivity : AppCompatActivity() {
         const val APK_URL = "http://47.102.106.237"
         private const val MQTT_TOPIC = "xvj/device/+/command"
         private const val AUTH_TOPIC = "xvj/auth/response"
+        // ETag/Last-Modified 缓存的 SharedPreferences key 前缀
+        private const val PREF_ETAG_PREFIX = "etag_"
+        private const val PREF_LM_PREFIX = "lm_"
     }
 
     // 文件日志
@@ -316,7 +320,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun connectMQTT() {
-        executor.execute {
+        downloadExecutor.submit {
             try {
                 Log.d(TAG, "Connecting to MQTT: $mqttServer")
                 logToFile("MQTT connecting to $mqttServer...")
@@ -725,7 +729,7 @@ class MainActivity : AppCompatActivity() {
             binding.statusText?.text = "下载中: $videoId"
         }
 
-        executor.execute {
+        downloadExecutor.submit {
             try {
                 val apiUrl = "http://47.102.106.237/api/materials/$videoId"
                 val connection = java.net.URL(apiUrl).openConnection()
@@ -791,7 +795,7 @@ class MainActivity : AppCompatActivity() {
             binding.statusText?.text = "下载中: $filename"
         }
 
-        executor.execute {
+        downloadExecutor.submit {
             try {
                 // 确保文件夹存在
                 val folderDir = File(videoFolderPath, folder)
@@ -835,7 +839,7 @@ class MainActivity : AppCompatActivity() {
             binding.statusText?.text = "同步预设素材(${folders.length()}个文件夹)..."
         }
 
-        executor.execute {
+        downloadExecutor.submit {
             try {
                 val folderList = mutableListOf<Pair<String, String>>() // folderId to folderName
 
@@ -889,7 +893,7 @@ class MainActivity : AppCompatActivity() {
             binding.statusText?.text = "同步房间素材中..."
         }
 
-        executor.execute {
+        downloadExecutor.submit {
             try {
                 prefs.edit()
                     .putString("current_room_id", roomId)
@@ -952,7 +956,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 按 material IDs 精确同步单个文件夹（传入预获取的云端素材列表，避免重复请求）
+    // 按 material IDs 精确同步单个文件夹（并行下载，ETag 条件请求）
     private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?) {
         try {
             if (cloudList == null || cloudList.length() == 0) {
@@ -975,6 +979,9 @@ class MainActivity : AppCompatActivity() {
 
             val shouldExist = mutableSetOf<String>()
 
+            // 收集需要下载的任务，提交到 4 线程池并行执行
+            val downloadTasks = mutableListOf<Runnable>()
+
             for (i in 0 until cloudList.length()) {
                 val item = cloudList.getJSONObject(i)
                 val cloudId = item.optString("id", "")
@@ -985,20 +992,29 @@ class MainActivity : AppCompatActivity() {
                     val localFile = File(localFolder, filename)
                     val downloadUrl = if (urlPath.startsWith("http")) urlPath else APK_URL + urlPath
 
-                    val md5 = item.optString("md5", "")
-                    if (localFile.exists() && md5.isNotEmpty()) {
-                        val localMd5 = calculateMd5(localFile)
-                        if (localMd5 == md5) {
-                            Log.d(TAG, "文件已存在且MD5一致: " + filename)
-                            continue
-                        }
+                    // 跳过本地已存在且etag未变（缓存命中的文件不下载）
+                    val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
+                    if (localFile.exists() && cachedEtag != null) {
+                        Log.d(TAG, "文件已存在且有缓存ETag，跳过: $filename")
+                        continue
                     }
-                    Log.d(TAG, "下载: " + filename)
-                    logToFile("下载: " + filename)
-                    downloadFile(downloadUrl, localFile)
+
+                    downloadTasks.add(Runnable {
+                        val downloaded = downloadWithETag(downloadUrl, localFile, filename)
+                        if (downloaded) {
+                            logToFile("下载: $filename")
+                        }
+                    })
                 }
             }
 
+            // 并行等待所有下载任务完成
+            if (downloadTasks.isNotEmpty()) {
+                val futures = downloadTasks.map { downloadExecutor.submit(it) }
+                futures.forEach { it.get() }  // 阻塞等待每个任务完成
+            }
+
+            // 删除不在清单中的文件
             for (file in localFiles) {
                 if (!shouldExist.contains(file.name)) {
                     Log.d(TAG, "删除不在清单中的文件: " + file.name)
@@ -1032,7 +1048,7 @@ class MainActivity : AppCompatActivity() {
 
     // 下载并播放指定文件夹
     private fun downloadAndPlayFolder(folderId: String) {
-        executor.execute {
+        downloadExecutor.submit {
             try {
                 // 获取该文件夹的素材列表
                 val mappingsStr = prefs.getString("room_folder_mappings", "{}")
@@ -1264,7 +1280,7 @@ class MainActivity : AppCompatActivity() {
             mqttClient?.disconnect()
             mqttClient?.close()
         } catch (e: Exception) {}
-        executor.shutdown()
+        downloadExecutor.shutdown()
     }
 
     @Deprecated("Deprecated in Java")
@@ -1315,7 +1331,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         // 使用room-materials API获取该房间精确的素材列表（按folder_mappings过滤）
-        executor.execute {
+        downloadExecutor.submit {
             try {
                 val apiUrl = java.net.URL("$APK_URL/api/room-materials/$roomId")
                 val connection = apiUrl.openConnection()
@@ -1365,7 +1381,78 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
-    // 下载文件
+    /**
+     * 带 ETag/Last-Modified 条件请求的文件下载
+     * - 先发 HEAD 查文件是否有变化，有变化再下载
+     * - 缓存 ETag 和 Last-Modisted 到 SharedPreferences
+     * - 使用 64KB buffer
+     * 返回 true 表示实际下载了文件，false 表示跳过（未变化）
+     */
+    private fun downloadWithETag(urlStr: String, destFile: File, filename: String): Boolean {
+        return try {
+            val url = java.net.URL(urlStr)
+            val connection = url.openConnection() as java.net.HttpURLConnection
+            connection.connectTimeout = 15000
+            connection.readTimeout = 15000
+            connection.requestMethod = "HEAD"
+
+            // 带上缓存的 ETag 和 Last-Modified
+            val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
+            val cachedLm = prefs.getString(PREF_LM_PREFIX + filename, null)
+            if (cachedEtag != null) connection.setRequestProperty("If-None-Match", cachedEtag)
+            if (cachedLm != null) connection.setRequestProperty("If-Modified-Since", cachedLm)
+
+            val responseCode = connection.responseCode
+            connection.disconnect()
+
+            // 304 Not Modified → 本地文件没变，跳过下载
+            if (responseCode == 304) {
+                Log.d(TAG, "文件未变化跳过: $filename")
+                return false
+            }
+
+            // 打开实际下载连接，带上缓存头
+            val conn2 = url.openConnection() as java.net.HttpURLConnection
+            conn2.connectTimeout = 30000
+            conn2.readTimeout = 30000
+            if (cachedEtag != null) conn2.setRequestProperty("If-None-Match", cachedEtag)
+            if (cachedLm != null) conn2.setRequestProperty("If-Modified-Since", cachedLm)
+
+            val realCode = conn2.responseCode
+            if (realCode == 304) {
+                Log.d(TAG, "文件未变化跳过: $filename")
+                conn2.disconnect()
+                return false
+            }
+
+            // 保存新的 ETag 和 Last-Modified
+            val newEtag = conn2.getHeaderField("ETag")
+            val newLm = conn2.getHeaderField("Last-Modified")
+            if (newEtag != null) prefs.edit().putString(PREF_ETAG_PREFIX + filename, newEtag).apply()
+            if (newLm != null) prefs.edit().putString(PREF_LM_PREFIX + filename, newLm).apply()
+
+            // 下载文件，64KB buffer
+            conn2.inputStream.use { input ->
+                FileOutputStream(destFile).use { output ->
+                    val buffer = ByteArray(65536)
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                    }
+                }
+            }
+            conn2.disconnect()
+            Log.d(TAG, "下载完成: $filename")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "下载失败 [${filename}]: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * 兼容旧逻辑的下载（无 ETag，用于 OTA APK 等一次性文件）
+     */
     private fun downloadFile(urlStr: String, destFile: File) {
         try {
             val url = java.net.URL(urlStr)
@@ -1374,7 +1461,7 @@ class MainActivity : AppCompatActivity() {
             connection.readTimeout = 30000
             connection.getInputStream().use { input ->
                 FileOutputStream(destFile).use { output ->
-                    val buffer = ByteArray(8192)
+                    val buffer = ByteArray(65536)
                     var bytesRead: Int
                     while (input.read(buffer).also { bytesRead = it } != -1) {
                         output.write(buffer, 0, bytesRead)
