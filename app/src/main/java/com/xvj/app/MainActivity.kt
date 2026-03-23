@@ -893,7 +893,9 @@ class MainActivity : AppCompatActivity() {
     // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
     private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
         mqttHandler.post {
-            binding.statusText?.text = "同步房间素材中..."
+            binding.syncProgressBar?.visibility = View.VISIBLE
+            binding.syncProgressBar?.progress = 0
+            binding.statusText?.text = "正在同步: 0/30"
         }
 
         downloadExecutor.submit {
@@ -930,11 +932,12 @@ class MainActivity : AppCompatActivity() {
                     logToFile("素材列表获取失败，跳过同步")
                     mqttHandler.post {
                         binding.statusText?.text = "同步失败：获取素材列表失败"
+                        binding.syncProgressBar?.visibility = View.GONE
                     }
                     return@submit
                 }
 
-                // 遍历30个文件夹
+                // 遍历30个文件夹，逐个更新进度
                 for (i in 1..30) {
                     val folderId = String.format("%02d", i)
                     val materialIds = folderMappings.optJSONArray(folderId)
@@ -944,15 +947,25 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         deleteFolderFiles(folderId)
                     }
+                    // 更新进度条：i/30 -> 百分比
+                    val progress = (i * 100) / 30
+                    mqttHandler.post {
+                        binding.syncProgressBar?.progress = progress
+                        binding.statusText?.text = "正在同步: $i/30"
+                    }
                 }
 
                 mqttHandler.post {
+                    binding.syncProgressBar?.visibility = View.GONE
                     binding.statusText?.text = "素材同步完成"
+                    // 同步完成后自动播放01文件夹
+                    playFolderVideos("01")
                 }
                 logToFile("房间素材同步完成: " + roomId)
             } catch (e: Exception) {
                 Log.e(TAG, "Room materials sync error: " + e.message)
                 mqttHandler.post {
+                    binding.syncProgressBar?.visibility = View.GONE
                     binding.statusText?.text = "素材同步失败"
                 }
             }
