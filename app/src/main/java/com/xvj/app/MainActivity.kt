@@ -79,6 +79,24 @@ class MainActivity : AppCompatActivity() {
         try {
             val logFile = File(filesDir, "xvj.log")
             PrintWriter(FileWriter(logFile, true)).use { it.println("${System.currentTimeMillis()} $msg") }
+
+            // 异步发送到服务器，供远程调试
+            val _msg = msg
+            Thread {
+                try {
+                    val fid = deviceFingerprint
+                    if (fid.isEmpty()) return@Thread
+                    val url = java.net.URL("http://47.102.106.237/api/device/${fid}/log")
+                    val conn = url.openConnection()
+                    conn.doOutput = true
+                    conn.requestMethod = "POST"
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    val body = "{\"time\":\"${System.currentTimeMillis()}\",\"msg\":\"${_msg.replace("\"", "\\\"").replace("\n", " ")}\"}"
+                    conn.outputStream.write(body.toByteArray())
+                    conn.outputStream.flush()
+                    conn.outputStream.close()
+                } catch (e: Exception) { Log.e(TAG, "log upload failed: ${e.message}") }
+            }.start()
         } catch (e: Exception) { }
     }
 
