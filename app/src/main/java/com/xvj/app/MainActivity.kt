@@ -1429,8 +1429,11 @@ class MainActivity : AppCompatActivity() {
     private fun downloadWithETag(urlStr: String, destFile: File, filename: String): Boolean {
         val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
 
-        // 文件完整性兜底：本地文件存在但ETag无效时，验证服务器ETag是否变化
-        if (destFile.exists() && destFile.length() > 0 && cachedEtag != null) {
+        // 文件不存在或为空：直接下载，不走任何缓存逻辑
+        if (!destFile.exists() || destFile.length() == 0L) {
+            Log.d(TAG, "本地文件不存在或为空，强制下载: ${destFile.name}")
+        } else if (cachedEtag != null) {
+            // 文件存在且有缓存ETag：用HEAD请求验证服务器ETag是否有变化
             try {
                 val url = java.net.URL(urlStr)
                 val checkConn = url.openConnection() as java.net.HttpURLConnection
@@ -1444,7 +1447,7 @@ class MainActivity : AppCompatActivity() {
                     Log.d(TAG, "本地文件完整且ETag未变，跳过: ${destFile.name}")
                     return false
                 }
-                Log.d(TAG, "本地文件存在但ETag变化或损坏，重新下载: ${destFile.name}")
+                Log.d(TAG, "本地文件存在但ETag变化，重新下载: ${destFile.name}")
             } catch (e: Exception) {
                 Log.w(TAG, "ETag验证失败，继续下载: ${e.message}")
             }
