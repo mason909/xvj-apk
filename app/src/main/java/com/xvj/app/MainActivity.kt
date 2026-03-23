@@ -914,7 +914,6 @@ class MainActivity : AppCompatActivity() {
                     connection.readTimeout = 30000
                     val response = connection.inputStream.bufferedReader().readText()
                     val resultJson = org.json.JSONObject(response)
-                    // 解析成 { "01": [{id,filename,url...}], "02": [...] } 结构
                     val keys = resultJson.keys()
                     while (keys.hasNext()) {
                         val folderId = keys.next()
@@ -937,28 +936,41 @@ class MainActivity : AppCompatActivity() {
                     return@submit
                 }
 
-                // 遍历30个文件夹，逐个更新进度
-                for (i in 1..30) {
+                // 真正并行：30个文件夹全部同时提交，互不等待
+                val totalFolders = 30
+                val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+                val latch = java.util.concurrent.CountDownLatch(totalFolders)
+
+                for (i in 1..totalFolders) {
                     val folderId = String.format("%02d", i)
                     val materialIds = folderMappings.optJSONArray(folderId)
-                    if (materialIds != null && materialIds.length() > 0) {
-                        val cloudList = allMaterials[folderId]
-                        syncFolderWithIds(folderId, materialIds, cloudList)
-                    } else {
-                        deleteFolderFiles(folderId)
-                    }
-                    // 更新进度条：i/30 -> 百分比
-                    val progress = (i * 100) / 30
-                    mqttHandler.post {
-                        binding.syncProgressBar?.progress = progress
-                        binding.statusText?.text = "正在同步: $i/30"
+                    val cloudList = allMaterials[folderId]
+
+                    downloadExecutor.submit {
+                        try {
+                            if (materialIds != null && materialIds.length() > 0) {
+                                syncFolderWithIds(folderId, materialIds, cloudList)
+                            } else {
+                                deleteFolderFiles(folderId)
+                            }
+                        } finally {
+                            val done = completedCount.incrementAndGet()
+                            val progress = (done * 100) / totalFolders
+                            mqttHandler.post {
+                                binding.syncProgressBar?.progress = progress
+                                binding.statusText?.text = "正在同步: $done/$totalFolders"
+                            }
+                            latch.countDown()
+                        }
                     }
                 }
+
+                // 等待所有文件夹完成
+                latch.await()
 
                 mqttHandler.post {
                     binding.syncProgressBar?.visibility = View.GONE
                     binding.statusText?.text = "素材同步完成"
-                    // 同步完成后自动播放01文件夹
                     playFolderVideos("01")
                 }
                 logToFile("房间素材同步完成: " + roomId)
