@@ -1021,13 +1021,6 @@ class MainActivity : AppCompatActivity() {
                     val localFile = File(localFolder, filename)
                     val downloadUrl = if (urlPath.startsWith("http")) urlPath else APK_URL + urlPath
 
-                    // 跳过本地已存在且etag未变（缓存命中的文件不下载）
-                    val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
-                    if (localFile.exists() && cachedEtag != null) {
-                        Log.d(TAG, "文件已存在且有缓存ETag，跳过: $filename")
-                        continue
-                    }
-
                     downloadTasks.add(Runnable {
                         val downloaded = downloadWithETag(downloadUrl, localFile, filename)
                         if (downloaded) {
@@ -1434,6 +1427,29 @@ class MainActivity : AppCompatActivity() {
      * 返回 true 表示实际下载了文件，false 表示跳过（未变化）
      */
     private fun downloadWithETag(urlStr: String, destFile: File, filename: String): Boolean {
+        val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
+
+        // 文件完整性兜底：本地文件存在但ETag无效时，验证服务器ETag是否变化
+        if (destFile.exists() && destFile.length() > 0 && cachedEtag != null) {
+            try {
+                val url = java.net.URL(urlStr)
+                val checkConn = url.openConnection() as java.net.HttpURLConnection
+                checkConn.requestMethod = "HEAD"
+                checkConn.connectTimeout = 8000
+                checkConn.readTimeout = 8000
+                checkConn.setRequestProperty("If-None-Match", cachedEtag)
+                val code = checkConn.responseCode
+                checkConn.disconnect()
+                if (code == 304) {
+                    Log.d(TAG, "本地文件完整且ETag未变，跳过: ${destFile.name}")
+                    return false
+                }
+                Log.d(TAG, "本地文件存在但ETag变化或损坏，重新下载: ${destFile.name}")
+            } catch (e: Exception) {
+                Log.w(TAG, "ETag验证失败，继续下载: ${e.message}")
+            }
+        }
+
         return try {
             val url = java.net.URL(urlStr)
             val connection = url.openConnection() as java.net.HttpURLConnection
@@ -1441,7 +1457,6 @@ class MainActivity : AppCompatActivity() {
             connection.readTimeout = 15000
             connection.requestMethod = "HEAD"
 
-            val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
             val cachedLm = prefs.getString(PREF_LM_PREFIX + filename, null)
             if (cachedEtag != null) connection.setRequestProperty("If-None-Match", cachedEtag)
             if (cachedLm != null) connection.setRequestProperty("If-Modified-Since", cachedLm)
