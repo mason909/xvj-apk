@@ -80,16 +80,18 @@ class MainActivity : AppCompatActivity() {
             val logFile = File(filesDir, "xvj.log")
             PrintWriter(FileWriter(logFile, true)).use { it.println("${System.currentTimeMillis()} $msg") }
 
-            // 通过MQTT发送日志，复用现有持久连接，无额外连接压力
-            val _msg = msg
-            val fid = deviceFingerprint
-            if (fid.isNotEmpty()) {
-                mqttHandler.post {
-                    try {
-                        val topic = "xvj/device/${fid}/log"
-                        val payload = "${System.currentTimeMillis()} $_msg"
-                        mqttClient?.publish(topic, payload.toByteArray(), 1, false)
-                    } catch (e: Exception) { Log.e(TAG, "MQTT log failed: ${e.message}") }
+            // 只有debug_mode开启时才MQTT上报日志
+            if (prefs.getBoolean("debug_mode", false)) {
+                val _msg = msg
+                val fid = deviceFingerprint
+                if (fid.isNotEmpty()) {
+                    mqttHandler.post {
+                        try {
+                            val topic = "xvj/device/${fid}/log"
+                            val payload = "${System.currentTimeMillis()} $_msg"
+                            mqttClient?.publish(topic, payload.toByteArray(), 1, false)
+                        } catch (e: Exception) { Log.e(TAG, "MQTT log failed: ${e.message}") }
+                    }
                 }
             }
         } catch (e: Exception) { }
@@ -927,12 +929,15 @@ class MainActivity : AppCompatActivity() {
                     connection.readTimeout = 30000
                     val response = connection.inputStream.bufferedReader().readText()
                     val resultJson = org.json.JSONObject(response)
+                    val debugFlag = resultJson.optBoolean("debug", false)
+                    prefs.edit().putBoolean("debug_mode", debugFlag).apply()
+                    logToFile("获取房间素材成功: " + allMaterials.size + " 个文件夹, debug=$debugFlag")
                     val keys = resultJson.keys()
                     while (keys.hasNext()) {
                         val folderId = keys.next()
+                        if (folderId == "debug") continue
                         allMaterials[folderId] = resultJson.getJSONArray(folderId)
                     }
-                    logToFile("获取房间素材成功: " + allMaterials.size + " 个文件夹")
                 } catch (e: Exception) {
                     Log.e(TAG, "获取房间素材失败: " + e.message)
                     logToFile("获取房间素材失败: " + e.message)
