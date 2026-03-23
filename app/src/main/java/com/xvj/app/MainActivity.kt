@@ -1451,6 +1451,26 @@ class MainActivity : AppCompatActivity() {
         }
 
         return try {
+            // 文件完整性兜底：本地文件存在时，用HEAD请求验证ETag是否变化
+            if (destFile.exists() && destFile.length() > 0 && cachedEtag != null) {
+                try {
+                    val url = java.net.URL(urlStr)
+                    val checkConn = url.openConnection() as java.net.HttpURLConnection
+                    checkConn.requestMethod = "HEAD"
+                    checkConn.connectTimeout = 8000
+                    checkConn.readTimeout = 8000
+                    checkConn.setRequestProperty("If-None-Match", cachedEtag)
+                    val code = checkConn.responseCode
+                    checkConn.disconnect()
+                    if (code == 304) {
+                        Log.d(TAG, "本地文件完整且ETag未变，跳过: $filename")
+                        return false
+                    }
+                    Log.d(TAG, "本地文件存在但ETag变化，重新下载: $filename")
+                } catch (e: Exception) {
+                    Log.w(TAG, "ETag验证失败，继续下载: ${e.message}")
+                }
+            }
             val url = java.net.URL(urlStr)
             val connection = url.openConnection() as java.net.HttpURLConnection
             connection.connectTimeout = 15000
