@@ -1,3 +1,26 @@
+/**
+ * XVJ 云控系统 - Android APP (MainActivity)
+ * =========================================
+ * 架构：Kotlin + AndroidX + ExoPlayer + MQTT
+ * 
+ * 核心流程：
+ *   1. MQTT 连接（持久连接，复用于所有通信）
+ *   2. 设备注册 → authorized=1 → 等待房间分配
+ *   3. syncRoomMaterials() → /api/room-materials/{roomId}
+ *      → 下载文件夹 → 精确同步本地文件
+ *   4. 播放循环：按 folder_mappings 顺序播放
+ * 
+ * 房间调试模式（debug_mode）：
+ *   - 由 /api/room-materials 响应中的 debug 字段控制
+ *   - SharedPreferences 持久化
+ *   - true 时 logToFile() 通过 MQTT 上报日志到 device_logs 表
+ * 
+ * 重要约定：
+ *   - device_id 注册前为 fingerprint，注册后为 uuid
+ *   - 本地文件存 getFilesDir()，与服务器素材解耦
+ *   - 所有网络请求在下载线程执行，UI 更新 post 到 mqttHandler
+ */
+
 package com.xvj.app
 
 import android.content.Intent
@@ -322,6 +345,10 @@ class MainActivity : AppCompatActivity() {
         loopPlay = prefs.getBoolean("loop_play", true)
         autoPlay = prefs.getBoolean("auto_play", true)
         mqttServer = prefs.getString("mqtt_server", "tcp://47.102.106.237:1883") ?: "tcp://47.102.106.237:1883"
+
+        // 恢复调试模式标志（MQTT 命令或 HTTP API 设置的值）
+        val debugMode = prefs.getBoolean("debug_mode", false)
+        Log.d(TAG, "Debug mode: $debugMode")
 
         // 使用设备指纹作为ID
         deviceId = prefs.getString("device_id", "") ?: ""
@@ -680,6 +707,10 @@ class MainActivity : AppCompatActivity() {
                     // 接收房间素材同步，下载到本地文件夹
                     val roomId = cmd.optString("room_id", "")
                     val folderMappings = cmd.optJSONObject("folder_mappings")
+                    // 保存 debug 标志（来自 MQTT 命令或后续 HTTP API，MQTT 先收到就先保存）
+                    val debug = cmd.optBoolean("debug", false)
+                    prefs.edit().putBoolean("debug_mode", debug).apply()
+                    logToFile("sync_room_materials: debug=$debug")
                     if (folderMappings != null) {
                         syncRoomMaterials(roomId, folderMappings)
                     }
