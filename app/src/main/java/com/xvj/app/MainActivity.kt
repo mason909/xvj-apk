@@ -1090,6 +1090,11 @@ class MainActivity : AppCompatActivity() {
                 if (!shouldExist.contains(file.name)) {
                     Log.d(TAG, "删除不在清单中的文件: " + file.name)
                     logToFile("删除: " + file.name)
+                    // 清除缓存的 ETag，避免删文件后重加时 APK 因 304 跳过下载
+                    prefs.edit()
+                        .remove(PREF_ETAG_PREFIX + file.name)
+                        .remove(PREF_LM_PREFIX + file.name)
+                        .apply()
                     file.delete()
                 }
             }
@@ -1110,6 +1115,11 @@ class MainActivity : AppCompatActivity() {
             for (file in files) {
                 Log.d(TAG, "清空文件夹" + folderId + "，删除: " + file.name)
                 logToFile("清空删除: " + file.name)
+                // 清除缓存的 ETag，避免删文件后重加时 APK 因 304 跳过下载
+                prefs.edit()
+                    .remove(PREF_ETAG_PREFIX + file.name)
+                    .remove(PREF_LM_PREFIX + file.name)
+                    .apply()
                 file.delete()
             }
         } catch (e: Exception) {
@@ -1493,8 +1503,16 @@ class MainActivity : AppCompatActivity() {
                 val code = checkConn.responseCode
                 checkConn.disconnect()
                 if (code == 304) {
-                    Log.d(TAG, "本地文件完整且ETag未变，跳过: ${destFile.name}")
-                    return false
+                    // BUG FIX: 文件不存在时，即使ETag未变也必须重新下载
+                    // 场景：素材曾被添加→下载→从房间移除（文件被删）→重新添加
+                    // 此时本地文件不存在但SharedPreferences中ETag仍缓存着旧值
+                    // 服务器返回304（文件未变），必须强制重下而非跳过
+                    if (!destFile.exists()) {
+                        Log.d(TAG, "文件被删，ETag未变但强制重下: ${destFile.name}")
+                    } else {
+                        Log.d(TAG, "本地文件完整且ETag未变，跳过: ${destFile.name}")
+                        return false
+                    }
                 }
                 Log.d(TAG, "本地文件存在但ETag变化，重新下载: ${destFile.name}")
             } catch (e: Exception) {
