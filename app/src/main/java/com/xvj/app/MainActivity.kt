@@ -178,22 +178,10 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "Device Fingerprint: $deviceFingerprint")
         logToFile("Fingerprint: $deviceFingerprint")
 
-        // 加载配置
+        // 加载配置（包含 scenes 缓存恢复，设备开机直接进入窗口1）
         loadConfig()
 
-        // 检查授权状态并播放
-        val isAuthorized = prefs.getBoolean("authorized", false)
-        if (isAuthorized) {
-            // 已授权，播放01文件夹视频
-            logToFile("已授权，播放文件夹01")
-            playFolderVideos("01")
-        } else {
-            // 未授权，播放欢迎视频
-            logToFile("本地存储为未授权，播放欢迎视频")
-            playWelcomeVideo()
-        }
-
-        // 连接MQTT
+        // 连接MQTT（窗口系统由 sync_room_materials 触发，或从本地缓存恢复）
         connectMQTT()
         checkForUpdate() // 检查更新
     }
