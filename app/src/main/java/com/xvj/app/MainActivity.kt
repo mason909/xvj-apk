@@ -975,16 +975,13 @@ class MainActivity : AppCompatActivity() {
 
     // 同步房间素材到本地文件夹
 
-
-    // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
-
     // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
     private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
         }
 
-        executor.execute {
+        downloadExecutor.submit {
             try {
                 prefs.edit()
                     .putString("current_room_id", roomId)
@@ -1949,6 +1946,20 @@ class MainActivity : AppCompatActivity() {
 
         // 场景A：若没有窗口配置，自动创建默认全屏窗口1播放文件夹01
         if (currentSceneId == "A" && windowsArr.length() == 0) {
+            val defaultWin = JSONObject().apply {
+                put("id", DEFAULT_WINDOW_ID)
+                put("name", "窗口1")
+                put("x", 0)
+                put("y", 0)
+                put("width", 1920)
+                put("height", 1080)
+                put("zIndex", 1)
+                put("content", JSONObject().apply {
+                    put("type", "VIDEO")
+                    put("folderId", DEFAULT_FOLDER)
+                })
+            }
+            createWindowView(DEFAULT_WINDOW_ID, defaultWin)
             Log.d(TAG, "场景A无窗口配置，自动创建默认全屏窗口1 -> 文件夹 $DEFAULT_FOLDER")
         }
 
