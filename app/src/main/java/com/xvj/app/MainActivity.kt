@@ -1905,7 +1905,60 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    // ========== 多窗口系统实现 ==========
+    // =========================================================================
+    // 多窗口系统（Scene / Window System）
+    // =========================================================================
+    //
+    // 概念说明：
+    //   - Scene（场景）= 房间的 A/B 两套配置，互不影响，可切换
+    //     - 场景A（第一幕）：默认配置，开机即用。窗口为空时自动创建全屏窗口1播放文件夹01
+    //     - 场景B（第二幕）：默认空，等待用户手动配置
+    //   - Window（窗口）= 屏幕上的一个矩形区域，独立渲染一层
+    //   - 每窗口独立 ExoPlayer 实例，支持同时播放多个视频
+    //
+    // scenes JSON 结构（与后端 rooms.config.scenes 对应）：
+    //   {
+    //     "A": { "name": "第一幕", "folder_mappings": {...}, "windows": [Win, ...] },
+    //     "B": { "name": "第二幕", "folder_mappings": {...}, "windows": [Win, ...] }
+    //   }
+    //
+    // Win 结构（与后端窗口配置对应）：
+    //   {
+    //     "id": "win_1",           // 窗口唯一ID
+    //     "name": "主屏",           // 显示名称
+    //     "x": 0, "y": 0,          // 左上角坐标（px）
+    //     "width": 1920, "height": 1080,  // 尺寸（px）
+    //     "zIndex": 1,             // 层级（越大越上层）
+    //     "aspectRatio": "16:9",  // 可选
+    //     "content": {
+    //       "type": "VIDEO",       // COLOR | VIDEO | HDMI | IMAGE
+    //       "folderId": "01",      // type=VIDEO 时，对应素材文件夹
+    //       "inputIndex": 0,       // type=HDMI 时，HDMI 输入索引
+    //       "color": "#000000"     // type=COLOR 时，背景色
+    //     }
+    //   }
+    //
+    // 设备开机流程：
+    //   1. loadConfig() → 尝试从 scenes_json 缓存恢复 → applySceneConfigs()
+    //   2. MQTT 连接成功 → sync_room_materials → applySceneConfigs(scenes)
+    //   3. scenes 为空 → 从 SharedPreferences("scenes_json") 读取缓存恢复（离线模式）
+    //
+    // 持久化：
+    //   scenes_json = SharedPreferences key，存完整 scenes JSON 字符串
+    //   存储时机：每次收到 sync_room_materials 且包含 scenes 时
+    //
+    // 成员变量说明：
+    //   currentSceneId : "A" | "B"   当前激活的场景
+    //   windowPlayers  : Map<windowId, ExoPlayer>  每窗口独立播放器
+    //   windowViews    : Map<windowId, View>       每窗口视图引用（用于删除）
+    //   flSurface      : FrameLayout?              根容器，窗口视图挂载于此
+    //   DEFAULT_WINDOW_ID = "win_1"                 场景A默认窗口ID
+    //   DEFAULT_FOLDER    = "01"                   场景A默认播放文件夹
+    //
+    // 资源释放：
+    //   releaseAllWindows() 在 onDestroy() 中调用，释放所有播放器并移除视图
+    //
+    // =========================================================================
 
     /**
      * 应用场景配置（MQTT同步后或启动时调用）
