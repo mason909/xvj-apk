@@ -37,6 +37,13 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
+import android.widget.FrameLayout
+import android.widget.TextView
+import android.view.Gravity
+import android.graphics.Color
+import android.net.Uri
+import org.json.JSONArray
 import com.xvj.app.databinding.ActivityMainBinding
 import org.eclipse.paho.client.mqttv3.*
 import org.json.JSONObject
@@ -72,6 +79,20 @@ class MainActivity : AppCompatActivity() {
     private var mqttServer = "tcp://47.102.106.237:1883"
     private var mqttClientId = ""
     private var deviceId: String = ""
+
+    // ========== 多窗口系统 ==========
+    /** 当前活跃场景 ID："A" 或 "B" */
+    private var currentSceneId = "A"
+    /** windowId -> ExoPlayer 实例（每个窗口独立播放器）*/
+    private val windowPlayers = mutableMapOf<String, ExoPlayer>()
+    /** windowId -> View 实例（窗口视图）*/
+    private val windowViews = mutableMapOf<String, View>()
+    /** 默认窗口 ID（场景A默认播放文件夹01）*/
+    private val DEFAULT_WINDOW_ID = "win_1"
+    private val DEFAULT_FOLDER = "01"
+    /** 窗口容器 FrameLayout（根视图）*/
+    private val flSurface: FrameLayout? get() = binding.root as? FrameLayout
+    // ==============================
     private var mqttClient: MqttClient? = null
     private val mqttHandler = Handler(Looper.getMainLooper())
     private val statusHandler = Handler(Looper.getMainLooper())
@@ -362,6 +383,17 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "Device ID: $deviceId")
         Log.d(TAG, "MQTT Server: $mqttServer")
         logToFile("DeviceID: $deviceId, MQTT: $mqttServer")
+
+        // 启动时从本地缓存恢复 scenes 配置（离线多窗口）
+        val cachedScenes = prefs.getString("scenes_json", null)
+        if (cachedScenes != null) {
+            try {
+                applySceneConfigs(org.json.JSONObject(cachedScenes))
+                Log.d(TAG, "启动时从本地缓存恢复 scenes 成功")
+            } catch (e: Exception) {
+                Log.e(TAG, "启动时恢复 scenes 失败: ${e.message}")
+            }
+        }
     }
 
     private fun connectMQTT() {
@@ -711,6 +743,26 @@ class MainActivity : AppCompatActivity() {
                     val debug = cmd.optBoolean("debug", false)
                     prefs.edit().putBoolean("debug_mode", debug).apply()
                     logToFile("sync_room_materials: debug=$debug")
+
+                    // 解析并持久化 scenes（A/B 两套窗口配置）
+                    val scenes = cmd.optJSONObject("scenes")
+                    if (scenes != null) {
+                        prefs.edit().putString("scenes_json", scenes.toString()).apply()
+                        Log.d(TAG, "已保存 scenes 到本地: ${scenes.names()}")
+                        applySceneConfigs(scenes)
+                    } else {
+                        // 无 scenes 时尝试从本地缓存恢复（离线场景）
+                        val cached = prefs.getString("scenes_json", null)
+                        if (cached != null) {
+                            try {
+                                applySceneConfigs(org.json.JSONObject(cached))
+                                Log.d(TAG, "从本地缓存恢复 scenes 成功")
+                            } catch (e: Exception) {
+                                Log.e(TAG, "从本地缓存恢复 scenes 失败: ${e.message}")
+                            }
+                        }
+                    }
+
                     if (folderMappings != null) {
                         syncRoomMaterials(roomId, folderMappings)
                     }
@@ -937,14 +989,14 @@ class MainActivity : AppCompatActivity() {
 
 
     // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
+
+    // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
     private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
         mqttHandler.post {
-            binding.syncProgressBar?.visibility = View.VISIBLE
-            binding.syncProgressBar?.progress = 0
-            binding.statusText?.text = "正在同步: 0/30"
+            binding.statusText?.text = "同步房间素材中..."
         }
 
-        downloadExecutor.submit {
+        executor.execute {
             try {
                 prefs.edit()
                     .putString("current_room_id", roomId)
@@ -960,73 +1012,37 @@ class MainActivity : AppCompatActivity() {
                     connection.readTimeout = 30000
                     val response = connection.inputStream.bufferedReader().readText()
                     val resultJson = org.json.JSONObject(response)
-                    val debugFlag = resultJson.optBoolean("debug", false)
-                    prefs.edit().putBoolean("debug_mode", debugFlag).apply()
-                    logToFile("获取房间素材成功: " + allMaterials.size + " 个文件夹, debug=$debugFlag")
+                    // 解析成 { "01": [{id,filename,url...}], "02": [...] } 结构
                     val keys = resultJson.keys()
                     while (keys.hasNext()) {
                         val folderId = keys.next()
-                        if (folderId == "debug") continue
                         allMaterials[folderId] = resultJson.getJSONArray(folderId)
                     }
+                    logToFile("获取房间素材成功: " + allMaterials.size() + " 个文件夹")
                 } catch (e: Exception) {
                     Log.e(TAG, "获取房间素材失败: " + e.message)
                     logToFile("获取房间素材失败: " + e.message)
                 }
 
-                // 获取失败时，跳过同步（不删本地文件）
-                if (allMaterials.isEmpty()) {
-                    Log.w(TAG, "素材列表获取失败，跳过同步")
-                    logToFile("素材列表获取失败，跳过同步")
-                    mqttHandler.post {
-                        binding.statusText?.text = "同步失败：获取素材列表失败"
-                        binding.syncProgressBar?.visibility = View.GONE
-                    }
-                    return@submit
-                }
-
-                // 真正并行：30个文件夹全部同时提交，互不等待
-                val totalFolders = 30
-                val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
-                val latch = java.util.concurrent.CountDownLatch(totalFolders)
-
-                for (i in 1..totalFolders) {
+                // 遍历30个文件夹
+                for (i in 1..30) {
                     val folderId = String.format("%02d", i)
                     val materialIds = folderMappings.optJSONArray(folderId)
-                    val cloudList = allMaterials[folderId]
-
-                    downloadExecutor.submit {
-                        try {
-                            if (materialIds != null && materialIds.length() > 0) {
-                                syncFolderWithIds(folderId, materialIds, cloudList)
-                            } else {
-                                deleteFolderFiles(folderId)
-                            }
-                        } finally {
-                            val done = completedCount.incrementAndGet()
-                            val progress = (done * 100) / totalFolders
-                            mqttHandler.post {
-                                binding.syncProgressBar?.progress = progress
-                                binding.statusText?.text = "正在同步: $done/$totalFolders"
-                            }
-                            latch.countDown()
-                        }
+                    if (materialIds != null && materialIds.length() > 0) {
+                        val cloudList = allMaterials.optJSONArray(folderId)
+                        syncFolderWithIds(folderId, materialIds, cloudList)
+                    } else {
+                        deleteFolderFiles(folderId)
                     }
                 }
 
-                // 等待所有文件夹完成
-                latch.await()
-
                 mqttHandler.post {
-                    binding.syncProgressBar?.visibility = View.GONE
                     binding.statusText?.text = "素材同步完成"
-                    playFolderVideos("01")
                 }
                 logToFile("房间素材同步完成: " + roomId)
             } catch (e: Exception) {
                 Log.e(TAG, "Room materials sync error: " + e.message)
                 mqttHandler.post {
-                    binding.syncProgressBar?.visibility = View.GONE
                     binding.statusText?.text = "素材同步失败"
                 }
             }
@@ -1034,7 +1050,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 按 material IDs 精确同步单个文件夹（传入预获取的云端素材列表，避免重复请求）
-    // 素材同步 v2: 4线程并行 + ETag条件请求（按 material IDs 精确同步单个文件夹）
     private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?) {
         try {
             if (cloudList == null || cloudList.length() == 0) {
@@ -1057,9 +1072,6 @@ class MainActivity : AppCompatActivity() {
 
             val shouldExist = mutableSetOf<String>()
 
-            // 收集需要下载的任务，提交到 4 线程池并行执行
-            val downloadTasks = mutableListOf<Runnable>()
-
             for (i in 0 until cloudList.length()) {
                 val item = cloudList.getJSONObject(i)
                 val cloudId = item.optString("id", "")
@@ -1070,31 +1082,24 @@ class MainActivity : AppCompatActivity() {
                     val localFile = File(localFolder, filename)
                     val downloadUrl = if (urlPath.startsWith("http")) urlPath else APK_URL + urlPath
 
-                    downloadTasks.add(Runnable {
-                        val downloaded = downloadWithETag(downloadUrl, localFile, filename)
-                        if (downloaded) {
-                            logToFile("下载: $filename")
+                    val md5 = item.optString("md5", "")
+                    if (localFile.exists() && md5.isNotEmpty()) {
+                        val localMd5 = calculateMd5(localFile)
+                        if (localMd5 == md5) {
+                            Log.d(TAG, "文件已存在且MD5一致: " + filename)
+                            continue
                         }
-                    })
+                    }
+                    Log.d(TAG, "下载: " + filename)
+                    logToFile("下载: " + filename)
+                    downloadFile(downloadUrl, localFile)
                 }
             }
 
-            // 并行等待所有下载任务完成
-            if (downloadTasks.isNotEmpty()) {
-                val futures = downloadTasks.map { downloadExecutor.submit(it) }
-                futures.forEach { it.get() }
-            }
-
-            // 删除不在清单中的文件
             for (file in localFiles) {
                 if (!shouldExist.contains(file.name)) {
                     Log.d(TAG, "删除不在清单中的文件: " + file.name)
                     logToFile("删除: " + file.name)
-                    // 清除缓存的 ETag，避免删文件后重加时 APK 因 304 跳过下载
-                    prefs.edit()
-                        .remove(PREF_ETAG_PREFIX + file.name)
-                        .remove(PREF_LM_PREFIX + file.name)
-                        .apply()
                     file.delete()
                 }
             }
@@ -1354,6 +1359,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseAllWindows()
         releasePlayer()
         // 停止定时器并发送离线状态
         stopStatusTimer()
@@ -1913,4 +1919,198 @@ class MainActivity : AppCompatActivity() {
             }
         }.start()
     }
+
+    // ========== 多窗口系统实现 ==========
+
+    /**
+     * 应用场景配置（MQTT同步后或启动时调用）
+     * scenes: 完整 scenes JSON（包含 A 和 B 两套）
+     * 场景A无窗口时，自动创建全屏窗口1播放文件夹01
+     */
+    private fun applySceneConfigs(scenes: JSONObject?) {
+        if (scenes == null) {
+            Log.w(TAG, "applySceneConfigs: scenes 为空")
+            return
+        }
+
+        val sceneObj = scenes.optJSONObject(currentSceneId)
+        if (sceneObj == null) {
+            Log.w(TAG, "applySceneConfigs: 场景 $currentSceneId 不存在")
+            return
+        }
+
+        val windowsArr = sceneObj.optJSONArray("windows") ?: JSONArray()
+
+        // 释放旧的窗口播放器
+        windowPlayers.values.forEach { it.release() }
+        windowPlayers.clear()
+
+        // 移除旧的窗口视图
+        windowViews.values.forEach { flSurface?.removeView(it) }
+        windowViews.clear()
+
+        Log.d(TAG, "applySceneConfigs: 场景 $currentSceneId, ${windowsArr.length()} 个窗口")
+
+        // 按 zIndex 升序创建窗口
+        val sorted = sortWindowsByZ(windowsArr)
+        for (i in 0 until sorted.length()) {
+            val w = sorted.getJSONObject(i)
+            val winId = w.optString("id", "win_$i")
+            createWindowView(winId, w)
+        }
+
+        // 场景A：若没有窗口配置，自动创建默认全屏窗口1播放文件夹01
+        if (currentSceneId == "A" && windowsArr.length() == 0) {
+            Log.d(TAG, "场景A无窗口配置，自动创建默认全屏窗口1 -> 文件夹 $DEFAULT_FOLDER")
+        }
+
+        // 场景A：窗口1默认播放文件夹01
+        if (currentSceneId == "A" && windowPlayers.containsKey(DEFAULT_WINDOW_ID)) {
+            val folderPath = videoFolderPath.ifEmpty { filesDir.absolutePath }
+            playFolderInWindow(DEFAULT_WINDOW_ID, DEFAULT_FOLDER, folderPath)
+        }
+    }
+
+    /** 按 zIndex 升序排列 JSONArray */
+    private fun sortWindowsByZ(arr: JSONArray): JSONArray {
+        val list = mutableListOf<JSONObject>()
+        for (i in 0 until arr.length()) list.add(arr.getJSONObject(i))
+        list.sortBy { it.optInt("zIndex", 0) }
+        return JSONArray(list)
+    }
+
+    /** 创建单个窗口视图并加入 flSurface */
+    private fun createWindowView(winId: String, w: JSONObject) {
+        if (flSurface == null) {
+            Log.e(TAG, "flSurface 为 null，无法创建窗口")
+            return
+        }
+
+        val x = w.optInt("x", 0)
+        val y = w.optInt("y", 0)
+        val width = w.optInt("width", 1920).coerceAtLeast(64)
+        val height = w.optInt("height", 1080).coerceAtLeast(64)
+
+        val content = w.optJSONObject("content") ?: JSONObject()
+        val type = content.optString("type", "VIDEO").uppercase()
+
+        val view: View = when (type) {
+            "COLOR" -> createColorView(w, content)
+            "HDMI"  -> createHdmiView(w, content)
+            else    -> createVideoWindowView(winId, w, content)  // VIDEO / 默认
+        }
+
+        val params = FrameLayout.LayoutParams(width, height).apply {
+            leftMargin = x
+            topMargin = y
+            gravity = Gravity.TOP or Gravity.START
+        }
+
+        flSurface?.addView(view, params)
+        windowViews[winId] = view
+        Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y)")
+    }
+
+    /** 纯色背景窗口 */
+    private fun createColorView(w: JSONObject, content: JSONObject): View {
+        val color = content.optString("color", "#000000")
+        val name = w.optString("name", "")
+        return TextView(this).apply {
+            setBackgroundColor(Color.parseColor(color))
+            text = name
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            alpha = 0.85f
+        }
+    }
+
+    /** HDMI 输入占位窗口 */
+    private fun createHdmiView(w: JSONObject, content: JSONObject): View {
+        val inputIdx = content.optInt("inputIndex", 0)
+        return TextView(this).apply {
+            setBackgroundColor(Color.BLACK)
+            text = "HDMI ${inputIdx + 1}"
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+        }
+    }
+
+    /** 视频播放窗口（每个窗口独立 ExoPlayer）*/
+    private fun createVideoWindowView(winId: String, w: JSONObject, content: JSONObject): View {
+        val playerView = PlayerView(this).apply {
+            useController = false
+            setBackgroundColor(Color.BLACK)
+        }
+        val player = ExoPlayer.Builder(this).build().apply {
+            repeatMode = Player.REPEAT_MODE_ALL
+            playWhenReady = true
+        }
+        playerView.player = player
+        windowPlayers[winId] = player
+        return playerView
+    }
+
+    /**
+     * 在指定窗口内播放指定文件夹的视频
+     * @param winId      窗口 ID
+     * @param folderId   文件夹 ID（如 "01"）
+     * @param folderPath 设备上文件夹的绝对路径
+     */
+    private fun playFolderInWindow(winId: String, folderId: String, folderPath: String) {
+        val player = windowPlayers[winId] ?: run {
+            Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
+            return
+        }
+        val folder = java.io.File(folderPath, folderId)
+        if (!folder.exists()) {
+            Log.w(TAG, "playFolderInWindow: 文件夹不存在 $folder")
+            return
+        }
+        val videos = folder.listFiles()
+            ?.filter { it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm") }
+            ?.sortedBy { it.name } ?: return
+        if (videos.isEmpty()) {
+            Log.w(TAG, "playFolderInWindow: 文件夹 $folderId 内无视频")
+            return
+        }
+
+        val items = videos.map { MediaItem.fromUri(Uri.fromFile(it)) }
+        player.setMediaItems(items)
+        player.prepare()
+        Log.d(TAG, "窗口 $winId 开始播放文件夹 $folderId (${videos.size}个视频)")
+    }
+
+    /** 停止指定窗口的播放 */
+    private fun stopWindow(winId: String) {
+        windowPlayers[winId]?.let {
+            it.stop()
+            it.clearMediaItems()
+            Log.d(TAG, "停止窗口 $winId")
+        }
+    }
+
+    /** 切换到 A 或 B 场景并重新渲染 */
+    fun switchScene(sceneId: String) {
+        currentSceneId = sceneId.uppercase()
+        val cached = prefs.getString("scenes_json", null)
+        if (cached != null) {
+            try {
+                applySceneConfigs(JSONObject(cached))
+                Log.d(TAG, "切换到场景 $sceneId")
+            } catch (e: Exception) {
+                Log.e(TAG, "切换场景失败", e)
+            }
+        }
+    }
+
+    /** 释放所有窗口资源（onDestroy 时调用）*/
+    private fun releaseAllWindows() {
+        windowPlayers.values.forEach { it.release() }
+        windowPlayers.clear()
+        windowViews.values.forEach { flSurface?.removeView(it) }
+        windowViews.clear()
+        Log.d(TAG, "释放所有窗口资源")
+    }
+
+    // ========== 多窗口系统实现 ==========
 }
