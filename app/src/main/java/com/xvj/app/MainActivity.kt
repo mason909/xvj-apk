@@ -730,29 +730,37 @@ class MainActivity : AppCompatActivity() {
                     // 保存 debug 标志（来自 MQTT 命令或后续 HTTP API，MQTT 先收到就先保存）
                     val debug = cmd.optBoolean("debug", false)
                     prefs.edit().putBoolean("debug_mode", debug).apply()
-                    logToFile("sync_room_materials: debug=$debug")
+                    logToFile("sync_room_materials: roomId=$roomId, folderMappings=${folderMappings?.keys()?.joinToString()}, debug=$debug")
 
                     // 解析并持久化 scenes（A/B 两套窗口配置）
-                    val scenes = cmd.optJSONObject("scenes")
-                    if (scenes != null) {
-                        prefs.edit().putString("scenes_json", scenes.toString()).apply()
-                        Log.d(TAG, "已保存 scenes 到本地: ${scenes.names()}")
-                        applySceneConfigs(scenes)
-                    } else {
-                        // 无 scenes 时尝试从本地缓存恢复（离线场景）
-                        val cached = prefs.getString("scenes_json", null)
-                        if (cached != null) {
-                            try {
-                                applySceneConfigs(org.json.JSONObject(cached))
-                                Log.d(TAG, "从本地缓存恢复 scenes 成功")
-                            } catch (e: Exception) {
-                                Log.e(TAG, "从本地缓存恢复 scenes 失败: ${e.message}")
+                    try {
+                        val scenes = cmd.optJSONObject("scenes")
+                        if (scenes != null) {
+                            prefs.edit().putString("scenes_json", scenes.toString()).apply()
+                            Log.d(TAG, "已保存 scenes 到本地: ${scenes.names()}")
+                            applySceneConfigs(scenes)
+                        } else {
+                            // 无 scenes 时尝试从本地缓存恢复（离线场景）
+                            val cached = prefs.getString("scenes_json", null)
+                            if (cached != null) {
+                                try {
+                                    applySceneConfigs(org.json.JSONObject(cached))
+                                    Log.d(TAG, "从本地缓存恢复 scenes 成功")
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "从本地缓存恢复 scenes 失败: ${e.message}")
+                                }
                             }
                         }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "sync_room_materials: scenes 处理异常: ${e.message}")
+                        logToFile("scenes 处理异常: ${e.message}")
                     }
 
                     if (folderMappings != null) {
+                        logToFile("准备同步素材: roomId=$roomId, folders=${folderMappings.keys().joinToString()}")
                         syncRoomMaterials(roomId, folderMappings)
+                    } else {
+                        logToFile("folderMappings 为 null，跳过素材同步")
                     }
                 }
                 "update" -> {
@@ -992,18 +1000,22 @@ class MainActivity : AppCompatActivity() {
                 val allMaterials = mutableMapOf<String, org.json.JSONArray>() // folderId -> materials[]
                 try {
                     val apiUrl = java.net.URL(APK_URL + "/api/room-materials/" + roomId)
+                    logToFile("HTTP 请求: $apiUrl")
                     val connection = apiUrl.openConnection()
                     connection.connectTimeout = 15000
                     connection.readTimeout = 30000
                     val response = connection.inputStream.bufferedReader().readText()
+                    logToFile("HTTP 响应长度: ${response.length}, 前100字符: ${response.take(100)}")
                     val resultJson = org.json.JSONObject(response)
                     // 解析成 { "01": [{id,filename,url...}], "02": [...] } 结构
                     val keys = resultJson.keys()
                     while (keys.hasNext()) {
                         val folderId = keys.next()
-                        allMaterials[folderId] = resultJson.getJSONArray(folderId)
+                        if (folderId != "debug") {
+                            allMaterials[folderId] = resultJson.getJSONArray(folderId)
+                        }
                     }
-                    logToFile("获取房间素材成功: " + allMaterials.size + " 个文件夹")
+                    logToFile("获取房间素材成功: ${allMaterials.size} 个文件夹, folders=${allMaterials.keys().joinToString()}")
                 } catch (e: Exception) {
                     Log.e(TAG, "获取房间素材失败: " + e.message)
                     logToFile("获取房间素材失败: " + e.message)
@@ -1905,60 +1917,7 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    // =========================================================================
-    // 多窗口系统（Scene / Window System）
-    // =========================================================================
-    //
-    // 概念说明：
-    //   - Scene（场景）= 房间的 A/B 两套配置，互不影响，可切换
-    //     - 场景A（第一幕）：默认配置，开机即用。窗口为空时自动创建全屏窗口1播放文件夹01
-    //     - 场景B（第二幕）：默认空，等待用户手动配置
-    //   - Window（窗口）= 屏幕上的一个矩形区域，独立渲染一层
-    //   - 每窗口独立 ExoPlayer 实例，支持同时播放多个视频
-    //
-    // scenes JSON 结构（与后端 rooms.config.scenes 对应）：
-    //   {
-    //     "A": { "name": "第一幕", "folder_mappings": {...}, "windows": [Win, ...] },
-    //     "B": { "name": "第二幕", "folder_mappings": {...}, "windows": [Win, ...] }
-    //   }
-    //
-    // Win 结构（与后端窗口配置对应）：
-    //   {
-    //     "id": "win_1",           // 窗口唯一ID
-    //     "name": "主屏",           // 显示名称
-    //     "x": 0, "y": 0,          // 左上角坐标（px）
-    //     "width": 1920, "height": 1080,  // 尺寸（px）
-    //     "zIndex": 1,             // 层级（越大越上层）
-    //     "aspectRatio": "16:9",  // 可选
-    //     "content": {
-    //       "type": "VIDEO",       // COLOR | VIDEO | HDMI | IMAGE
-    //       "folderId": "01",      // type=VIDEO 时，对应素材文件夹
-    //       "inputIndex": 0,       // type=HDMI 时，HDMI 输入索引
-    //       "color": "#000000"     // type=COLOR 时，背景色
-    //     }
-    //   }
-    //
-    // 设备开机流程：
-    //   1. loadConfig() → 尝试从 scenes_json 缓存恢复 → applySceneConfigs()
-    //   2. MQTT 连接成功 → sync_room_materials → applySceneConfigs(scenes)
-    //   3. scenes 为空 → 从 SharedPreferences("scenes_json") 读取缓存恢复（离线模式）
-    //
-    // 持久化：
-    //   scenes_json = SharedPreferences key，存完整 scenes JSON 字符串
-    //   存储时机：每次收到 sync_room_materials 且包含 scenes 时
-    //
-    // 成员变量说明：
-    //   currentSceneId : "A" | "B"   当前激活的场景
-    //   windowPlayers  : Map<windowId, ExoPlayer>  每窗口独立播放器
-    //   windowViews    : Map<windowId, View>       每窗口视图引用（用于删除）
-    //   flSurface      : FrameLayout?              根容器，窗口视图挂载于此
-    //   DEFAULT_WINDOW_ID = "win_1"                 场景A默认窗口ID
-    //   DEFAULT_FOLDER    = "01"                   场景A默认播放文件夹
-    //
-    // 资源释放：
-    //   releaseAllWindows() 在 onDestroy() 中调用，释放所有播放器并移除视图
-    //
-    // =========================================================================
+    // ========== 多窗口系统实现 ==========
 
     /**
      * 应用场景配置（MQTT同步后或启动时调用）
