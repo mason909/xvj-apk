@@ -730,7 +730,7 @@ class MainActivity : AppCompatActivity() {
                     // 保存 debug 标志（来自 MQTT 命令或后续 HTTP API，MQTT 先收到就先保存）
                     val debug = cmd.optBoolean("debug", false)
                     prefs.edit().putBoolean("debug_mode", debug).apply()
-                    logToFile("sync_room_materials: roomId=$roomId, folderMappings=${folderMappings?.let { m -> buildString { m.keys().forEach { append(it); append(",") } }}, debug=$debug")
+                    logToFile("sync_room_materials: roomId=$roomId, folderMappings=" + folderMappings?.keys?.toList()?.joinToString() + ", debug=$debug")
 
                     // 解析并持久化 scenes（A/B 两套窗口配置）
                     val scenes = cmd.optJSONObject("scenes")
@@ -752,7 +752,7 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     if (folderMappings != null) {
-                        logToFile("准备同步素材: roomId=$roomId, folders=${buildString { folderMappings.keys().forEach { append(it); append(",") } }}")
+                        logToFile("准备同步素材: roomId=$roomId, folders=" + folderMappings.keys.toList().joinToString())
                         syncRoomMaterials(roomId, folderMappings)
                     } else {
                         logToFile("folderMappings 为 null，跳过素材同步")
