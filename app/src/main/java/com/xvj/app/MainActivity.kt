@@ -733,27 +733,22 @@ class MainActivity : AppCompatActivity() {
                     logToFile("sync_room_materials: roomId=$roomId, folderMappings=${folderMappings?.let { m -> buildString { m.keys().forEach { append(it); append(",") } }}, debug=$debug")
 
                     // 解析并持久化 scenes（A/B 两套窗口配置）
-                    try {
-                        val scenes = cmd.optJSONObject("scenes")
-                        if (scenes != null) {
-                            prefs.edit().putString("scenes_json", scenes.toString()).apply()
-                            Log.d(TAG, "已保存 scenes 到本地: ${scenes.names()}")
-                            applySceneConfigs(scenes)
-                        } else {
-                            // 无 scenes 时尝试从本地缓存恢复（离线场景）
-                            val cached = prefs.getString("scenes_json", null)
-                            if (cached != null) {
-                                try {
-                                    applySceneConfigs(org.json.JSONObject(cached))
-                                    Log.d(TAG, "从本地缓存恢复 scenes 成功")
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "从本地缓存恢复 scenes 失败: ${e.message}")
-                                }
+                    val scenes = cmd.optJSONObject("scenes")
+                    if (scenes != null) {
+                        prefs.edit().putString("scenes_json", scenes.toString()).apply()
+                        Log.d(TAG, "已保存 scenes 到本地: ${scenes.names()}")
+                        applySceneConfigs(scenes)
+                    } else {
+                        // 无 scenes 时尝试从本地缓存恢复（离线场景）
+                        val cached = prefs.getString("scenes_json", null)
+                        if (cached != null) {
+                            try {
+                                applySceneConfigs(org.json.JSONObject(cached))
+                                Log.d(TAG, "从本地缓存恢复 scenes 成功")
+                            } catch (e: Exception) {
+                                Log.e(TAG, "从本地缓存恢复 scenes 失败: ${e.message}")
                             }
                         }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "sync_room_materials: scenes 处理异常: ${e.message}")
-                        logToFile("scenes 处理异常: ${e.message}")
                     }
 
                     if (folderMappings != null) {
@@ -1015,7 +1010,7 @@ class MainActivity : AppCompatActivity() {
                             allMaterials[folderId] = resultJson.getJSONArray(folderId)
                         }
                     }
-                    logToFile("获取房间素材成功: ${allMaterials.size} 个文件夹, folders=${allMaterials.keys().joinToString()}")
+                    logToFile("获取房间素材成功: " + allMaterials.size + " 个文件夹")
                 } catch (e: Exception) {
                     Log.e(TAG, "获取房间素材失败: " + e.message)
                     logToFile("获取房间素材失败: " + e.message)
