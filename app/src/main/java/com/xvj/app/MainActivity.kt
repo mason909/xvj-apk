@@ -1023,9 +1023,10 @@ class MainActivity : AppCompatActivity() {
                     .apply()
 
                 // 一次性获取该房间所有素材（合并 materials + preset_materials）
+                // v2: 使用 /api/room-materials-v2/ 同时查 materials + preset_materials 表
                 val allMaterials = mutableMapOf<String, org.json.JSONArray>() // folderId -> materials[]
                 try {
-                    val apiUrl = java.net.URL(APK_URL + "/api/room-materials/" + roomId)
+                    val apiUrl = java.net.URL(APK_URL + "/api/room-materials-v2/" + roomId)
                     logToFile("HTTP 请求: $apiUrl")
                     val connection = apiUrl.openConnection()
                     connection.connectTimeout = 15000
