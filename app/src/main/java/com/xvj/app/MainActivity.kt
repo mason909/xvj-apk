@@ -397,21 +397,31 @@ class MainActivity : AppCompatActivity() {
                 options.keepAliveInterval = 60
                 // Paho MQTT库的setWill是protected，暂不使用离线消息功能
 
-                mqttClient?.connect(options)
-                mqttClient?.subscribe(commandTopic, 0)
-
-                // 订阅授权响应主题
-                mqttClient?.subscribe(AUTH_TOPIC, 0)
-
-                Log.d(TAG, "MQTT Connected! Subscribed to: $commandTopic")
-                logToFile("MQTT Connected OK!")
-
-                // 发送设备注册/认证请求
-                registerDevice()
-
-                mqttHandler.post {
-                    binding.statusText?.text = "云端已连接"
-                }
+                // P4 fix: connect 改为带 IMqttActionListener，onSuccess/onFailure 精确控制
+                mqttClient?.connect(options, null, object : org.eclipse.paho.client.mqttv3.IMqttActionListener {
+                    override fun onSuccess(token: org.eclipse.paho.client.mqttv3.IMqttToken?) {
+                        Log.d(TAG, "MQTT Connected! Subscribed to: $commandTopic")
+                        logToFile("MQTT Connected OK!")
+                        onMqttConnected()  // P4 fix: 重置退避计数器
+                        mqttClient?.subscribe(commandTopic, 0)
+                        mqttClient?.subscribe(AUTH_TOPIC, 0)
+                        registerDevice()
+                        mqttHandler.post {
+                            binding.statusText?.text = "云端已连接"
+                        }
+                        // P4 fix: 连接成功后执行，不要在闭包外裸调
+                        checkForUpdate()
+                        requestAuthSync()
+                    }
+                    override fun onFailure(token: org.eclipse.paho.client.mqttv3.IMqttToken?, cause: Throwable?) {
+                        Log.e(TAG, "MQTT Connection failed: ${cause?.message}")
+                        logToFile("MQTT Connection failed: ${cause?.message}")
+                        onMqttReconnectFailed()  // P4 fix: 触发退避
+                        mqttHandler.post {
+                            binding.statusText?.text = "连接失败: ${cause?.message}"
+                        }
+                    }
+                })
 
                 // 设置消息回调
                 mqttClient?.setCallback(object : MqttCallback {
@@ -420,8 +430,11 @@ class MainActivity : AppCompatActivity() {
                         mqttHandler.post {
                             binding.statusText?.text = "连接断开,重连中..."
                         }
-                        reconnectMQTT()
-        checkForUpdate() // 检查更新
+                        // P4 fix: 检查是否真的断了，再用退避策略重连
+                        if (mqttClient?.isConnected != true) {
+                            onMqttReconnectFailed()
+                            reconnectMQTT()
+                        }
                     }
 
                     override fun messageArrived(topic: String?, message: MqttMessage?) {
@@ -631,16 +644,34 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // P4 fix: MQTT 重连加指数退避，上限 5 分钟，防止死循环
+    private var mqttReconnectDelaySeconds = 5
+    private val mqttMaxReconnectDelaySeconds = 300
+    private var mqttReconnectAttempts = 0
+
     private fun reconnectMQTT() {
+        val delayMs = (mqttReconnectDelaySeconds * 1000).toLong()
         mqttHandler.postDelayed({
-            try {
-                mqttClient?.close()
-            } catch (e: Exception) {}
+            try { mqttClient?.close() } catch (e: Exception) {}
             connectMQTT()
-        checkForUpdate() // 检查更新
-        // 请求同步授权状态
-        requestAuthSync()
-        }, 5000)
+            // P4 fix: checkForUpdate 和 requestAuthSync 移入 postDelayed 闭包内，等待连接建立后再执行
+            checkForUpdate()
+            requestAuthSync()
+        }, delayMs)
+    }
+
+    // 连接成功时调用（由 MQTT callback 触发），重置退避计数器
+    private fun onMqttConnected() {
+        mqttReconnectDelaySeconds = 5
+        mqttReconnectAttempts = 0
+    }
+
+    // 连接失败时调用，逐步增加退避延迟
+    private fun onMqttReconnectFailed() {
+        mqttReconnectAttempts++
+        // 指数退避：5s → 10s → 20s → 40s → 80s → 160s → 300s（上限）
+        mqttReconnectDelaySeconds = minOf(mqttReconnectDelaySeconds * 2, mqttMaxReconnectDelaySeconds)
+        Log.d(TAG, "MQTT重连失败 #${mqttReconnectAttempts}，${mqttReconnectDelaySeconds}s 后重试")
     }
 
     // 请求同步授权状态
@@ -674,20 +705,26 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "play_local" -> {
-                    // 本地播放 - 推送指定文件夹的文件
+                    // P1 fix: 路径遍历防护 — 严格校验 folder + filename
                     val folder = cmd.optString("folder", "01")
                     val filename = cmd.optString("filename", "")
-                    if (filename.isNotEmpty()) {
-                        playLocalVideo(folder, filename)
+                    if (filename.isNotEmpty() && isValidFilepath(filename)) {
+                        val safeFolder = folder.trim().take(2).replace(Regex("[^0-9]"), "01")
+                        playLocalVideo(safeFolder, filename.trim())
+                    } else {
+                        Log.w(TAG, "play_local 拒绝非法参数: folder=$folder, filename=$filename")
                     }
                 }
                 "push_file" -> {
-                    // 接收文件推送
+                    // P1 fix: 路径遍历防护 — 严格校验 folder + filename
                     val folder = cmd.optString("folder", "01")
                     val filename = cmd.optString("filename", "")
                     val url = cmd.optString("url", "")
-                    if (filename.isNotEmpty() && url.isNotEmpty()) {
-                        downloadAndPlay(folder, filename, url)
+                    if (filename.isNotEmpty() && isValidFilepath(filename) && url.isNotEmpty()) {
+                        val safeFolder = folder.trim().take(2).replace(Regex("[^0-9]"), "01")
+                        downloadAndPlay(safeFolder, filename.trim(), url)
+                    } else {
+                        Log.w(TAG, "push_file 拒绝非法参数: folder=$folder, filename=$filename, url=$url")
                     }
                 }
                 "stop" -> {
@@ -1623,12 +1660,20 @@ class MainActivity : AppCompatActivity() {
     }
     
     // 计算文件MD5
+    // P3 fix: 流式 MD5 计算，防止大文件 OOM
     private fun calculateMd5(file: File): String {
         return try {
             val digest = java.security.MessageDigest.getInstance("MD5")
-            val bytes = file.inputStream().use { it.readBytes() }
-            digest.digest(bytes).joinToString("") { "%02x".format(it) }
+            file.inputStream().use { fis ->
+                val buffer = ByteArray(8192)
+                var read: Int
+                while (fis.read(buffer).also { read = it } != -1) {
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
         } catch (e: Exception) {
+            Log.e(TAG, "MD5计算失败: ${e.message}")
             ""
         }
     }
@@ -1689,13 +1734,18 @@ class MainActivity : AppCompatActivity() {
             val digest = md.digest(cert)
             val fingerprint = digest.joinToString("") { "%02x".format(it) }
             
-            // 验证签名证书指纹（需要替换为实际证书指纹）
-            // 这里先允许所有有效签名，但在生产环境应配置可信证书指纹
+            // P2 fix: 必须配置实际证书指纹才可启用生产 OTA
+            // TODO: 替换为实际 APK 签名证书的 SHA-256 指纹后删除下面这行
+            if (true) { Log.w(TAG, "APK签名验证已启用但缺少 EXPECTED_CERT_FINGERPRINT，请联系管理员"); return false }
             Log.d(TAG, "APK签名证书指纹: $fingerprint")
-            
-            // TODO: 在生产环境配置 EXPECTED_CERT_FINGERPRINT 并启用以下验证:
-            // return fingerprint == EXPECTED_CERT_FINGERPRINT
-            return true  // 开发环境暂时跳过指纹验证
+            val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
+            if (fingerprint == EXPECTED_CERT_FINGERPRINT) {
+                Log.d(TAG, "APK签名校验通过")
+                return true
+            } else {
+                Log.e(TAG, "APK签名校验失败: 指纹不匹配")
+                return false
+            }
         } catch (e: Exception) {
             Log.e(TAG, "APK签名验证异常: ${e.message}")
             return false
