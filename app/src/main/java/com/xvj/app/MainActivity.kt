@@ -392,9 +392,9 @@ class MainActivity : AppCompatActivity() {
                 mqttClient = MqttClient(mqttServer, mqttClientId, null)
                 val commandTopic = "xvj/device/$deviceId/command"
                 val options = MqttConnectOptions()
-                options.isCleanSession = true
+                options.isCleanSession = false
                 options.connectionTimeout = 30
-                options.keepAliveInterval = 60
+                options.keepAliveInterval = 15
                 // P4 fix: 连接成功/失败通过 setCallback + isConnected 标志判断
                 mqttClient?.setCallback(object : MqttCallback {
                     override fun connectionLost(cause: Throwable?) {
