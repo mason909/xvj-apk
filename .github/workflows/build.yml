@@ -27,9 +27,29 @@ jobs:
         echo "sdk.dir=$ANDROID_HOME" > local.properties
     
     - name: Build with Gradle
+      id: gradle-build
       run: |
         chmod +x gradlew
-        ./gradlew assembleDebug --no-daemon
+        mkdir -p build-logs
+        # Use script file + separate status capture so PIPESTATUS gives Gradle exit code
+        cat > gradle_build.sh << 'SCRIPT'
+        #!/bin/bash
+        set -o pipefail
+        ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build-logs/gradle-output.log
+        echo "GRADLE_EXIT=$?"
+        SCRIPT
+        bash gradle_build.sh
+        GRADLE_CODE=${PIPESTATUS[0]}
+        echo "BUILD_EXIT_CODE=$GRADLE_CODE" >> $GITHUB_ENV
+        echo "Gradle exit code: $GRADLE_CODE"
+    
+    - name: Upload build logs on failure
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: gradle-build-logs
+        path: build-logs/gradle-output.log
+        retention-days: 3
     
     - name: Upload APK
       uses: actions/upload-artifact@v4
