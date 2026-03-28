@@ -31,7 +31,6 @@ jobs:
       run: |
         chmod +x gradlew
         mkdir -p build-logs
-        # Use script file + separate status capture so PIPESTATUS gives Gradle exit code
         cat > gradle_build.sh << 'SCRIPT'
         #!/bin/bash
         set -o pipefail
@@ -42,6 +41,13 @@ jobs:
         GRADLE_CODE=${PIPESTATUS[0]}
         echo "BUILD_EXIT_CODE=$GRADLE_CODE" >> $GITHUB_ENV
         echo "Gradle exit code: $GRADLE_CODE"
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      if: success()
+      with:
+        name: xvj-apk
+        path: app/build/outputs/**/*.apk
     
     - name: Upload build logs on failure
       if: always()
@@ -50,10 +56,3 @@ jobs:
         name: gradle-build-logs
         path: build-logs/gradle-output.log
         retention-days: 3
-    
-    - name: Upload APK
-      uses: actions/upload-artifact@v4
-      if: success()
-      with:
-        name: xvj-apk
-        path: app/build/outputs/apk/debug/app-debug.apk
