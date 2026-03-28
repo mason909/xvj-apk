@@ -395,35 +395,7 @@ class MainActivity : AppCompatActivity() {
                 options.isCleanSession = true
                 options.connectionTimeout = 30
                 options.keepAliveInterval = 60
-                // Paho MQTT库的setWill是protected，暂不使用离线消息功能
-
-                // P4 fix: connect 改为带 IMqttActionListener，onSuccess/onFailure 精确控制
-                mqttClient?.connect(options, null, object : org.eclipse.paho.client.mqttv3.IMqttActionListener {
-                    override fun onSuccess(token: org.eclipse.paho.client.mqttv3.IMqttToken?) {
-                        Log.d(TAG, "MQTT Connected! Subscribed to: $commandTopic")
-                        logToFile("MQTT Connected OK!")
-                        onMqttConnected()  // P4 fix: 重置退避计数器
-                        mqttClient?.subscribe(commandTopic, 0)
-                        mqttClient?.subscribe(AUTH_TOPIC, 0)
-                        registerDevice()
-                        mqttHandler.post {
-                            binding.statusText?.text = "云端已连接"
-                        }
-                        // P4 fix: 连接成功后执行，不要在闭包外裸调
-                        checkForUpdate()
-                        requestAuthSync()
-                    }
-                    override fun onFailure(token: org.eclipse.paho.client.mqttv3.IMqttToken?, cause: Throwable?) {
-                        Log.e(TAG, "MQTT Connection failed: ${cause?.message}")
-                        logToFile("MQTT Connection failed: ${cause?.message}")
-                        onMqttReconnectFailed()  // P4 fix: 触发退避
-                        mqttHandler.post {
-                            binding.statusText?.text = "连接失败: ${cause?.message}"
-                        }
-                    }
-                })
-
-                // 设置消息回调
+                // P4 fix: 连接成功/失败通过 setCallback + isConnected 标志判断
                 mqttClient?.setCallback(object : MqttCallback {
                     override fun connectionLost(cause: Throwable?) {
                         Log.w(TAG, "MQTT Connection Lost: ${cause?.message}")
@@ -441,8 +413,6 @@ class MainActivity : AppCompatActivity() {
                         try {
                             val payload = String(message?.payload ?: ByteArray(0))
                             Log.d(TAG, "Received: $topic -> $payload")
-
-                            // 处理授权响应
                             if (topic == AUTH_TOPIC) {
                                 handleAuthResponse(payload)
                             } else {
@@ -456,12 +426,31 @@ class MainActivity : AppCompatActivity() {
                     override fun deliveryComplete(token: IMqttDeliveryToken?) {}
                 })
 
-            } catch (e: Exception) {
-                Log.e(TAG, "MQTT Connection Error: ${e.message}")
-                logToFile("MQTT Error: ${e.message}")
-                mqttHandler.post {
-                    binding.statusText?.text = "连接失败: ${e.message}"
+                try {
+                    mqttClient?.connect(options)
+                    Log.d(TAG, "MQTT Connected! Subscribed to: $commandTopic")
+                    logToFile("MQTT Connected OK!")
+                    onMqttConnected()  // P4 fix: 重置退避计数器
+                    mqttClient?.subscribe(commandTopic, 0)
+                    mqttClient?.subscribe(AUTH_TOPIC, 0)
+                    registerDevice()
+                    mqttHandler.post {
+                        binding.statusText?.text = "云端已连接"
+                    }
+                    // P4 fix: 连接成功后执行，不要在闭包外裸调
+                    checkForUpdate()
+                    requestAuthSync()
+                } catch (e: Exception) {
+                    Log.e(TAG, "MQTT Connection Error: ${e.message}")
+                    logToFile("MQTT Connection Error: ${e.message}")
+                    onMqttReconnectFailed()  // P4 fix: 连接失败也触发退避
+                    mqttHandler.post {
+                        binding.statusText?.text = "连接失败: ${e.message}"
+                    }
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "MQTT setup error: ${e.message}")
+                logToFile("MQTT setup error: ${e.message}")
             }
         }
     }
