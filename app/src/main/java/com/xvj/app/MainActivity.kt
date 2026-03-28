@@ -544,7 +544,7 @@ class MainActivity : AppCompatActivity() {
 
                     mqttHandler.post {
                         if (authorized) {
-                            binding.statusText?.text = "设备已授权: $message"
+                            binding.statusText?.text = "已授权至房间 $roomId"
                             // 保存授权状态和房间信息
                             prefs.edit()
                                 .putBoolean("authorized", true)
@@ -568,7 +568,7 @@ class MainActivity : AppCompatActivity() {
                             // 播放默认folder01（实际播放由RS485/DMX信号决定）
                             playFolderVideos("01")
                         } else {
-                            binding.statusText?.text = "设备未授权: $message"
+                            binding.statusText?.text = "设备未授权"
                             // 未授权，停止工作
                             stopPlayback()
                             // 可以选择显示全屏提示或自动退出
@@ -842,14 +842,14 @@ class MainActivity : AppCompatActivity() {
                 playWhenReady = true
                 prepare()
             }
-            binding.statusText?.text = "播放: $url"
+            binding.statusText?.text = "播放中"
         }
     }
 
     private fun playFromCloud(videoId: String) {
         Log.d(TAG, "Playing from cloud: $videoId")
         mqttHandler.post {
-            binding.statusText?.text = "下载中: $videoId"
+            binding.statusText?.text = "正在下载素材..."
         }
 
         downloadExecutor.submit {
@@ -866,7 +866,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "Play from cloud error: ${e.message}")
                 mqttHandler.post {
-                    binding.statusText?.text = "下载失败: ${e.message}"
+                    binding.statusText?.text = "素材下载失败"
                 }
             }
         }
@@ -884,7 +884,7 @@ class MainActivity : AppCompatActivity() {
         if (!videoFile.exists()) {
             Log.e(TAG, "File not found: ${videoFile.absolutePath}")
             mqttHandler.post {
-                binding.statusText?.text = "文件不存在: $folder/$filename"
+                binding.statusText?.text = "素材文件不存在"
             }
             return
         }
@@ -915,7 +915,7 @@ class MainActivity : AppCompatActivity() {
 
         Log.d(TAG, "Downloading: $serverUrl -> ${localFile.absolutePath}")
         mqttHandler.post {
-            binding.statusText?.text = "下载中: $filename"
+            binding.statusText?.text = "正在下载素材..."
         }
 
         downloadExecutor.submit {
@@ -951,7 +951,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "Download error: ${e.message}")
                 mqttHandler.post {
-                    binding.statusText?.text = "下载失败: ${e.message}"
+                    binding.statusText?.text = "素材下载失败"
                 }
             }
         }
