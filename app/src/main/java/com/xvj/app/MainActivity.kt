@@ -579,7 +579,8 @@ class MainActivity : AppCompatActivity() {
                 "deauthorize" -> {
                     // 被远程废掉
                     mqttHandler.post {
-                        binding.statusText?.text = "设备已被废止"
+                        // 状态文字放在stopPlayback之前，避免被覆盖
+                        binding.statusText?.text = "已废止"
                         prefs.edit()
                             .putBoolean("authorized", false)
                             .remove("room_id")
@@ -1360,7 +1361,7 @@ class MainActivity : AppCompatActivity() {
     private fun stopPlayback() {
         Log.d(TAG, "stopPlayback called")
         releasePlayer()
-        binding.statusText?.text = "已停止"
+        binding.statusText?.text = "播放已停止"
     }
 
     private fun releasePlayer() {
