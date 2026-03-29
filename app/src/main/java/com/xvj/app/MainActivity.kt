@@ -738,8 +738,8 @@ class MainActivity : AppCompatActivity() {
                 }
                 "sync" -> {
                     val roomId = prefs.getString("room_id", "") ?: ""
-                    val mappingsStr = prefs.getString("room_folder_mappings", "{}")
-                    if (roomId.isNotEmpty() && mappingsStr.isNotEmpty()) {
+                    val mappingsStr = prefs.getString("room_folder_mappings", "{}") ?: "{}"
+                    if (roomId.isNotEmpty()) {
                         syncRoomMaterials(roomId, org.json.JSONObject(mappingsStr))
                     }
                 }
