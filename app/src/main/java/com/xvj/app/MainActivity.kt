@@ -23,8 +23,6 @@
 
 package com.xvj.app
 
-// 上线前替换为实际 SHA-256 指纹；未配置时跳过验证，方便测试
-private const val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
 
 import android.content.Intent
 import android.content.pm.ActivityInfo
