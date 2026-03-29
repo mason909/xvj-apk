@@ -1732,11 +1732,10 @@ class MainActivity : AppCompatActivity() {
             val fingerprint = digest.joinToString("") { "%02x".format(it) }
             
             // P2 fix: 必须配置实际证书指纹才可启用生产 OTA
-            // TODO: 替换为实际 APK 签名证书的 SHA-256 指纹后删除下面这行
-            val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
+            // 未配置指纹时跳过验证，方便测试
             if (EXPECTED_CERT_FINGERPRINT == "YOUR_CERT_FINGERPRINT_HERE") {
                 Log.w(TAG, "APK签名验证未配置，跳过（请在 MainActivity.kt 中配置 EXPECTED_CERT_FINGERPRINT）")
-                return true  // 未配置时跳过验证，方便测试
+                return true
             }
             Log.d(TAG, "APK签名证书指纹: $fingerprint")
             val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
