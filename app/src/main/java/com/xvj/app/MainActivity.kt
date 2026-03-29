@@ -559,10 +559,7 @@ class MainActivity : AppCompatActivity() {
                                 prefs.edit().putString("room_folder_mappings", folderMappings.toString()).apply()
                             }
                             Log.d(TAG, "授权成功: room_id=$roomId, folder_mappings=$folderMappings")
-                            
-                            // 先停止当前播放
-                            stopPlayback()
-                            
+
                             // 开始同步素材（同步完成后由 syncRoomMaterials 末尾触发默认播放）
                             if (folderMappings != null) {
                                 logToFile("开始根据房间配置同步素材...")
@@ -570,9 +567,7 @@ class MainActivity : AppCompatActivity() {
                             }
                         } else {
                             binding.statusText?.text = "设备未授权"
-                            // 未授权，停止工作
-                            stopPlayback()
-                            // 可以选择显示全屏提示或自动退出
+                            // 切换到欢迎视频（不停止当前播放）
                             showUnauthorizedAlert(message)
                         }
                     }
@@ -580,15 +575,12 @@ class MainActivity : AppCompatActivity() {
                 "deauthorize" -> {
                     // 被远程废掉
                     mqttHandler.post {
-                        // 状态文字放在stopPlayback之前，避免被覆盖
                         binding.statusText?.text = "已废止"
                         prefs.edit()
                             .putBoolean("authorized", false)
                             .remove("room_id")
                             .remove("folder_mappings")
                             .apply()
-                        // 先停止当前播放
-                        stopPlayback()
                         showUnauthorizedAlert("设备已被远程废止，请联系管理员")
                     }
                 }
@@ -602,8 +594,7 @@ class MainActivity : AppCompatActivity() {
      * 显示未授权提示并播放欢迎视频
      */
     private fun showUnauthorizedAlert(message: String) {
-        // 停止当前播放并切换到欢迎视频
-        stopPlayback()
+        // 直接切换到欢迎视频（不停止当前播放）
         playWelcomeVideo()
         Log.w(TAG, "UNAUTHORIZED: $message")
     }
