@@ -545,25 +545,30 @@ class MainActivity : AppCompatActivity() {
                     // 提取房间信息
                     val roomId = resp.optString("room_id", "")
                     val folderMappings = resp.optJSONObject("folder_mappings")
+                    // 提取 scenes 配置（包含 A/B 两套窗口配置和各自 folder_mappings）
+                    val scenes = resp.optJSONObject("scenes")
 
                     mqttHandler.post {
                         if (authorized) {
                             binding.statusText?.text = "已授权至房间 $roomId"
+                            // 停止欢迎视频等旧播放器
+                            releasePlayer()
                             // 保存授权状态和房间信息
                             prefs.edit()
                                 .putBoolean("authorized", true)
                                 .putString("room_id", roomId)
                                 .apply()
-                            // 保存folder_mappings到本地
+                            // 保存 scenes 配置（包含 A/B 的 folder_mappings）
+                            if (scenes != null) {
+                                prefs.edit().putString("scenes_json", scenes.toString()).apply()
+                                Log.d(TAG, "授权成功，已保存 scenes: ${scenes.names()}")
+                            }
+                            // 保存 folder_mappings 并合并 A+B 一次同步
                             if (folderMappings != null) {
                                 prefs.edit().putString("room_folder_mappings", folderMappings.toString()).apply()
-                            }
-                            Log.d(TAG, "授权成功: room_id=$roomId, folder_mappings=$folderMappings")
-
-                            // 开始同步素材（同步完成后由 syncRoomMaterials 末尾触发默认播放）
-                            if (folderMappings != null) {
+                                Log.d(TAG, "授权成功: room_id=$roomId, folder_mappings=$folderMappings")
                                 logToFile("开始根据房间配置同步素材...")
-                                syncRoomMaterials(roomId, folderMappings)
+                                syncRoomMaterialsAllScenes(roomId, folderMappings, scenes)
                             }
                         } else {
                             binding.statusText?.text = "设备未授权"
@@ -677,10 +682,6 @@ class MainActivity : AppCompatActivity() {
             val action = cmd.getString("action")
 
             when (action) {
-                // 修复：auth_result 可能从 command topic 到达，也需要更新状态文字
-                "auth_result" -> {
-                    handleAuthResponse(json)
-                }
                 "play" -> {
                     val url = cmd.optString("url", "")
                     val videoId = cmd.optString("id", "")
@@ -780,25 +781,15 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
+                    // 合并 Scene A + B 的 folder_mappings，一次调用，避免覆盖问题
                     if (folderMappings != null) {
                         val foldersStr = java.lang.StringBuilder()
                         val k = folderMappings.keys()
                         while (k.hasNext()) { foldersStr.append(k.next()).append(",") }
                         logToFile("准备同步素材: roomId=$roomId, folders=" + foldersStr)
-                        syncRoomMaterials(roomId, folderMappings)
+                        syncRoomMaterialsAllScenes(roomId, folderMappings, scenes)
                     } else {
                         logToFile("folderMappings 为 null，跳过素材同步")
-                    }
-
-                    // 同步 Scene B 素材（如果存在）
-                    val scenesB = scenes?.optJSONObject("B")
-                    val folderMappingsB = scenesB?.optJSONObject("folder_mappings")
-                    if (folderMappingsB != null && folderMappingsB.length() > 0) {
-                        val foldersStrB = java.lang.StringBuilder()
-                        val kB = folderMappingsB.keys()
-                        while (kB.hasNext()) { foldersStrB.append(kB.next()).append(",") }
-                        logToFile("准备同步 Scene B 素材: roomId=$roomId, folders=" + foldersStrB)
-                        syncRoomMaterials(roomId, folderMappingsB)
                     }
                 }
                 "update" -> {
@@ -894,6 +885,9 @@ class MainActivity : AppCompatActivity() {
 
         if (!videoFile.exists()) {
             Log.w(TAG, "File not found: ${videoFile.absolutePath}, waiting for sync...")
+            mqttHandler.post {
+                binding.statusText?.text = "等待素材同步..."
+            }
             return
         }
 
@@ -1019,6 +1013,19 @@ class MainActivity : AppCompatActivity() {
     // 同步房间素材到本地文件夹
 
     // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
+    // 合并 Scene A + B 的 folder_mappings，一次同步，避免两次调用覆盖 prefs
+    private fun syncRoomMaterialsAllScenes(roomId: String, folderMappingsA: org.json.JSONObject, scenes: org.json.JSONObject?) {
+        val merged = org.json.JSONObject()
+        // 先放入 Scene A 的映射
+        folderMappingsA.keys().forEach { key -> merged.put(key, folderMappingsA.get(key)) }
+        // 再合并 Scene B（若有），B 的 key 不会和 A 重叠
+        scenes?.optJSONObject("B")?.optJSONObject("folder_mappings")?.let { fmB ->
+            fmB.keys().forEach { key -> merged.put(key, fmB.get(key)) }
+        }
+        Log.d(TAG, "合并后 folder_mappings: ${merged.keys().asSequence().toList()}")
+        syncRoomMaterials(roomId, merged)
+    }
+
     private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
