@@ -8,51 +8,42 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
         distribution: 'temurin'
-    
+
     - name: Set up Android SDK
       uses: android-actions/setup-android@v3
-    
+
     - name: Create local.properties
-      run: |
-        echo "sdk.dir=$ANDROID_HOME" > local.properties
-    
+      run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
     - name: Build with Gradle
       id: gradle-build
       run: |
         chmod +x gradlew
-        mkdir -p build-logs
-        cat > gradle_build.sh << 'SCRIPT'
-        #!/bin/bash
-        set -o pipefail
-        ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build-logs/gradle-output.log
-        echo "GRADLE_EXIT=$?"
-        SCRIPT
-        bash gradle_build.sh
-        GRADLE_CODE=${PIPESTATUS[0]}
-        echo "BUILD_EXIT_CODE=$GRADLE_CODE" >> $GITHUB_ENV
-        echo "Gradle exit code: $GRADLE_CODE"
+        ./gradlew clean assembleDebug --no-daemon --stacktrace || exit 1
+
+    - name: Check APK exists
+      id: check-apk
+      run: |
+        echo "Checking for APK files..."
+        ls -la app/build/outputs/apk/ 2>/dev/null || echo "No apk directory found"
+        find app/build/outputs -name "*.apk" 2>/dev/null || echo "No APK files found"
+        if ! ls app/build/outputs/**/*.apk 1>/dev/null 2>&1; then
+          echo "ERROR: No APK files produced by build!"
+          exit 1
+        fi
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
-      if: success()
       with:
         name: xvj-apk
         path: app/build/outputs/**/*.apk
-    
-    - name: Upload build logs on failure
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: gradle-build-logs
-        path: build-logs/gradle-output.log
-        retention-days: 3
