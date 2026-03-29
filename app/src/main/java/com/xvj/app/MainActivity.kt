@@ -686,6 +686,10 @@ class MainActivity : AppCompatActivity() {
             val action = cmd.getString("action")
 
             when (action) {
+                // 修复：auth_result 可能从 command topic 到达，也需要更新状态文字
+                "auth_result" -> {
+                    handleAuthResponse(json)
+                }
                 "play" -> {
                     val url = cmd.optString("url", "")
                     val videoId = cmd.optString("id", "")
