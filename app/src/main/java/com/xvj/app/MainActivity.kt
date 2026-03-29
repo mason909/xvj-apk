@@ -563,7 +563,7 @@ class MainActivity : AppCompatActivity() {
                             // 开始同步素材（同步完成后由 syncRoomMaterials 末尾触发默认播放）
                             if (folderMappings != null) {
                                 logToFile("开始根据房间配置同步素材...")
-                                syncMaterials()
+                                syncRoomMaterials(roomId, folderMappings)
                             }
                         } else {
                             binding.statusText?.text = "设备未授权"
@@ -737,7 +737,11 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "sync" -> {
-                    syncMaterials()
+                    val roomId = prefs.getString("room_id", "") ?: ""
+                    val mappingsStr = prefs.getString("room_folder_mappings", "{}")
+                    if (roomId.isNotEmpty() && mappingsStr.isNotEmpty()) {
+                        syncRoomMaterials(roomId, org.json.JSONObject(mappingsStr))
+                    }
                 }
                 "preset_sync" -> {
                     // 接收预设素材同步
@@ -784,6 +788,17 @@ class MainActivity : AppCompatActivity() {
                         syncRoomMaterials(roomId, folderMappings)
                     } else {
                         logToFile("folderMappings 为 null，跳过素材同步")
+                    }
+
+                    // 同步 Scene B 素材（如果存在）
+                    val scenesB = scenes?.optJSONObject("B")
+                    val folderMappingsB = scenesB?.optJSONObject("folder_mappings")
+                    if (folderMappingsB != null && folderMappingsB.length() > 0) {
+                        val foldersStrB = java.lang.StringBuilder()
+                        val kB = folderMappingsB.keys()
+                        while (kB.hasNext()) { foldersStrB.append(kB.next()).append(",") }
+                        logToFile("准备同步 Scene B 素材: roomId=$roomId, folders=" + foldersStrB)
+                        syncRoomMaterials(roomId, folderMappingsB)
                     }
                 }
                 "update" -> {
@@ -878,10 +893,7 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "Playing local: ${videoFile.absolutePath}")
 
         if (!videoFile.exists()) {
-            Log.e(TAG, "File not found: ${videoFile.absolutePath}")
-            mqttHandler.post {
-                binding.statusText?.text = "素材文件不存在"
-            }
+            Log.w(TAG, "File not found: ${videoFile.absolutePath}, waiting for sync...")
             return
         }
 
@@ -1163,45 +1175,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 下载并播放指定文件夹
-    private fun downloadAndPlayFolder(folderId: String) {
-        downloadExecutor.submit {
-            try {
-                // 获取该文件夹的素材列表
-                val mappingsStr = prefs.getString("room_folder_mappings", "{}")
-                val mappings = org.json.JSONObject(mappingsStr)
-                val materialIds = mappings.optJSONArray(folderId)
-
-                if (materialIds == null || materialIds.length() == 0) {
-                    Log.d(TAG, "文件夹 $folderId 没有素材")
-                    return@submit
-                }
-
-                // 获取素材URL并下载
-                val videoList = mutableListOf<File>()
-                val folderDir = File(videoFolderPath, folderId)
-                if (!folderDir.exists()) {
-                    folderDir.mkdirs()
-                }
-
-                for (i in 0 until materialIds.length()) {
-                    val materialId = materialIds.getString(i)
-                    // TODO: 从API获取素材详情（URL等）
-                    // 这里简化处理
-                    Log.d(TAG, "需要下载素材: $materialId 到文件夹 $folderId")
-                }
-
-                // 播放01文件夹
-                mqttHandler.post {
-                    binding.statusText?.text = "播放文件夹: $folderId"
-                    playFolderVideos(folderId)
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Download folder error: ${e.message}")
-            }
-        }
-    }
-
     // 播放本地文件夹的视频
     private fun playFolderVideos(folderId: String) {
         Log.d(TAG, "playFolderVideos called: folderId=$folderId")
@@ -1439,80 +1412,6 @@ class MainActivity : AppCompatActivity() {
     /**
      * 检查更新 - 延迟5秒后执行
      */
-    // 素材同步：根据folder_mappings从云端同步素材
-    private fun syncMaterials() {
-        logToFile("开始同步素材...")
-        
-        val mappingsStr = prefs.getString("room_folder_mappings", "{}")
-        if (mappingsStr.isNullOrEmpty()) {
-            logToFile("无素材映射配置，跳过同步")
-            return
-        }
-        
-        try {
-            val mappings = org.json.JSONObject(mappingsStr)
-            val keys = mappings.keys()
-            
-            while (keys.hasNext()) {
-                val sceneId = keys.next()
-                val folderId = mappings.getString(sceneId)
-                logToFile("同步场景$sceneId -> 文件夹$folderId")
-                syncFolder(folderId)
-            }
-            
-            logToFile("素材同步完成")
-        } catch (e: Exception) {
-            Log.e(TAG, "素材同步失败: ${e.message}")
-            logToFile("素材同步失败: ${e.message}")
-        }
-    }
-    
-    // 同步单个文件夹
-    private fun syncFolder(folderId: String) {
-        Thread {
-            try {
-                // 获取云端该文件夹的文件列表
-                val url = java.net.URL("$APK_URL/api/materials?folder=$folderId")
-                val connection = url.openConnection()
-                connection.connectTimeout = 10000
-                connection.readTimeout = 30000
-                val response = connection.inputStream.bufferedReader().readText()
-                val json = org.json.JSONArray(response)
-                
-                val localFolder = File(videoFolderPath, folderId)
-                if (!localFolder.exists()) {
-                    localFolder.mkdirs()
-                }
-                
-                for (i in 0 until json.length()) {
-                    val file = json.getJSONObject(i)
-                    val filename = file.getString("filename")
-                    val md5 = file.optString("md5", "")
-                    val urlPath = file.getString("url")
-                    
-                    val localFile = File(localFolder, filename)
-                    
-                    // 检查是否需要下载
-                    if (localFile.exists() && md5.isNotEmpty()) {
-                        val localMd5 = calculateMd5(localFile)
-                        if (localMd5 == md5) {
-                            Log.d(TAG, "文件已存在且MD5一致: $filename")
-                            continue
-                        }
-                    }
-                    
-                    // 下载文件
-                    logToFile("下载素材: $filename")
-                    downloadFile("$APK_URL$urlPath", localFile)
-                }
-                
-                logToFile("文件夹$folderId 同步完成")
-            } catch (e: Exception) {
-                Log.e(TAG, "同步文件夹$folderId 失败: ${e.message}")
-            }
-        }.start()
-    }
-
     // 素材同步 v2: 4线程并行 + ETag条件请求 + 64KB buffer
     /**
      * 带 ETag/Last-Modified 条件请求的文件下载
