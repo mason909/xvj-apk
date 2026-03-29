@@ -55,6 +55,9 @@ import java.io.PrintWriter
 import java.io.RandomAccessFile
 import java.util.concurrent.Executors
 
+// 上线前替换为实际 SHA-256 指纹；未配置时跳过验证，方便测试
+private const val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
+
 /**
  * XVJ 终端播放器
  * - 无界面，纯执行器
@@ -1739,7 +1742,6 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
             Log.d(TAG, "APK签名证书指纹: $fingerprint")
-            val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
             if (fingerprint == EXPECTED_CERT_FINGERPRINT) {
                 Log.d(TAG, "APK签名校验通过")
                 return true
