@@ -37,7 +37,7 @@ jobs:
         echo "Checking for APK files..."
         ls -la app/build/outputs/apk/ 2>/dev/null || echo "No apk directory found"
         find app/build/outputs -name "*.apk" 2>/dev/null || echo "No APK files found"
-        if ! ls app/build/outputs/**/*.apk 1>/dev/null 2>&1; then
+        if ! find app/build/outputs -name "*.apk" | grep -q .; then
           echo "ERROR: No APK files produced by build!"
           exit 1
         fi
