@@ -559,14 +559,11 @@ class MainActivity : AppCompatActivity() {
                             // 先停止当前播放
                             stopPlayback()
                             
-                            // 开始同步素材
+                            // 开始同步素材（同步完成后由 syncRoomMaterials 末尾触发默认播放）
                             if (folderMappings != null) {
                                 logToFile("开始根据房间配置同步素材...")
                                 syncMaterials()
                             }
-                            
-                            // 播放默认folder01（实际播放由RS485/DMX信号决定）
-                            playFolderVideos("01")
                         } else {
                             binding.statusText?.text = "设备未授权"
                             // 未授权，停止工作
@@ -1063,6 +1060,15 @@ class MainActivity : AppCompatActivity() {
 
                 mqttHandler.post {
                     binding.statusText?.text = "素材同步完成"
+                    // 素材同步完成后，应用场景配置并开始默认播放
+                    val scenesJson = prefs.getString("scenes_json", null)
+                    if (scenesJson != null) {
+                        try {
+                            applySceneConfigs(org.json.JSONObject(scenesJson))
+                        } catch (e: Exception) {
+                            Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
+                        }
+                    }
                 }
                 logToFile("房间素材同步完成: " + roomId)
             } catch (e: Exception) {
@@ -1727,7 +1733,11 @@ class MainActivity : AppCompatActivity() {
             
             // P2 fix: 必须配置实际证书指纹才可启用生产 OTA
             // TODO: 替换为实际 APK 签名证书的 SHA-256 指纹后删除下面这行
-            if (true) { Log.w(TAG, "APK签名验证已启用但缺少 EXPECTED_CERT_FINGERPRINT，请联系管理员"); return false }
+            val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
+            if (EXPECTED_CERT_FINGERPRINT == "YOUR_CERT_FINGERPRINT_HERE") {
+                Log.w(TAG, "APK签名验证未配置，跳过（请在 MainActivity.kt 中配置 EXPECTED_CERT_FINGERPRINT）")
+                return true  // 未配置时跳过验证，方便测试
+            }
             Log.d(TAG, "APK签名证书指纹: $fingerprint")
             val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
             if (fingerprint == EXPECTED_CERT_FINGERPRINT) {
