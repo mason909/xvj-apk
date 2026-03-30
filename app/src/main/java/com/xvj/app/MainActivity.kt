@@ -1951,7 +1951,7 @@ class MainActivity : AppCompatActivity() {
         // 场景A/B：若没有窗口配置，自动创建默认全屏窗口1
         // 第一幕播文件夹01，第二幕也播文件夹01（文件夹由485信号切换）
         if (windowsArr.length() == 0) {
-            val sceneType = if (currentSceneId == "A") "VIDEO" else "SCENE_B"
+            val sceneType = if (currentSceneId == "A") "SCENE_A" else "SCENE_B"
             val defaultWin = JSONObject().apply {
                 put("id", DEFAULT_WINDOW_ID)
                 put("name", "窗口1")
@@ -1977,7 +1977,7 @@ class MainActivity : AppCompatActivity() {
             val inputIndex = content.optInt("inputIndex", 0)
 
             val folderId: String? = when (type) {
-                "VIDEO", "SCENE_B" -> {
+                "SCENE_A", "SCENE_B" -> {
                     // VIDEO=第一幕(文件夹01), SCENE_B=第二幕(文件夹01)
                     "01"
                 }
@@ -1990,7 +1990,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "" -> {
-                    // 兼容空类型：Scene A 播 01，Scene B 播 01
+                    // 兼容空类型：默认播 Scene A（文件夹01）
                     "01"
                 }
                 else -> null // HDMI/COLOR 等类型不播文件夹
@@ -2023,7 +2023,7 @@ class MainActivity : AppCompatActivity() {
         val height = w.optInt("height", 1080).coerceAtLeast(64)
 
         val content = w.optJSONObject("content") ?: JSONObject()
-        val type = content.optString("type", "VIDEO").uppercase()
+        val type = content.optString("type", "SCENE_A").uppercase()
 
         val view: View = when (type) {
             "COLOR" -> createColorView(w, content)
