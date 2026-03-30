@@ -2,6 +2,21 @@
  * XVJ 云控系统 - Android APP (MainActivity)
  * =========================================
  * 架构：Kotlin + AndroidX + ExoPlayer + MQTT
+ *
+ * 【代码索引】搜索 "【A-XX】" 快速定位
+ * ─────────────────────────────────────────────────
+ * 【A-01】生命周期 & 初始化（onCreate / onDestroy）
+ * 【A-02】MQTT 连接（connectMQTT / onMqttConnected）
+ * 【A-03】设备注册 & 授权（registerDevice / handleAuthResponse）
+ * 【A-04】MQTT 消息处理 & 分发（handleCommand → when(action)）
+ * 【A-05】视频播放（playFromUrl / playFromCloud / playLocalVideo）
+ * 【A-06】素材同步（syncRoomMaterials / syncFolderWithIds / deleteMaterialFile）
+ * 【A-07】窗口配置 & 渲染（applySceneConfigs / createWindowView / playFolderVideos）
+ * 【A-08】场景切换（switchScene）
+ * 【A-09】本地文件扫描（scanLocalVideos / loadVideosFromFolder）
+ * 【A-10】权限 & 系统 UI（checkStoragePermission / hideSystemUI）
+ * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint）
+ * ─────────────────────────────────────────────────
  * 
  * 核心流程：
  *   1. MQTT 连接（持久连接，复用于所有通信）
@@ -373,6 +388,8 @@ class MainActivity : AppCompatActivity() {
         mqttClientId = "xvj_device_$deviceId"
 
         Log.d(TAG, "Device ID: $deviceId")
+
+// 【A-02】 MQTT 连接初始化 // private fun connectMQTT()
         Log.d(TAG, "MQTT Server: $mqttServer")
         logToFile("DeviceID: $deviceId, MQTT: $mqttServer")
 
@@ -447,6 +464,8 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     Log.e(TAG, "MQTT Connection Error: ${e.message}")
                     logToFile("MQTT Connection Error: ${e.message}")
+
+// 【A-03】 设备注册 // private fun registerDevice()
                     onMqttReconnectFailed()  // P4 fix: 连接失败也触发退避
                     mqttHandler.post {
                         binding.statusText?.text = "连接失败: ${e.message}"
@@ -520,6 +539,8 @@ class MainActivity : AppCompatActivity() {
         }
         statusHandler.post(statusTimerRunnable!!)
     }
+
+// 【A-03b】 处理授权响应 // private fun handleAuthResponse()
 
     /**
      * 停止定时发送状态
@@ -661,6 +682,8 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "MQTT重连失败 #${mqttReconnectAttempts}，${mqttReconnectDelaySeconds}s 后重试")
     }
 
+
+// 【A-04】 MQTT 消息分发 // private fun handleCommand() → when(action)
     // 请求同步授权状态
     private fun requestAuthSync() {
         try {
@@ -828,6 +851,8 @@ class MainActivity : AppCompatActivity() {
                         // 用Handler在主线程显示Toast
                         mqttHandler.post {
                             try {
+
+// 【A-05】 视频播放 // private fun playFromUrl() | playLocalVideo() | downloadAndPlay()
                                 android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_LONG).show()
                             } catch(e: Exception) {}
                         }
@@ -956,6 +981,8 @@ class MainActivity : AppCompatActivity() {
                 Log.d(TAG, "Download complete: ${localFile.absolutePath}")
 
                 // 下载完成后播放
+
+// 【A-06】 预设素材同步 // private fun syncPresetFolders()
                 mqttHandler.post {
                     binding.statusText?.text = "下载完成，播放: $filename"
                 }
@@ -1010,6 +1037,8 @@ class MainActivity : AppCompatActivity() {
                 Log.d(TAG, "Preset folders saved: $folderList")
 
                 mqttHandler.post {
+
+// 【A-06b】 房间素材同步入口 // private fun syncRoomMaterialsAllScenes()
                     binding.statusText?.text = "预设素材同步完成"
                 }
             } catch (e: Exception) {
@@ -1022,6 +1051,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 同步房间素材到本地文件夹
+
+// 【A-06c】 房间素材同步核心 // private fun syncRoomMaterials()
 
     // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
     // 合并 Scene A + B 的 folder_mappings，一次同步，避免两次调用覆盖 prefs
@@ -1095,6 +1126,8 @@ class MainActivity : AppCompatActivity() {
                         try {
                             applySceneConfigs(org.json.JSONObject(scenesJson))
                         } catch (e: Exception) {
+
+// 【A-06d】 下载单个文件夹素材 // private fun syncFolderWithIds()
                             Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
                         }
                     }
@@ -1156,6 +1189,8 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+
+// 【A-06e】 删除本地素材文件 // private fun deleteMaterialFile()
             for (file in localFiles) {
                 if (!shouldExist.contains(file.name)) {
                     Log.d(TAG, "删除不在清单中的文件: " + file.name)
@@ -1182,6 +1217,8 @@ class MainActivity : AppCompatActivity() {
             if (file.exists()) {
                 // 清除 ETag/Last-Modified 缓存，避免删后重加时 APK 因 304 跳过下载
                 prefs.edit()
+
+// 【A-06f】 清空文件夹 // private fun deleteFolderFiles()
                     .remove(PREF_ETAG_PREFIX + filename)
                     .remove(PREF_LM_PREFIX + filename)
                     .apply()
@@ -1206,6 +1243,8 @@ class MainActivity : AppCompatActivity() {
             } ?: emptyList()
             for (file in files) {
                 Log.d(TAG, "清空文件夹" + folderId + "，删除: " + file.name)
+
+// A-07a】 扫描并播放本地视频 // private fun playFolderVideos()
                 logToFile("清空删除: " + file.name)
                 // 清除缓存的 ETag，避免删文件后重加时 APK 因 304 跳过下载
                 prefs.edit()
@@ -1901,6 +1940,8 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 logToFile("下载APK失败: ${e.message}")
                 mqttHandler.post {
+
+// 【A-07】 应用场景配置 // private fun applySceneConfigs()
                     try {
                         android.widget.Toast.makeText(this, "更新下载失败: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                     } catch(e: Exception) {}
@@ -2044,6 +2085,8 @@ class MainActivity : AppCompatActivity() {
 
     /** 纯色背景窗口 */
     private fun createColorView(w: JSONObject, content: JSONObject): View {
+
+// 【A-07b】 创建窗口视图 // private fun createWindowView()
         val color = content.optString("color", "#000000")
         val name = w.optString("name", "")
         return TextView(this).apply {
@@ -2078,6 +2121,8 @@ class MainActivity : AppCompatActivity() {
         }
         playerView.player = player
         windowPlayers[winId] = player
+
+// 【A-08】 场景切换 // fun switchScene()
         return playerView
     }
 
