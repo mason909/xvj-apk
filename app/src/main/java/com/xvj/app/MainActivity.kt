@@ -917,7 +917,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun playLocalVideo(folder: String, filename: String) {
         val videoFile = File(videoFolderPath, "$folder/$filename")
-        Log.d(TAG, "Playing local: ${videoFile.absolutePath}")
+        Log.d(TAG, "Playing local: ${videoFile.absolutePath}, exists=${videoFile.exists()}, size=${if(videoFile.exists()) videoFile.length() else 0}")
 
         if (!videoFile.exists()) {
             Log.w(TAG, "File not found: ${videoFile.absolutePath}, waiting for sync...")
@@ -928,16 +928,21 @@ class MainActivity : AppCompatActivity() {
         }
 
         mqttHandler.post {
-            releasePlayer()
-            player = ExoPlayer.Builder(this).build().apply {
-                binding.playerView.player = this
-                val mediaItem = MediaItem.fromUri(android.net.Uri.fromFile(videoFile))
-                setMediaItems(listOf(mediaItem))
-                repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
-                playWhenReady = true
-                prepare()
+            try {
+                releasePlayer()
+                player = ExoPlayer.Builder(this).build().apply {
+                    binding.playerView.player = this
+                    val mediaItem = MediaItem.fromUri(android.net.Uri.parse("file://${android.net.Uri.encode(videoFile.absolutePath, null)}"))
+                    setMediaItems(listOf(mediaItem))
+                    repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
+                    playWhenReady = true
+                    prepare()
+                }
+                binding.statusText?.text = "播放: $folder/$filename"
+            } catch (e: Exception) {
+                Log.e(TAG, "ExoPlayer init error: ${e.message}")
+                binding.statusText?.text = "播放器初始化失败: ${e.message}"
             }
-            binding.statusText?.text = "播放: $folder/$filename"
         }
     }
 
@@ -952,6 +957,7 @@ class MainActivity : AppCompatActivity() {
         val localFile = File(videoFolderPath, "$folder/$filename")
 
         Log.d(TAG, "Downloading: $serverUrl -> ${localFile.absolutePath}")
+                Log.d(TAG, "videoFolderPath=$videoFolderPath, exists=${File(videoFolderPath).exists()}")
         mqttHandler.post {
             binding.statusText?.text = "正在下载素材..."
         }
@@ -978,20 +984,25 @@ class MainActivity : AppCompatActivity() {
                 output.close()
                 input.close()
 
-                Log.d(TAG, "Download complete: ${localFile.absolutePath}")
+                Log.d(TAG, "Download complete: ${localFile.absolutePath} (${localFile.length()} bytes)")
 
-                // 下载完成后播放
-
-// 【A-06】 预设素材同步 // private fun syncPresetFolders()
-                mqttHandler.post {
-                    binding.statusText?.text = "下载完成，播放: $filename"
+                // 下载完成后播放（完整 try-catch 确保异常不漏出）
+                try {
+                    mqttHandler.post {
+                        binding.statusText?.text = "下载完成，播放: $filename"
+                    }
+                    playLocalVideo(folder, filename)
+                } catch (e: Exception) {
+                    Log.e(TAG, "playLocalVideo exception: ${e.message}")
+                    mqttHandler.post {
+                        binding.statusText?.text = "播放失败: ${e.message}"
+                    }
                 }
-                playLocalVideo(folder, filename)
 
             } catch (e: Exception) {
                 Log.e(TAG, "Download error: ${e.message}")
                 mqttHandler.post {
-                    binding.statusText?.text = "素材下载失败"
+                    binding.statusText?.text = "素材下载失败: ${e.message}"
                 }
             }
         }
