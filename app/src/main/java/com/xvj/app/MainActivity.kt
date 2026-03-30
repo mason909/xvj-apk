@@ -792,6 +792,17 @@ class MainActivity : AppCompatActivity() {
                         logToFile("folderMappings 为 null，跳过素材同步")
                     }
                 }
+                "delete_material" -> {
+                    // 收到删除本地素材命令（前端删除素材时后端通过MQTT下发）
+                    val materialId = cmd.optString("material_id", "")
+                    val folder = cmd.optString("folder", "01")
+                    val filename = cmd.optString("filename", "")
+                    if (materialId.isNotEmpty() && filename.isNotEmpty()) {
+                        logToFile("delete_material: id=$materialId, folder=$folder, file=$filename")
+                        deleteMaterialFile(folder, filename, materialId)
+                    }
+                }
+
                 "update" -> {
                     // 收到OTA更新推送
                     Log.w(TAG, "收到update命令!")
@@ -1156,6 +1167,33 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "syncFolderWithIds " + folderId + " 失败: " + e.message)
             logToFile("同步文件夹" + folderId + " 失败: " + e.message)
+        }
+    }
+
+    // 删除指定文件夹下的指定素材文件
+    private fun deleteMaterialFile(folderId: String, filename: String, materialId: String) {
+        try {
+            val localFolder = File(videoFolderPath, folderId)
+            if (!localFolder.exists()) {
+                Log.d(TAG, "deleteMaterialFile: folder $folderId not exist")
+                return
+            }
+            val file = File(localFolder, filename)
+            if (file.exists()) {
+                // 清除 ETag/Last-Modified 缓存，避免删后重加时 APK 因 304 跳过下载
+                prefs.edit()
+                    .remove(PREF_ETAG_PREFIX + filename)
+                    .remove(PREF_LM_PREFIX + filename)
+                    .apply()
+                val deleted = file.delete()
+                Log.d(TAG, "deleteMaterialFile deleted=$deleted folder=$folderId file=$filename")
+                logToFile("删除素材文件: folder=$folderId file=$filename deleted=$deleted")
+            } else {
+                Log.d(TAG, "deleteMaterialFile: file not found folder=$folderId file=$filename")
+                logToFile("删除素材文件失败（文件不存在）: folder=$folderId file=$filename")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "deleteMaterialFile 失败: " + e.message)
         }
     }
 
