@@ -1948,8 +1948,9 @@ class MainActivity : AppCompatActivity() {
             createWindowView(winId, w)
         }
 
-        // 场景A：若没有窗口配置，自动创建默认全屏窗口1播放文件夹01
-        if (currentSceneId == "A" && windowsArr.length() == 0) {
+        // 场景A/B：若没有窗口配置，自动创建默认全屏窗口1播放对应场景的文件夹
+        if (windowsArr.length() == 0) {
+            val defaultFolder = if (currentSceneId == "A") DEFAULT_FOLDER else "02"
             val defaultWin = JSONObject().apply {
                 put("id", DEFAULT_WINDOW_ID)
                 put("name", "窗口1")
@@ -1959,18 +1960,45 @@ class MainActivity : AppCompatActivity() {
                 put("height", 1080)
                 put("zIndex", 1)
                 put("content", JSONObject().apply {
-                    put("type", "VIDEO")
-                    put("folderId", DEFAULT_FOLDER)
+                    put("type", "FOLDER")
+                    put("folderId", defaultFolder)
                 })
             }
             createWindowView(DEFAULT_WINDOW_ID, defaultWin)
-            Log.d(TAG, "场景A无窗口配置，自动创建默认全屏窗口1 -> 文件夹 $DEFAULT_FOLDER")
+            Log.d(TAG, "场景${currentSceneId}无窗口配置，自动创建默认全屏窗口1 -> 文件夹 $defaultFolder")
         }
 
-        // 场景A：窗口1默认播放文件夹01
-        if (currentSceneId == "A" && windowPlayers.containsKey(DEFAULT_WINDOW_ID)) {
-            val folderPath = videoFolderPath.ifEmpty { filesDir.absolutePath }
-            playFolderInWindow(DEFAULT_WINDOW_ID, DEFAULT_FOLDER, folderPath)
+        // 每个窗口：根据 content 类型播放对应文件夹（支持 Scene A/B）
+        windowPlayers.forEach { (winId, player) ->
+            // 找到对应窗口的 content 配置
+            val winObj = (0 until windowsArr.length()).map { windowsArr.getJSONObject(it) }.find { it.optString("id") == winId }
+            val content = winObj?.optJSONObject("content") ?: JSONObject()
+            val type = content.optString("type", "").uppercase()
+            val inputIndex = content.optInt("inputIndex", 0)
+
+            val folderId: String? = when (type) {
+                "FOLDER" -> {
+                    // 文件夹类型：直接用 window content 指定的 folderId
+                    content.optString("folderId", if (currentSceneId == "A") DEFAULT_FOLDER else "02")
+                }
+                "VIDEO_INPUT" -> {
+                    // 输入源类型：inputIndex 映射到场景（0=第一幕SceneA=文件夹01, 1=第二幕SceneB=文件夹02）
+                    when (inputIndex) {
+                        0 -> "01"  // 第一幕
+                        1 -> "02"  // 第二幕
+                        else -> "01"
+                    }
+                }
+                "VIDEO", "" -> {
+                    // 兼容旧 VIDEO/空类型：Scene A 播 01，Scene B 播 02
+                    if (currentSceneId == "A") DEFAULT_FOLDER else "02"
+                }
+                else -> null // HDMI/COLOR 等类型不播文件夹
+            }
+            if (folderId != null && player != null) {
+                val folderPath = videoFolderPath.ifEmpty { filesDir.absolutePath }
+                playFolderInWindow(winId, folderId, folderPath)
+            }
         }
     }
 
