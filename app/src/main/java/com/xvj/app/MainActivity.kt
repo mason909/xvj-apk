@@ -2002,8 +2002,11 @@ class MainActivity : AppCompatActivity() {
 
         // 场景A/B：若没有窗口配置，自动创建默认全屏窗口1
         // 第一幕播文件夹01，第二幕也播文件夹01（文件夹由485信号切换）
+        var autoCreatedDefaultContent: JSONObject? = null
         if (windowsArr.length() == 0) {
             val sceneType = if (currentSceneId == "A") "SCENE_A" else "SCENE_B"
+            val defaultContent = JSONObject().apply { put("type", sceneType) }
+            autoCreatedDefaultContent = defaultContent
             val defaultWin = JSONObject().apply {
                 put("id", DEFAULT_WINDOW_ID)
                 put("name", "窗口1")
@@ -2012,9 +2015,7 @@ class MainActivity : AppCompatActivity() {
                 put("width", 1920)
                 put("height", 1080)
                 put("zIndex", 1)
-                put("content", JSONObject().apply {
-                    put("type", sceneType)
-                })
+                put("content", defaultContent)
             }
             createWindowView(DEFAULT_WINDOW_ID, defaultWin)
             Log.d(TAG, "场景${currentSceneId}无窗口配置，自动创建默认全屏窗口1 -> type=$sceneType")
@@ -2023,15 +2024,21 @@ class MainActivity : AppCompatActivity() {
         // 每个窗口：根据 content 类型播放对应文件夹（支持 Scene A/B）
         windowPlayers.forEach { (winId, player) ->
             // 找到对应窗口的 content 配置
+            // 【Bug Fix】auto-created 默认窗口不在 windowsArr 里 → 用 autoCreatedDefaultContent 兜底
             val winObj = (0 until windowsArr.length()).map { windowsArr.getJSONObject(it) }.find { it.optString("id") == winId }
-            val content = winObj?.optJSONObject("content") ?: JSONObject()
+            val content = winObj?.optJSONObject("content") ?: autoCreatedDefaultContent ?: JSONObject()
             val type = content.optString("type", "").uppercase()
             val inputIndex = content.optInt("inputIndex", 0)
 
             val folderId: String? = when (type) {
                 "SCENE_A", "SCENE_B" -> {
-                    // VIDEO=第一幕(文件夹01), SCENE_B=第二幕(文件夹01)
-                    "01"
+                    // 【Bug Fix】SCENE_A/B 硬编码文件夹"01"改为读取 scenes 中该 scene 的第一个有效文件夹
+                    // 初始播放使用 scenes 中配置的第一个文件夹，后续 RS485 信号切换时 playFolderInWindow 会更新
+                    val sceneData = scenes.optJSONObject(currentSceneId)
+                    val mappings = sceneData?.optJSONObject("folder_mappings") ?: JSONObject()
+                    val firstFolder = mappings.keys()?.nextElement() ?: "01"
+                    Log.d(TAG, "SCENE_${currentSceneId} 初始播放文件夹: $firstFolder")
+                    firstFolder
                 }
                 "VIDEO_INPUT", "HDMI" -> {
                     // HDMI输入类型：inputIndex 映射场景（0=第一幕, 1=第二幕）
