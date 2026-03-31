@@ -30,9 +30,14 @@ jobs:
       env:
         GRADLE_OPTS: "-Xmx2048m -Dorg.gradle.daemon=false"
       run: |
+        set -o pipefail
         chmod +x gradlew
-        ./gradlew clean assembleDebug --no-daemon --no-build-cache --stacktrace 2>&1 | tail -50
-        # 即使失败也保留输出
+        ./gradlew clean assembleDebug --no-daemon 2>&1 | tee /tmp/gradle_output.txt | tail -30
+        if [ $? -ne 0 ]; then
+          echo "GRADLE BUILD FAILED, output tail:"
+          tail -80 /tmp/gradle_output.txt
+          exit 1
+        fi
 
     - name: Check APK exists
       id: check-apk
