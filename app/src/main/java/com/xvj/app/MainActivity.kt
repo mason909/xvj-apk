@@ -2047,7 +2047,7 @@ class MainActivity : AppCompatActivity() {
                     // 初始播放使用 scenes 中配置的第一个文件夹，后续 RS485 信号切换时 playFolderInWindow 会更新
                     val sceneData = scenes.optJSONObject(currentSceneId)
                     val mappings = sceneData?.optJSONObject("folder_mappings") ?: JSONObject()
-                    val firstFolder = mappings.keys()?.nextElement() ?: "01"
+                    val firstFolder = mappings.keys().asSequence().firstOrNull() ?: "01"
                     Log.d(TAG, "SCENE_${currentSceneId} 初始播放文件夹: $firstFolder")
                     firstFolder
                 }
