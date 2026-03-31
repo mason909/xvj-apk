@@ -27,9 +27,12 @@ jobs:
 
     - name: Build with Gradle
       id: gradle-build
+      env:
+        GRADLE_OPTS: "-Xmx2048m -Dorg.gradle.daemon=false"
       run: |
         chmod +x gradlew
-        ./gradlew clean assembleDebug --no-daemon --stacktrace || exit 1
+        ./gradlew clean assembleDebug --no-daemon --no-build-cache --stacktrace 2>&1 | tail -50
+        # 即使失败也保留输出
 
     - name: Check APK exists
       id: check-apk
