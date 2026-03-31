@@ -583,6 +583,17 @@ class MainActivity : AppCompatActivity() {
                             if (scenes != null) {
                                 prefs.edit().putString("scenes_json", scenes.toString()).apply()
                                 Log.d(TAG, "授权成功，已保存 scenes: ${scenes.names()}")
+                                // 【Bug Fix】收到授权响应后，提取 uuid 并更新 MQTT 订阅主题
+                                // 避免服务器授权后改发 uuid 主题，但 APP 仍收听 fingerprint 主题
+                                val newDeviceId = resp.optString("device_id", "")
+                                if (newDeviceId.isNotEmpty() && newDeviceId != deviceId) {
+                                    deviceId = newDeviceId
+                                    prefs.edit().putString("device_id", deviceId).apply()
+                                    mqttClientId = "xvj_device_$deviceId"
+                                    val newCommandTopic = "xvj/device/$deviceId/command"
+                                    mqttClient?.subscribe(newCommandTopic, 0)
+                                    Log.d(TAG, "授权后更新订阅: $newCommandTopic")
+                                }
                             }
                             // 保存 folder_mappings 并合并 A+B 一次同步
                             if (folderMappings != null) {
