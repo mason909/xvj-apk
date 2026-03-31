@@ -30,11 +30,12 @@ jobs:
       env:
         GRADLE_OPTS: "-Xmx2048m -Dorg.gradle.daemon=false"
       run: |
-        set -o pipefail
         chmod +x gradlew
-        ./gradlew clean assembleDebug --no-daemon 2>&1 | tee /tmp/gradle_output.txt | tail -30
-        if [ $? -ne 0 ]; then
-          echo "GRADLE BUILD FAILED, output tail:"
+        ./gradlew clean assembleDebug --no-daemon 2>&1 | tee /tmp/gradle_output.txt
+        GRADLE_EXIT=${PIPESTATUS[0]}
+        echo "Gradle exit code: $GRADLE_EXIT"
+        if [ $GRADLE_EXIT -ne 0 ]; then
+          echo "GRADLE BUILD FAILED:"
           tail -80 /tmp/gradle_output.txt
           exit 1
         fi
