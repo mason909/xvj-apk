@@ -583,8 +583,7 @@ class MainActivity : AppCompatActivity() {
                             if (scenes != null) {
                                 prefs.edit().putString("scenes_json", scenes.toString()).apply()
                                 Log.d(TAG, "授权成功，已保存 scenes: ${scenes.names()}")
-                                // 【Bug Fix】收到授权响应后，提取 uuid 并更新 MQTT 订阅主题
-                                // 避免服务器授权后改发 uuid 主题，但 APP 仍收听 fingerprint 主题
+                                // 服务器授权后可能分配新的 uuid，切换 MQTT 订阅到新 topic
                                 val newDeviceId = resp.optString("device_id", "")
                                 if (newDeviceId.isNotEmpty() && newDeviceId != deviceId) {
                                     deviceId = newDeviceId
@@ -1993,7 +1992,7 @@ class MainActivity : AppCompatActivity() {
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
 
-        // 【修复】收集所有场景的窗口，合并后统一处理
+        // 收集所有场景的窗口，A 和 B 的 windows 合并后统一处理
         // currentSceneId（外部信号状态）仅决定初始文件夹，后续 RS485 切换时各窗口自行更新
         val allWindows = JSONArray()
         scenes.keys().forEach { sceneKey ->
@@ -2036,7 +2035,7 @@ class MainActivity : AppCompatActivity() {
 
             val folderId: String? = when (type) {
                 "SCENE_A", "SCENE_B" -> {
-                    // 【关键修复】用窗口的 content.type（SCENE_A/SCENE_B）直接映射场景 key
+                    // 用窗口的 content.type（SCENE_A/SCENE_B）直接映射到对应场景的 folder_mappings
                     // scene-prefixed folderId：A01/B01 格式，物理隔离不同场景的文件夹
                     val sceneKey = type.removePrefix("SCENE_")  // "SCENE_A" → "A"
                     val sceneData = scenes.optJSONObject(sceneKey)
