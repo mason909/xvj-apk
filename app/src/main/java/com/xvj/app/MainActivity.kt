@@ -2050,9 +2050,7 @@ class MainActivity : AppCompatActivity() {
                         null
                     } else {
                         val (folderId, _) = folderEntries.first()
-                        // 解析到物理文件夹（scene-prefixed：01 → sceneA/01/，B01 → sceneB/B01/）
-                        val physicalFolder = resolvePhysicalFolder(sceneKey, folderId, videoFolderPath.ifEmpty { filesDir.absolutePath })
-                        Log.d(TAG, "窗口 $winId [${type}] -> 场景 $sceneKey 物理文件夹 ${physicalFolder.absolutePath}")
+                        Log.d(TAG, "窗口 $winId [${type}] -> 场景 $sceneKey 文件夹 $folderId (由 playFolderInWindow 解析到物理路径)")
                         folderId
                     }
                 }
@@ -2187,23 +2185,6 @@ class MainActivity : AppCompatActivity() {
         player.setMediaItems(items)
         player.prepare()
         Log.d(TAG, "窗口 $winId 开始播放 $folderId -> ${physicalFolder.absolutePath} (${videos.size}个视频)")
-    }
-        if (!folder.exists()) {
-            Log.w(TAG, "playFolderInWindow: 文件夹不存在 $folder")
-            return
-        }
-        val videos = folder.listFiles()
-            ?.filter { it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm") }
-            ?.sortedBy { it.name } ?: return
-        if (videos.isEmpty()) {
-            Log.w(TAG, "playFolderInWindow: 文件夹 $folderId 内无视频")
-            return
-        }
-
-        val items = videos.map { MediaItem.fromUri(Uri.fromFile(it)) }
-        player.setMediaItems(items)
-        player.prepare()
-        Log.d(TAG, "窗口 $winId 开始播放文件夹 $folderId (${videos.size}个视频)")
     }
 
     /** 停止指定窗口的播放 */
