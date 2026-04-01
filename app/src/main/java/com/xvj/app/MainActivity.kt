@@ -1985,14 +1985,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val sceneObj = scenes.optJSONObject(currentSceneId)
-        if (sceneObj == null) {
-            Log.w(TAG, "applySceneConfigs: 场景 $currentSceneId 不存在")
-            return
-        }
-
-        val windowsArr = sceneObj.optJSONArray("windows") ?: JSONArray()
-
         // 释放旧的窗口播放器
         windowPlayers.values.forEach { it.release() }
         windowPlayers.clear()
@@ -2001,23 +1993,18 @@ class MainActivity : AppCompatActivity() {
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
 
-        Log.d(TAG, "applySceneConfigs: 场景 $currentSceneId, ${windowsArr.length()} 个窗口")
-
-        // 按 zIndex 升序创建窗口
-        val sorted = sortWindowsByZ(windowsArr)
-        for (i in 0 until sorted.length()) {
-            val w = sorted.getJSONObject(i)
-            val winId = w.optString("id", "win_$i")
-            createWindowView(winId, w)
+        // 【修复】收集所有场景的窗口，合并后统一处理
+        // currentSceneId（外部信号状态）仅决定初始文件夹，后续 RS485 切换时各窗口自行更新
+        val allWindows = JSONArray()
+        scenes.keys().forEach { sceneKey ->
+            scenes.optJSONObject(sceneKey)?.optJSONArray("windows")?.let { arr ->
+                for (i in 0 until arr.length()) { allWindows.put(arr.getJSONObject(i)) }
+            }
         }
 
-        // 场景A/B：若没有窗口配置，自动创建默认全屏窗口1
-        // 第一幕播文件夹01，第二幕也播文件夹01（文件夹由485信号切换）
-        var autoCreatedDefaultContent: JSONObject? = null
-        if (windowsArr.length() == 0) {
-            val sceneType = if (currentSceneId == "A") "SCENE_A" else "SCENE_B"
-            val defaultContent = JSONObject().apply { put("type", sceneType) }
-            autoCreatedDefaultContent = defaultContent
+        // 若所有场景均无窗口，为 Scene A 创建默认全屏窗口
+        if (allWindows.length() == 0) {
+            val defaultContent = JSONObject().apply { put("type", "SCENE_A") }
             val defaultWin = JSONObject().apply {
                 put("id", DEFAULT_WINDOW_ID)
                 put("name", "窗口1")
@@ -2029,42 +2016,37 @@ class MainActivity : AppCompatActivity() {
                 put("content", defaultContent)
             }
             createWindowView(DEFAULT_WINDOW_ID, defaultWin)
-            Log.d(TAG, "场景${currentSceneId}无窗口配置，自动创建默认全屏窗口1 -> type=$sceneType")
+            Log.d(TAG, "所有场景无窗口，自动创建默认全屏窗口1 -> SCENE_A")
+        } else {
+            // 按 zIndex 升序创建所有窗口（A 和 B 的窗口都加载）
+            val sorted = sortWindowsByZ(allWindows)
+            for (i in 0 until sorted.length()) {
+                val w = sorted.getJSONObject(i)
+                val winId = w.optString("id", "win_$i")
+                createWindowView(winId, w)
+            }
         }
 
-        // 每个窗口：根据 content 类型播放对应文件夹（支持 Scene A/B）
+        // 每个窗口根据自身 content.type 播放对应文件夹，与 currentSceneId 完全解耦
         windowPlayers.forEach { (winId, player) ->
-            // 找到对应窗口的 content 配置
-            // 【Bug Fix】auto-created 默认窗口不在 windowsArr 里 → 用 autoCreatedDefaultContent 兜底
-            val winObj = (0 until windowsArr.length()).map { windowsArr.getJSONObject(it) }.find { it.optString("id") == winId }
-            val content = winObj?.optJSONObject("content") ?: autoCreatedDefaultContent ?: JSONObject()
+            // 找到对应窗口的 content 配置（遍历 allWindows 查找）
+            val winObj = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }.find { it.optString("id") == winId }
+            val content = winObj?.optJSONObject("content") ?: JSONObject()
             val type = content.optString("type", "").uppercase()
-            val inputIndex = content.optInt("inputIndex", 0)
 
             val folderId: String? = when (type) {
                 "SCENE_A", "SCENE_B" -> {
-                    // 修复：用窗口的 content.type（SCENE_A/SCENE_B）直接映射到对应场景 key（"A"/"B"）
+                    // 【关键修复】用窗口的 content.type（SCENE_A/SCENE_B）直接映射场景 key
                     // 与 currentSceneId（外部信号状态）完全解耦
-                    val sceneKey = type.removePrefix("SCENE_")
+                    val sceneKey = type.removePrefix("SCENE_")  // "SCENE_A" → "A"
                     val sceneData = scenes.optJSONObject(sceneKey)
                     val mappings = sceneData?.optJSONObject("folder_mappings") ?: JSONObject()
                     val firstFolder = mappings.keys().asSequence().firstOrNull() ?: "01"
-                    Log.d(TAG, "${type} 窗口播放文件夹: $firstFolder (场景=${sceneKey})")
+                    Log.d(TAG, "窗口 $winId [${type}] -> 播放场景 $sceneKey 文件夹 $firstFolder")
                     firstFolder
                 }
-                "VIDEO_INPUT", "HDMI" -> {
-                    // HDMI输入类型：inputIndex 映射场景（0=第一幕, 1=第二幕）
-                    when (inputIndex) {
-                        0 -> "01"  // 第一幕
-                        1 -> "01"  // 第二幕（也播文件夹01）
-                        else -> "01"
-                    }
-                }
-                "" -> {
-                    // 兼容空类型：默认播 Scene A（文件夹01）
-                    "01"
-                }
-                else -> null // HDMI/COLOR 等类型不播文件夹
+                "HDMI", "VIDEO_INPUT" -> "01"  // HDMI 输入默认文件夹01
+                else -> null
             }
             if (folderId != null && player != null) {
                 val folderPath = videoFolderPath.ifEmpty { filesDir.absolutePath }
