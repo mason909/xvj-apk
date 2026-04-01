@@ -2043,12 +2043,13 @@ class MainActivity : AppCompatActivity() {
 
             val folderId: String? = when (type) {
                 "SCENE_A", "SCENE_B" -> {
-                    // 【Bug Fix】SCENE_A/B 硬编码文件夹"01"改为读取 scenes 中该 scene 的第一个有效文件夹
-                    // 初始播放使用 scenes 中配置的第一个文件夹，后续 RS485 信号切换时 playFolderInWindow 会更新
-                    val sceneData = scenes.optJSONObject(currentSceneId)
+                    // 修复：用窗口的 content.type（SCENE_A/SCENE_B）直接映射到对应场景 key（"A"/"B"）
+                    // 与 currentSceneId（外部信号状态）完全解耦
+                    val sceneKey = type.removePrefix("SCENE_")
+                    val sceneData = scenes.optJSONObject(sceneKey)
                     val mappings = sceneData?.optJSONObject("folder_mappings") ?: JSONObject()
                     val firstFolder = mappings.keys().asSequence().firstOrNull() ?: "01"
-                    Log.d(TAG, "SCENE_${currentSceneId} 初始播放文件夹: $firstFolder")
+                    Log.d(TAG, "${type} 窗口播放文件夹: $firstFolder (场景=${sceneKey})")
                     firstFolder
                 }
                 "VIDEO_INPUT", "HDMI" -> {
