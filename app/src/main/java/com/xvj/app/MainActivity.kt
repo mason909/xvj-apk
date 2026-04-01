@@ -2037,13 +2037,24 @@ class MainActivity : AppCompatActivity() {
             val folderId: String? = when (type) {
                 "SCENE_A", "SCENE_B" -> {
                     // 【关键修复】用窗口的 content.type（SCENE_A/SCENE_B）直接映射场景 key
-                    // 与 currentSceneId（外部信号状态）完全解耦
+                    // scene-prefixed folderId：A01/B01 格式，物理隔离不同场景的文件夹
                     val sceneKey = type.removePrefix("SCENE_")  // "SCENE_A" → "A"
                     val sceneData = scenes.optJSONObject(sceneKey)
                     val mappings = sceneData?.optJSONObject("folder_mappings") ?: JSONObject()
-                    val firstFolder = mappings.keys().asSequence().firstOrNull() ?: "01"
-                    Log.d(TAG, "窗口 $winId [${type}] -> 播放场景 $sceneKey 文件夹 $firstFolder")
-                    firstFolder
+                    val folderEntries = mappings.keys().asSequence()
+                        .map { folderId -> folderId to (mappings.get(folderId) as? org.json.JSONArray ?: org.json.JSONArray()) }
+                        .filter { (_, ids) -> ids.length() > 0 }  // 跳过空数组（无素材的文件夹）
+                        .toList()
+                    if (folderEntries.isEmpty()) {
+                        Log.d(TAG, "窗口 $winId [${type}] 场景 $sceneKey 无素材，跳过播放")
+                        null
+                    } else {
+                        val (folderId, _) = folderEntries.first()
+                        // 解析到物理文件夹（scene-prefixed：01 → sceneA/01/，B01 → sceneB/B01/）
+                        val physicalFolder = resolvePhysicalFolder(sceneKey, folderId, videoFolderPath.ifEmpty { filesDir.absolutePath })
+                        Log.d(TAG, "窗口 $winId [${type}] -> 场景 $sceneKey 物理文件夹 ${physicalFolder.absolutePath}")
+                        folderId
+                    }
                 }
                 "HDMI", "VIDEO_INPUT" -> "01"  // HDMI 输入默认文件夹01
                 else -> null
@@ -2144,12 +2155,39 @@ class MainActivity : AppCompatActivity() {
      * @param folderId   文件夹 ID（如 "01"）
      * @param folderPath 设备上文件夹的绝对路径
      */
+
     private fun playFolderInWindow(winId: String, folderId: String, folderPath: String) {
         val player = windowPlayers[winId] ?: run {
             Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
             return
         }
-        val folder = java.io.File(folderPath, folderId)
+        // scene-prefixed folderId：A01 → sceneA/01/, B01 → sceneB/B01/, 01 → 01/(root)
+        val scenePrefix = when {
+            folderId.startsWith("A") -> "A"
+            folderId.startsWith("B") -> "B"
+            else -> null
+        }
+        val physicalFolder = if (scenePrefix != null) {
+            java.io.File(folderPath, "scene" + scenePrefix + "/" + folderId.removePrefix(scenePrefix))
+        } else {
+            java.io.File(folderPath, folderId)
+        }
+        if (!physicalFolder.exists()) {
+            Log.w(TAG, "playFolderInWindow: 物理文件夹不存在 $physicalFolder")
+            return
+        }
+        val videos = physicalFolder.listFiles()
+            ?.filter { it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm") }
+            ?.sortedBy { it.name } ?: return
+        if (videos.isEmpty()) {
+            Log.w(TAG, "playFolderInWindow: 物理文件夹 $physicalFolder 内无视频")
+            return
+        }
+        val items = videos.map { MediaItem.fromUri(Uri.fromFile(it)) }
+        player.setMediaItems(items)
+        player.prepare()
+        Log.d(TAG, "窗口 $winId 开始播放 $folderId -> ${physicalFolder.absolutePath} (${videos.size}个视频)")
+    }
         if (!folder.exists()) {
             Log.w(TAG, "playFolderInWindow: 文件夹不存在 $folder")
             return
