@@ -2207,22 +2207,24 @@ class MainActivity : AppCompatActivity() {
             Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
             return
         }
-        // scene-prefixed folderId：A01 → sceneA/01/, B01 → sceneB/B01/, 01 → 01/(root)
-        val scenePrefix = when {
-            folderId.startsWith("A") -> "A"
-            folderId.startsWith("B") -> "B"
+        // scene-prefixed folderId：A01 → scenea/01/, B01 → sceneb/01/, 01 → 01/(root)
+        // 注意：scenePrefix 只取首字母小写，与 syncFolderWithIds 保持一致
+        val scenePrefixRaw = when {
+            folderId.startsWith("A") || folderId.startsWith("a") -> "a"
+            folderId.startsWith("B") || folderId.startsWith("b") -> "b"
             else -> null
         }
-        val physicalFolder = if (scenePrefix != null) {
-            java.io.File(folderPath, "scene" + scenePrefix + "/" + folderId.removePrefix(scenePrefix))
+        val pureFolderId = if (scenePrefixRaw != null) folderId.removePrefix(scenePrefixRaw.uppercase()).removePrefix(scenePrefixRaw) else folderId
+        val physicalDir = if (scenePrefixRaw != null) {
+            java.io.File(folderPath, "scene" + scenePrefixRaw + "/" + pureFolderId)
         } else {
-            java.io.File(folderPath, folderId)
+            java.io.File(folderPath, pureFolderId)
         }
-        if (!physicalFolder.exists()) {
-            Log.w(TAG, "playFolderInWindow: 物理文件夹不存在 $physicalFolder")
+        if (!physicalDir.exists()) {
+            Log.w(TAG, "playFolderInWindow: 物理文件夹不存在 $physicalDir")
             return
         }
-        val videos = physicalFolder.listFiles()
+        val videos = physicalDir.listFiles()
             ?.filter { it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm") }
             ?.sortedBy { it.name } ?: return
         if (videos.isEmpty()) {
@@ -2232,7 +2234,7 @@ class MainActivity : AppCompatActivity() {
         val items = videos.map { MediaItem.fromUri(Uri.fromFile(it)) }
         player.setMediaItems(items)
         player.prepare()
-        Log.d(TAG, "窗口 $winId 开始播放 $folderId -> ${physicalFolder.absolutePath} (${videos.size}个视频)")
+        Log.d(TAG, "窗口 $winId 开始播放 $folderId -> ${physicalDir.absolutePath} (${videos.size}个视频)")
     }
 
     /** 停止指定窗口的播放 */
