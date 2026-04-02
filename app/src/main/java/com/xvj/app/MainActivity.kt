@@ -778,8 +778,11 @@ class MainActivity : AppCompatActivity() {
                 "sync" -> {
                     val roomId = prefs.getString("room_id", "") ?: ""
                     val mappingsStr = prefs.getString("room_folder_mappings", "{}") ?: "{}"
+                    val scenesStr = prefs.getString("scenes_json", null)
                     if (roomId.isNotEmpty()) {
-                        syncRoomMaterials(roomId, org.json.JSONObject(mappingsStr))
+                        val scenes = scenesStr?.let { try { org.json.JSONObject(it) } catch(e: Exception) { null } }
+                        val folderMappingsA = org.json.JSONObject(mappingsStr)
+                        syncRoomMaterialsAllScenes(roomId, folderMappingsA, scenes)
                     }
                 }
                 "preset_sync" -> {
@@ -1099,6 +1102,7 @@ class MainActivity : AppCompatActivity() {
     // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
     // 分别同步 Scene A 和 B，不合并（避免 B 的 numeric key 覆盖 A）
     private fun syncRoomMaterialsAllScenes(roomId: String, folderMappingsA: org.json.JSONObject, scenes: org.json.JSONObject?) {
+        scenesJsonCache = scenes  // 缓存供 syncRoomMaterials 写入 prefs
         // 先同步 Scene A（HTTP API 返回 "A01"、"A02"...）
         syncRoomMaterials(roomId, folderMappingsA, "A")
         // 再同步 Scene B（HTTP API 返回 "B01"、"B02"...）
@@ -1108,6 +1112,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     // scenePrefix: "A" 或 "B"，用于拼接 HTTP API 返回的 scene-prefixed folder key（如 "A01"）
+    // scenesJsonCache: 缓存 scenes JSON，供 syncRoomMaterials 写入 SharedPreferences（MQTT sync 命令需要）
+    private var scenesJsonCache: org.json.JSONObject? = null
+
     private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject, scenePrefix: String) {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
@@ -1118,6 +1125,7 @@ class MainActivity : AppCompatActivity() {
                 prefs.edit()
                     .putString("current_room_id", roomId)
                     .putString("room_folder_mappings", folderMappings.toString())
+                    .putString("scenes_json", scenesJsonCache?.toString() ?: "")
                     .apply()
 
                 // 一次性获取该房间所有素材（合并 materials + preset_materials）
