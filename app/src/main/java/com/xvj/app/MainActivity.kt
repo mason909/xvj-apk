@@ -2228,7 +2228,7 @@ class MainActivity : AppCompatActivity() {
             ?.filter { it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm") }
             ?.sortedBy { it.name } ?: return
         if (videos.isEmpty()) {
-            Log.w(TAG, "playFolderInWindow: 物理文件夹 $physicalFolder 内无视频")
+            Log.w(TAG, "playFolderInWindow: 物理文件夹 $physicalDir 内无视频")
             return
         }
         val items = videos.map { MediaItem.fromUri(Uri.fromFile(it)) }
