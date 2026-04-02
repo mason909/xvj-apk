@@ -725,26 +725,38 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "play_local" -> {
-                    // P1 fix: 路径遍历防护 — 严格校验 folder + filename
-                    val folder = cmd.optString("folder", "01")
+                    // FIX: properly handle scene-prefixed folder IDs (A01, B02...)
+                    val rawFolder = cmd.optString("folder", "01").trim()
                     val filename = cmd.optString("filename", "")
                     if (filename.isNotEmpty() && isValidFilepath(filename)) {
-                        val safeFolder = folder.trim().take(2).replace(Regex("[^0-9]"), "01")
-                        playLocalVideo(safeFolder, filename.trim())
+                        val scenePrefix = if (rawFolder.length == 3 && rawFolder[0].isLetter()) {
+                            rawFolder[0].uppercaseChar().toString()
+                        } else { "A" }
+                        val folderNum = if (rawFolder.length == 3 && rawFolder[0].isLetter()) {
+                            rawFolder.substring(1)
+                        } else { rawFolder }
+                        val safeFolder = if (folderNum.matches(Regex("[0-9]{2}"))) folderNum else "01"
+                        playLocalVideo(scenePrefix + safeFolder, filename.trim())
                     } else {
-                        Log.w(TAG, "play_local 拒绝非法参数: folder=$folder, filename=$filename")
+                        Log.w(TAG, "play_local 拒绝非法参数: folder=$rawFolder, filename=$filename")
                     }
                 }
                 "push_file" -> {
-                    // P1 fix: 路径遍历防护 — 严格校验 folder + filename
-                    val folder = cmd.optString("folder", "01")
+                    // FIX: properly handle scene-prefixed folder IDs (A01, B02...)
+                    val rawFolder = cmd.optString("folder", "01").trim()
                     val filename = cmd.optString("filename", "")
                     val url = cmd.optString("url", "")
                     if (filename.isNotEmpty() && isValidFilepath(filename) && url.isNotEmpty()) {
-                        val safeFolder = folder.trim().take(2).replace(Regex("[^0-9]"), "01")
-                        downloadAndPlay(safeFolder, filename.trim(), url)
+                        val scenePrefix = if (rawFolder.length == 3 && rawFolder[0].isLetter()) {
+                            rawFolder[0].uppercaseChar().toString()
+                        } else { "A" }
+                        val folderNum = if (rawFolder.length == 3 && rawFolder[0].isLetter()) {
+                            rawFolder.substring(1)
+                        } else { rawFolder }
+                        val safeFolder = if (folderNum.matches(Regex("[0-9]{2}"))) folderNum else "01"
+                        downloadAndPlay(scenePrefix + safeFolder, filename.trim(), url)
                     } else {
-                        Log.w(TAG, "push_file 拒绝非法参数: folder=$folder, filename=$filename, url=$url")
+                        Log.w(TAG, "push_file 拒绝非法参数: folder=$rawFolder, filename=$filename, url=$url")
                     }
                 }
                 "stop" -> {
@@ -922,11 +934,19 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 播放本地视频
-     * @param folder 文件夹名 (01-20)
+     * @param folder 文件夹名 scene-prefixed (A01, B02...) or numeric (01)
      * @param filename 文件名
      */
     private fun playLocalVideo(folder: String, filename: String) {
-        val videoFile = File(videoFolderPath, "$folder/$filename")
+        // FIX: scene-prefixed folder IDs (A01, B02) → sceneA/01/video.mp4, sceneB/02/video.mp4
+        val scenePrefixChar = if (folder.length == 3 && folder[0].isLetter()) folder[0] else null
+        val folderNum = scenePrefixChar?.let { folder.removePrefix(it.toString()) } ?: folder
+        val physicalFolder = if (scenePrefixChar != null) {
+            File(File(videoFolderPath, "scene" + scenePrefixChar.lowercaseChar()), folderNum)
+        } else {
+            File(videoFolderPath, folderNum)
+        }
+        val videoFile = File(physicalFolder, filename)
         Log.d(TAG, "Playing local: ${videoFile.absolutePath}, exists=${videoFile.exists()}, size=${if(videoFile.exists()) videoFile.length() else 0}")
 
         if (!videoFile.exists()) {
@@ -958,16 +978,24 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 下载文件并播放
-     * @param folder 文件夹名 (01-20)
+     * @param folder 文件夹名 scene-prefixed (A01, B02...) or numeric (01)
      * @param filename 文件名
      * @param url 云端URL
      */
     private fun downloadAndPlay(folder: String, filename: String, url: String) {
+        // FIX: scene-prefixed folder IDs (A01, B02) → sceneA/01/video.mp4, sceneB/02/video.mp4
+        val scenePrefixChar = if (folder.length == 3 && folder[0].isLetter()) folder[0] else null
+        val folderNum = scenePrefixChar?.let { folder.removePrefix(it.toString()) } ?: folder
+        val physicalFolder = if (scenePrefixChar != null) {
+            File(File(videoFolderPath, "scene" + scenePrefixChar.lowercaseChar()), folderNum)
+        } else {
+            File(videoFolderPath, folderNum)
+        }
+        val localFile = File(physicalFolder, filename)
         val serverUrl = if (url.startsWith("http")) url else "http://47.102.106.237$url"
-        val localFile = File(videoFolderPath, "$folder/$filename")
 
         Log.d(TAG, "Downloading: $serverUrl -> ${localFile.absolutePath}")
-                Log.d(TAG, "videoFolderPath=$videoFolderPath, exists=${File(videoFolderPath).exists()}")
+        Log.d(TAG, "videoFolderPath=$videoFolderPath, physicalFolder=${physicalFolder.absolutePath}, exists=${physicalFolder.exists()}")
         mqttHandler.post {
             binding.statusText?.text = "正在下载素材..."
         }
@@ -975,9 +1003,8 @@ class MainActivity : AppCompatActivity() {
         downloadExecutor.submit {
             try {
                 // 确保文件夹存在
-                val folderDir = File(videoFolderPath, folder)
-                if (!folderDir.exists()) {
-                    folderDir.mkdirs()
+                if (!physicalFolder.exists()) {
+                    physicalFolder.mkdirs()
                 }
 
                 // 下载文件
@@ -1078,18 +1105,20 @@ class MainActivity : AppCompatActivity() {
     // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
     // 合并 Scene A + B 的 folder_mappings，一次同步，避免两次调用覆盖 prefs
     private fun syncRoomMaterialsAllScenes(roomId: String, folderMappingsA: org.json.JSONObject, scenes: org.json.JSONObject?) {
-        val merged = org.json.JSONObject()
-        // 先放入 Scene A 的映射
-        folderMappingsA.keys().forEach { key -> merged.put(key, folderMappingsA.get(key)) }
-        // 再合并 Scene B（若有），B 的 key 不会和 A 重叠
+        // FIX: call syncRoomMaterials separately per scene (A + B) so scene prefix is preserved
+        // folderMappingsA = Scene A folder_mappings (numeric keys: "01","02"...)
+        // scenes["B"]["folder_mappings"] = Scene B folder_mappings (numeric keys: "01","02"...)
+        Log.d(TAG, "同步 Scene A folders...")
+        syncRoomMaterials(roomId, folderMappingsA, "A")
         scenes?.optJSONObject("B")?.optJSONObject("folder_mappings")?.let { fmB ->
-            fmB.keys().forEach { key -> merged.put(key, fmB.get(key)) }
+            Log.d(TAG, "同步 Scene B folders...")
+            syncRoomMaterials(roomId, fmB, "B")
         }
-        Log.d(TAG, "合并后 folder_mappings: ${merged.keys().asSequence().toList()}")
-        syncRoomMaterials(roomId, merged)
     }
 
-    private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject) {
+    // FIX: added scenePrefix parameter — folder_mappings keys are numeric ("01","02"...),
+    // HTTP API keys are scene-prefixed ("A01","A02"...) so we build prefixedKey for lookup
+    private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject, scenePrefix: String = "A") {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
         }
@@ -1127,15 +1156,17 @@ class MainActivity : AppCompatActivity() {
                     logToFile("获取房间素材失败: " + e.message)
                 }
 
-                // 遍历30个文件夹
+                // FIX: HTTP API returns scene-prefixed keys ("A01","B15"...), build prefixedKey for lookup
+                // folder_mappings still uses numeric keys ("01","02"...) — prefix them with scene
                 for (i in 1..30) {
-                    val folderId = String.format("%02d", i)
-                    val materialIds = folderMappings.optJSONArray(folderId)
+                    val folderNum = String.format("%02d", i)
+                    val prefixedKey = scenePrefix + folderNum  // "A01", "B02"
+                    val materialIds = folderMappings.optJSONArray(folderNum)
                     if (materialIds != null && materialIds.length() > 0) {
-                        val cloudList = allMaterials[folderId]
-                        syncFolderWithIds(folderId, materialIds, cloudList)
+                        val cloudList = allMaterials[prefixedKey]  // lookup "A01" not "01"
+                        syncFolderWithIds(prefixedKey, materialIds, cloudList)
                     } else {
-                        deleteFolderFiles(folderId)
+                        deleteFolderFiles(prefixedKey)
                     }
                 }
 
@@ -1177,7 +1208,14 @@ class MainActivity : AppCompatActivity() {
                 idsSet.add(materialIds.getString(i))
             }
 
-            val localFolder = File(videoFolderPath, folderId)
+            // FIX: scene-prefixed folder IDs (A01, B02) → store in sceneA/01/, sceneB/02/
+            val scenePrefixChar = if (folderId.length == 3 && folderId[0].isLetter()) folderId[0] else null
+            val folderNum = scenePrefixChar?.let { folderId.removePrefix(it.toString()) } ?: folderId
+            val localFolder = if (scenePrefixChar != null) {
+                File(File(videoFolderPath, "scene" + scenePrefixChar.lowercaseChar()), folderNum)
+            } else {
+                File(videoFolderPath, folderNum)
+            }
             if (!localFolder.exists()) localFolder.mkdirs()
 
             val localFiles = localFolder.listFiles()?.filter {
@@ -1255,9 +1293,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // TODO: RS485/DMX512 external signal integration - currentSceneId currently has no active update path
     private fun deleteFolderFiles(folderId: String) {
         try {
-            val localFolder = File(videoFolderPath, folderId)
+            // FIX: match scene-prefixed path format used by syncFolderWithIds and playFolderInWindow
+            val scenePrefixChar = if (folderId.length == 3 && folderId[0].isLetter()) folderId[0] else null
+            val folderNum = scenePrefixChar?.let { folderId.removePrefix(it.toString()) } ?: folderId
+            val localFolder = if (scenePrefixChar != null) {
+                File(File(videoFolderPath, "scene" + scenePrefixChar.lowercaseChar()), folderNum)
+            } else {
+                File(videoFolderPath, folderNum)
+            }
             if (!localFolder.exists()) return
             val files = localFolder.listFiles()?.filter {
                 it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
@@ -1500,7 +1546,27 @@ class MainActivity : AppCompatActivity() {
                 baseDir.mkdirs()
             }
 
-            for (i in 1..20) {
+            for (i in 1..30) {
+                val folderName = String.format("%02d", i)
+                // FIX: also create scene subdirectories (sceneA/01..30, sceneB/01..30)
+                for (scene in listOf("", "sceneA", "sceneB")) {
+                    val folder = if (scene.isEmpty()) {
+                        File(baseDir, folderName)
+                    } else {
+                        File(File(baseDir, scene), folderName)
+                    }
+                    if (!folder.exists()) {
+                        folder.mkdirs()
+                        Log.d(TAG, "Created folder: ${folder.absolutePath}")
+                    }
+                }
+            }
+            Log.d(TAG, "Material folders initialized (01-30 + sceneA + sceneB)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create material folders: ${e.message}")
+        }
+    }
+
                 val folderName = String.format("%02d", i)
                 val folder = File(baseDir, folderName)
                 if (!folder.exists()) {
