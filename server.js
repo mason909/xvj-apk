@@ -333,14 +333,14 @@ function handleMqttMessage(topic, message) {
         console.log('📨 设备命令: ' + deviceId + ' -> ' + JSON.stringify(data));
         if (data.action === 'sync') {
           db.query(
-            'SELECT d.room_id, r.folder_mappings, r.config FROM devices d LEFT JOIN rooms r ON d.room_id = r.id WHERE d.id = ?',
+            'SELECT d.room_id, r.config FROM devices d LEFT JOIN rooms r ON d.room_id = r.id WHERE d.id = ?',
             [deviceId],
             (err, rows) => {
               if (err || !rows || rows.length === 0) {
                 console.log('⚠️ sync 命令找不到设备: ' + deviceId);
                 return;
               }
-              const { room_id, folder_mappings, config } = rows[0];
+              const { room_id, config } = rows[0];
               if (!room_id) {
                 console.log('⚠️ sync 命令设备未绑定房间: ' + deviceId);
                 return;
@@ -445,25 +445,12 @@ function sendAuthResponse(deviceId, authorized, message, roomId) {
   // 如果授权成功，获取房间的素材配置
   let folderMappings = {};
   if (authorized && roomId) {
-    // 同步获取房间素材配置
-    const roomQuery = `SELECT folder_mappings, config FROM rooms WHERE id = ?`;
-    db.query(roomQuery, [roomId], (err, results) => {
+    db.query('SELECT config FROM rooms WHERE id = ?', [roomId], (err, results) => {
       if (!err && results.length > 0) {
         try {
-          folderMappings = JSON.parse(results[0].folder_mappings || '{}');
           const roomConfig = results[0].config ? JSON.parse(results[0].config) : {};
           const debugFlag = roomConfig.debug === true;
-
-          // 迁移旧数据到 scenes 结构
-          if (!roomConfig.scenes) {
-            roomConfig.scenes = {
-              A: { name: '第一幕', folder_mappings: folderMappings, windows: roomConfig.windows || [] },
-              B: { name: '第二幕', folder_mappings: {}, windows: [] }
-            };
-            delete roomConfig.windows;
-          }
-
-          // 给 scenes 的 folder_mappings 键名加 scene 前缀（A01, B01），避免物理文件夹冲突
+          folderMappings = roomConfig.scenes?.A?.folder_mappings || {};
           var prefixedScenes = buildPrefixedScenes(roomConfig.scenes);
 
           // 构建完整的推送数据
@@ -700,13 +687,13 @@ app.post('/api/devices/:id/command', (req, res) => {
   // sync 命令需要补全 room_id + folder_mappings（服务器查数据库，APK 不需要重复传）
   if (cmd.action === 'sync') {
     db.query(
-      'SELECT d.room_id, d.fingerprint, r.folder_mappings, r.config FROM devices d LEFT JOIN rooms r ON d.room_id = r.id WHERE d.id = ?',
+      'SELECT d.room_id, d.fingerprint, r.config FROM devices d LEFT JOIN rooms r ON d.room_id = r.id WHERE d.id = ?',
       [deviceId],
       (err, rows) => {
         if (err || !rows || rows.length === 0) {
           return res.status(404).json({ error: '设备未找到' });
         }
-        const { room_id, fingerprint, folder_mappings, config } = rows[0];
+        const { room_id, fingerprint, config } = rows[0];
         if (!room_id) {
           return res.status(400).json({ error: '设备未绑定房间' });
         }
@@ -750,7 +737,7 @@ app.post('/api/rooms/:id/sync', (req, res) => {
   const roomId = req.params.id;
 
   // 查房间的 folder_mappings 和 config
-  db.query('SELECT folder_mappings, config FROM rooms WHERE id = ?', [roomId], (err, rows) => {
+  db.query('SELECT config FROM rooms WHERE id = ?', [roomId], (err, rows) => {
     if (err || !rows || rows.length === 0) {
       return res.status(404).json({ error: '房间不存在' });
     }
@@ -1175,8 +1162,8 @@ app.delete('/api/preset/materials/:id', (req, res) => {
   const mid = req.params.id;
   db.query('SELECT * FROM preset_materials WHERE id = ?', [mid], (err, rows) => {
     if (rows && rows[0]) logAction('delete', 'preset_material', rows[0]);
-    // 级联：同时查询 folder_mappings 和 config，用于清理根级和 scenes A/B
-    db.query('SELECT id, folder_mappings, config FROM rooms', [], (err2, rooms) => {
+    // 级联：查询所有 rooms，清理 scenes A/B
+    db.query('SELECT id, config FROM rooms', [], (err2, rooms) => {
       if (!err2 && rooms) {
         rooms.forEach((room) => {
 
@@ -1285,8 +1272,8 @@ app.delete("/api/materials/:id", (req, res) => {
       if (f) { try { fs.unlinkSync(base + f); } catch (e) { /* ignore */ } }
     }
 
-    // 步骤2：清理所有 rooms 的 folder_mappings 和 config.scenes（合并为一个 SELECT）
-    db.query("SELECT id, folder_mappings, config FROM rooms", [], (err2, rooms) => {
+    // 步骤2：清理所有 rooms 的 config.scenes
+    db.query("SELECT id, config FROM rooms", [], (err2, rooms) => {
       const promises = [];
       if (!err2 && rooms) {
         rooms.forEach(room => {
@@ -1494,7 +1481,7 @@ app.get("/api/folders/notes", (req, res) => {
 app.get('/api/room-materials-v2/:roomId', (req, res) => {
   const roomId = req.params.roomId;
 
-  db.query('SELECT folder_mappings, config FROM rooms WHERE id = ?', [roomId], (err, rows) => {
+  db.query('SELECT config FROM rooms WHERE id = ?', [roomId], (err, rows) => {
     if (err || !rows || rows.length === 0) {
       return res.status(404).json({ error: '房间不存在' });
     }
@@ -1685,8 +1672,8 @@ app.post('/api/rooms', (req, res) => {
   const { store_name, name, folder_mappings, config } = req.body;
   if (!store_name || !name) return res.status(400).json({error:'store_name and name required'});
   const id = 'room_' + Date.now();
-  db.query('INSERT INTO rooms (id, store_name, name, folder_mappings, config) VALUES (?, ?, ?, ?, ?)', 
-    [id, store_name, name, folder_mappings || '{}', config || '{}'], (err, result) => {
+  db.query('INSERT INTO rooms (id, store_name, name, config) VALUES (?, ?, ?, ?)', 
+    [id, store_name, name, config || '{}'], (err, result) => {
     if (err) return res.status(500).json({error:err.message});
     logAction('create', 'room', { id, store_name, name });
     res.json({success:true, id});
@@ -1839,17 +1826,11 @@ app.put('/api/rooms/:id/windows', (req, res) => {
       if (err2) return res.status(500).json({ error: err2.message });
       logAction('update_windows', 'room', { id, scene: targetScene, windows });
 
-      // 【S-04b-Fix】立即推送 MQTT，让 APP 立即应用新窗口配置
-      db.query('SELECT id, folder_mappings FROM rooms WHERE id = ?', [id], (err3, rows3) => {
-        if (!err3 && rows3 && rows3.length > 0) {
-          const roomFolderMappings = rows3[0].folder_mappings ? JSON.parse(rows3[0].folder_mappings) : {};
-          // 查找绑定到此房间的设备（APK MQTT clientId = fingerprint）
-          db.query('SELECT id, fingerprint FROM devices WHERE room_id = ?', [id], (err4, rows4) => {
-            if (!err4 && rows4 && rows4.length > 0) {
-              const mqttId = rows4[0].fingerprint || rows4[0].id;
-              sendSyncCommandToDevice(mqttId, id, roomFolderMappings, existingConfig);
-            }
-          });
+      // 查找绑定到此房间的设备（APK MQTT clientId = fingerprint）
+      db.query('SELECT id, fingerprint FROM devices WHERE room_id = ?', [id], (err4, rows4) => {
+        if (!err4 && rows4 && rows4.length > 0) {
+          const mqttId = rows4[0].fingerprint || rows4[0].id;
+          sendSyncCommandToDevice(mqttId, id, null, existingConfig);
         }
       });
 
@@ -1877,7 +1858,7 @@ app.delete('/api/rooms/:id', (req, res) => {
 // APK syncRoomMaterials 调用的 API（带 /list 后缀）
 app.get('/api/room-materials/:roomId/list', (req, res) => {
   const roomId = req.params.roomId;
-  db.query('SELECT folder_mappings, config FROM rooms WHERE id = ?', [roomId], (err, rooms) => {
+  db.query('SELECT config FROM rooms WHERE id = ?', [roomId], (err, rooms) => {
     if (err) return res.status(500).json({error: err.message});
     if (!rooms[0]) return res.status(404).json({error: 'room not found'});
     const room = rooms[0];
@@ -1927,29 +1908,16 @@ app.get('/api/room-materials/:roomId/list', (req, res) => {
 });
 
 // 房间素材API（/api/rooms/:id/materials的内部包装）
-app.get('/api/rooms/:id/materials', (req, res) => {
-  const id = req.params.id;
-  db.query('SELECT folder_mappings FROM rooms WHERE id = ?', [id], (err, results) => {
-    if (err) return res.status(500).json({error:err.message});
-    if (!results[0]) return res.status(404).json({error:'room not found'});
-    const mappings = JSON.parse(results[0].folder_mappings || '{}');
-    res.json(mappings);
-  });
-});
-
 // 添加素材到房间
 app.post('/api/rooms/:id/folder/:folder', (req, res) => {
   const { id } = req.params;
   const { folder } = req.params;
   const { material_ids } = req.body;
-  db.query('SELECT folder_mappings, config FROM rooms WHERE id = ?', [id], (err, results) => {
+  db.query('SELECT config FROM rooms WHERE id = ?', [id], (err, results) => {
     if (err) return res.status(500).json({error:err.message});
     if (!results || results.length === 0) return res.status(404).json({error:'Room not found'});
 
-    let mappings = results[0].folder_mappings ? JSON.parse(results[0].folder_mappings) : {};
-    mappings[folder] = material_ids || [];
-
-    // 同时更新 scenes A/B 的 folder_mappings（独立场景模式）
+    // 更新 scenes A/B 的 folder_mappings（独立场景模式）
     let cfg = results[0].config ? JSON.parse(results[0].config) : {};
     if (!cfg.scenes) {
       cfg.scenes = {
@@ -1993,11 +1961,10 @@ app.get('/api/devices/:id/room-materials', (req, res) => {
   db.query('SELECT room_id FROM devices WHERE id = ?', [id], (err, results) => {
     if (err) return res.status(500).json({error:err.message});
     if (!results[0] || !results[0].room_id) return res.json({});
-    db.query('SELECT folder_mappings, config FROM rooms WHERE id = ?', [results[0].room_id], (err, rows) => {
+    db.query('SELECT config FROM rooms WHERE id = ?', [results[0].room_id], (err, rows) => {
       if (err) return res.status(500).json({error:err.message});
       if (!rows[0]) return res.json({});
       const roomConfig = rows[0].config ? JSON.parse(rows[0].config) : {};
-      // scenes.A.folder_mappings 是唯一来源（根级已废止）
       const mappings = (roomConfig.scenes && roomConfig.scenes.A && roomConfig.scenes.A.folder_mappings)
         ? roomConfig.scenes.A.folder_mappings : {};
       res.json(mappings);
