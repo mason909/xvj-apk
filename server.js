@@ -20,7 +20,7 @@
  * 核心表：
  *   materials          - 素材库（原始视频文件）
  *   preset_materials   - 预设素材（从素材库复制，可跨房间复用）
- *   rooms              - 房间配置中心（folder_mappings 是设备同步唯一真相）
+ *   rooms              - 房间配置中心（config.scenes.{A,B}.folder_mappings 是设备同步唯一真相）
  *   devices            - 设备注册表
  *   operation_logs      - 前端操作日志（logAction 写入）
  *   device_logs        - 设备日志（APP MQTT log 主题上报）
@@ -755,20 +755,7 @@ app.post('/api/rooms/:id/sync', (req, res) => {
       return res.status(404).json({ error: '房间不存在' });
     }
     const config = rows[0].config ? JSON.parse(rows[0].config) : {};
-    let folderMappings = config.scenes?.A?.folder_mappings || {};
-    // fallback 到根级 folder_mappings（兼容旧数据）
-    if (Object.keys(folderMappings).length === 0 && rows[0].folder_mappings) {
-      try { folderMappings = JSON.parse(rows[0].folder_mappings); } catch(e) {}
-    }
-
-    // 迁移旧数据到 scenes 结构
-    if (!config.scenes) {
-      config.scenes = {
-        A: { name: '第一幕', folder_mappings: folderMappings, windows: config.windows || [] },
-        B: { name: '第二幕', folder_mappings: {}, windows: [] }
-      };
-      delete config.windows;
-    }
+    const folderMappings = config.scenes?.A?.folder_mappings || {};
 
     // 合并 Scene A 和 Scene B 的 folder_mappings（外部信号决定播放哪个文件夹，设备必须同时有A和B的数据）
     const fmA = config.scenes?.A?.folder_mappings || {};
@@ -1303,24 +1290,8 @@ app.delete("/api/materials/:id", (req, res) => {
       const promises = [];
       if (!err2 && rooms) {
         rooms.forEach(room => {
-          let changed = false;
           const cfg = {};
           try { Object.assign(cfg, room.config ? JSON.parse(room.config) : {}); } catch(e) {}
-
-          // 清理根级 folder_mappings
-          const fm = {};
-          try { Object.assign(fm, room.folder_mappings ? JSON.parse(room.folder_mappings) : {}); } catch(e) {}
-          Object.keys(fm).forEach(folderId => {
-            const arr = fm[folderId];
-            if (Array.isArray(arr)) {
-              const before = arr.length;
-              fm[folderId] = arr.filter(item => item !== id);
-              if (arr.length !== before) changed = true;
-            }
-          });
-          if (changed) promises.push(new Promise(resolve => {
-            db.query('UPDATE rooms SET folder_mappings=? WHERE id=?', [JSON.stringify(fm), room.id], () => resolve());
-          }));
 
           // 清理 scenes A/B folder_mappings
           let sceneChanged = false;
@@ -1537,9 +1508,7 @@ app.get('/api/room-materials-v2/:roomId', (req, res) => {
       folderMappingsA = config.scenes?.A?.folder_mappings || {};
       folderMappingsB = config.scenes?.B?.folder_mappings || {};
     } catch(e) {
-      if (rows[0].folder_mappings) {
-        try { folderMappingsA = JSON.parse(rows[0].folder_mappings); } catch(e2) {}
-      }
+      // config 解析失败时返回空
     }
 
     // 收集所有需要的 material IDs（来自 A 和 B）
@@ -1689,7 +1658,7 @@ db.query(`CREATE TABLE IF NOT EXISTS rooms (
   UNIQUE KEY unique_store_room (store_name, name)
 )`);
 
-// 获取房间列表（Plan A: 内存迁移，不写DB）
+// 获取房间列表
 app.get('/api/rooms', (req, res) => {
   const store = req.query.store;
   let sql = 'SELECT * FROM rooms';
@@ -1697,44 +1666,17 @@ app.get('/api/rooms', (req, res) => {
   if (store) { sql += ' WHERE store_name = ?'; params.push(store); }
   db.query(sql, params, (err, results) => {
     if (err) return res.status(500).json({error:err.message});
-    // 内存迁移：为每个房间构造 scenes 结构（不写 DB）
-    results.forEach(function(room) {
-      try {
-        const config = room.config ? JSON.parse(room.config) : {};
-        if (!config.scenes) {
-          config.scenes = {
-            A: { name: '第一幕', folder_mappings: room.folder_mappings ? JSON.parse(room.folder_mappings) : {}, windows: config.windows || [] },
-            B: { name: '第二幕', folder_mappings: {}, windows: [] }
-          };
-          delete config.windows;
-          room.config = JSON.stringify(config);
-        }
-      } catch(e) {}
-    });
     res.json(results);
   });
 });
 
-// 获取单个房间（Plan A: 内存迁移，不写DB）
+// 获取单个房间
 app.get('/api/rooms/:id', (req, res) => {
   const id = req.params.id;
   db.query('SELECT * FROM rooms WHERE id = ?', [id], (err, results) => {
     if (err) return res.status(500).json({error:err.message});
     if (results.length === 0) return res.status(404).json({error:'Room not found'});
-    const room = results[0];
-    // 内存迁移：为前端响应构造 scenes 结构（不写 DB）
-    try {
-      const config = room.config ? JSON.parse(room.config) : {};
-      if (!config.scenes) {
-        config.scenes = {
-          A: { name: '第一幕', folder_mappings: room.folder_mappings ? JSON.parse(room.folder_mappings) : {}, windows: config.windows || [] },
-          B: { name: '第二幕', folder_mappings: {}, windows: [] }
-        };
-        delete config.windows;
-        room.config = JSON.stringify(config);
-      }
-    } catch(e) {}
-    res.json(room);
+    res.json(results[0]);
   });
 });
 
@@ -2044,40 +1986,6 @@ app.post('/api/rooms/:id/folder/:folder', (req, res) => {
 //    合并查 materials + preset_materials，按 folder_mappings 过滤
 //    这是设备同步时调用的核心接口
 // ============================================================================
-
-// 获取房间所有素材（materials + preset_materials 合并，按文件夹分组，供APK同步使用）
-
-// 【S-04c】 房间素材（旧版）// GET /api/room-materials/:roomId
-app.get('/api/room-materials/:roomId', (req, res) => {
-  const { roomId } = req.params;
-  db.query('SELECT folder_mappings, config FROM rooms WHERE id = ?', [roomId], (err, results) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!results || results.length === 0) return res.json({});
-    const roomConfig = results[0].config ? JSON.parse(results[0].config) : {};
-    const debugFlag = roomConfig.debug === true;
-    // scenes.A.folder_mappings 是唯一来源（根级已废止）
-    const mappings = (roomConfig.scenes && roomConfig.scenes.A && roomConfig.scenes.A.folder_mappings)
-      ? roomConfig.scenes.A.folder_mappings : {};
-
-    // 收集所有需要的 material IDs
-    const allIds = new Set();
-    Object.values(mappings).forEach(ids => (ids || []).forEach(id => allIds.add(id)));
-
-    // 同时查询两个表
-    db.query('SELECT id, name AS filename, url, type, folder, thumbnail FROM materials', (err, materials) => {
-      if (err) return res.status(500).json({ error: err.message });
-      db.query('SELECT id, filename, url, type, thumbnail FROM preset_materials', (err, presets) => {
-        if (err) return res.status(500).json({ error: err.message });
-        const all = [...materials, ...presets];
-        const result = { debug: debugFlag };
-        Object.entries(mappings).forEach(([folder, ids]) => {
-          result[folder] = (ids || []).map(id => all.find(m => m.id === id)).filter(Boolean);
-        });
-        res.json(result);
-      });
-    });
-  });
-});
 
 // 获取设备的房间素材
 app.get('/api/devices/:id/room-materials', (req, res) => {
