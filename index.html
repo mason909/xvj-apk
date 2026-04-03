@@ -463,8 +463,8 @@ async function dm(e, id) {
     if (url && s.rooms) {
         for (var j = 0; j < s.rooms.length; j++) {
             var room = s.rooms[j];
-            if (!room.folder_mappings) continue;
-            var fm = JSON.parse(room.folder_mappings);
+            var roomCfg = room.config && typeof room.config === 'string' ? JSON.parse(room.config) : (room.config || {});
+            var fm = (roomCfg.scenes && roomCfg.scenes.A && roomCfg.scenes.A.folder_mappings) || {};
             var changed = false;
             for (var f in fm) {
                 var idx = fm[f].indexOf(id);
@@ -755,13 +755,17 @@ function rmDevice() {
     for (var i = 1; i <= 30; i++) {
         var f = i.toString().padStart(2, '0');
         var act = s.f === f ? 'active' : '';
-        var ms = r.folder_mappings ? JSON.parse(r.folder_mappings)[f] || [] : [];
+        var rCfg = r.config && typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {});
+        var rFm = (rCfg.scenes && rCfg.scenes.A && rCfg.scenes.A.folder_mappings) || {};
+        var ms = rFm[f] || [];
         h += '<div class="tab ' + act + '" onclick="sfR(\'' + f + '\')"><span class="tab-n">' + f + '</span><span class="tab-d">' + (ms.length > 0 ? ms.length : '+') + '</span></div>';
     }
     h += '</div>';
     h += '<button class="btn btn-primary" style="margin-top:10px;width:100%;background:#28a745;font-size:16px;padding:12px" onclick="syncCurrentRoom()">🔄 同步当前房间</button>';
-    
-    var ms = r.folder_mappings ? JSON.parse(r.folder_mappings)[s.f] || [] : [];
+
+    var rCfg2 = r.config && typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {});
+    var rFm2 = (rCfg2.scenes && rCfg2.scenes.A && rCfg2.scenes.A.folder_mappings) || {};
+    var ms = rFm2[s.f] || [];
     // 只显示已映射的素材
     var all = [];
     if (ms && ms.length > 0) {
@@ -798,15 +802,16 @@ function sfR(f) {
 async function toggleRM(mid) {
     if (!s.rf) return;
     var r = s.rooms.find(function(x) { return x.id === s.rf; });
-    var ms = r.folder_mappings ? JSON.parse(r.folder_mappings) : {};
-    if (!ms[s.f]) ms[s.f] = [];
-    var i = ms[s.f].indexOf(mid);
-    if (i > -1) ms[s.f].splice(i, 1);
-    else ms[s.f].push(mid);
+    var rCfg = r.config && typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {});
+    var rFm = (rCfg.scenes && rCfg.scenes.A && rCfg.scenes.A.folder_mappings) || {};
+    if (!rFm[s.f]) rFm[s.f] = [];
+    var i = rFm[s.f].indexOf(mid);
+    if (i > -1) rFm[s.f].splice(i, 1);
+    else rFm[s.f].push(mid);
     await fetch('/api/rooms/' + s.rf, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({folder_mappings: JSON.stringify(ms)})
+        body: JSON.stringify({folder_mappings: JSON.stringify(rFm)})
     });
     await lr();
 }
@@ -824,7 +829,8 @@ async function mapPreset() {
     var presetInFolder = pm;
     if (presetInFolder.length === 0) { alert('预设素材库为空，请先在预设素材页面添加'); return; }
     var r = s.rooms.find(function(x) { return x.id === s.rf; });
-    var folderMs = r.folder_mappings ? JSON.parse(r.folder_mappings) : {};
+    var rCfg = r.config && typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {});
+    var folderMs = (rCfg.scenes && rCfg.scenes.A && rCfg.scenes.A.folder_mappings) || {};
     // 添加所有预设素材到对应文件夹（按ID或URL去重）
     var count = 0;
     presetInFolder.forEach(function(preset) {
@@ -908,7 +914,8 @@ async function rmRoomMat(e, mid) {
     if (!s.rf) return;
     if (!confirm('从房间移除该素材?')) return;
     var r = s.rooms.find(function(x) { return x.id === s.rf; });
-    var ms = r.folder_mappings ? JSON.parse(r.folder_mappings) : {};
+    var rCfg = r.config && typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {});
+    var ms = (rCfg.scenes && rCfg.scenes.A && rCfg.scenes.A.folder_mappings) || {};
     if (!ms[s.f]) ms[s.f] = [];
     var i = ms[s.f].indexOf(mid);
     if (i > -1) ms[s.f].splice(i, 1);
@@ -1071,7 +1078,8 @@ async function doPushToRoom() {
         var ro = await fetch('/api/rooms/' + roomId);
         var room = await ro.json();
         console.log('room:', room);
-        var folderMs = room.folder_mappings ? JSON.parse(room.folder_mappings) : {};
+        var roomCfg = room.config && typeof room.config === 'string' ? JSON.parse(room.config) : (room.config || {});
+        var folderMs = (roomCfg.scenes && roomCfg.scenes.A && roomCfg.scenes.A.folder_mappings) || {};
         // 添加素材ID到对应文件夹（按原文件夹归属，去重）
         // 【问题 #3 修复】使用 mat 替代 m 避免与 DOM 元素 m 混淆
         s.pushMs.forEach(function(mat) {
