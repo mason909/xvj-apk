@@ -138,7 +138,12 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_LM_PREFIX = "lm_"
     }
 
-    // 文件日志
+    // 【A-11】 工具方法
+    /**
+     * 写入文件日志（xvj.log）
+     * 若 debug_mode 开启，同时通过 MQTT 上报到 device_logs 表
+     * @param msg 日志内容
+     */
     private fun logToFile(msg: String) {
         try {
             val logFile = File(filesDir, "xvj.log")
@@ -390,7 +395,7 @@ class MainActivity : AppCompatActivity() {
 
         Log.d(TAG, "Device ID: $deviceId")
 
-// 【A-02】 MQTT 连接初始化 // private fun connectMQTT()
+    private fun connectMQTT() {
         Log.d(TAG, "MQTT Server: $mqttServer")
         logToFile("DeviceID: $deviceId, MQTT: $mqttServer")
 
@@ -406,6 +411,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 【A-02】 MQTT 连接
+    /**
+     * 连接 MQTT Broker
+     * - 设置 MqttConnectOptions（持久会话、保活15秒、30秒超时）
+     * - 订阅 commandTopic 和 AUTH_TOPIC
+     * - 注册设备并请求授权状态同步
+     * - 连接成功后触发 checkForUpdate
+     * - 支持指数退避重连（5s → 最大300s）
+     */
     private fun connectMQTT() {
         downloadExecutor.submit {
             try {
@@ -466,7 +480,6 @@ class MainActivity : AppCompatActivity() {
                     Log.e(TAG, "MQTT Connection Error: ${e.message}")
                     logToFile("MQTT Connection Error: ${e.message}")
 
-// 【A-03】 设备注册 // private fun registerDevice()
                     onMqttReconnectFailed()  // P4 fix: 连接失败也触发退避
                     mqttHandler.post {
                         binding.statusText?.text = "连接失败: ${e.message}"
@@ -479,6 +492,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 【A-03】 设备注册 & 授权
     /**
      * 向云端注册设备
      */
@@ -540,8 +554,6 @@ class MainActivity : AppCompatActivity() {
         }
         statusHandler.post(statusTimerRunnable!!)
     }
-
-// 【A-03b】 处理授权响应 // private fun handleAuthResponse()
 
     /**
      * 停止定时发送状态
@@ -693,8 +705,7 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "MQTT重连失败 #${mqttReconnectAttempts}，${mqttReconnectDelaySeconds}s 后重试")
     }
 
-
-// 【A-04】 MQTT 消息分发 // private fun handleCommand() → when(action)
+    // 【A-04】 MQTT 消息处理 & 分发
     // 请求同步授权状态
     private fun requestAuthSync() {
         try {
@@ -710,6 +721,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 处理 MQTT 命令
+     * @param json 命令 JSON，包含 action 字段
+     * 支持的动作：play, play_local, push_file, stop, pause, resume, next,
+     *            config, sync, preset_sync, sync_room_materials, delete_material, update
+     */
     private fun handleCommand(json: String) {
         try {
             val cmd = JSONObject(json)
@@ -869,8 +886,6 @@ class MainActivity : AppCompatActivity() {
                         // 用Handler在主线程显示Toast
                         mqttHandler.post {
                             try {
-
-// 【A-05】 视频播放 // private fun playFromUrl() | playLocalVideo() | downloadAndPlay()
                                 android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_LONG).show()
                             } catch(e: Exception) {}
                         }
@@ -886,6 +901,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 【A-05】 视频播放
+    /**
+     * 从网络 URL 播放视频
+     * @param url 视频文件网络 URL
+     */
     private fun playFromUrl(url: String) {
         Log.d(TAG, "Playing from URL: $url")
         mqttHandler.post {
@@ -902,6 +922,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 通过素材 ID 从云端播放视频
+     * @param videoId 云端素材 ID
+     * 流程：调用 /api/materials/{videoId} 获取 URL，再调用 playFromUrl 播放
+     */
     private fun playFromCloud(videoId: String) {
         Log.d(TAG, "Playing from cloud: $videoId")
         mqttHandler.post {
@@ -1082,8 +1107,6 @@ class MainActivity : AppCompatActivity() {
                 Log.d(TAG, "Preset folders saved: $folderList")
 
                 mqttHandler.post {
-
-// 【A-06b】 房间素材同步入口 // private fun syncRoomMaterialsAllScenes()
                     binding.statusText?.text = "预设素材同步完成"
                 }
             } catch (e: Exception) {
@@ -1097,8 +1120,14 @@ class MainActivity : AppCompatActivity() {
 
     // 同步房间素材到本地文件夹
 
-// 【A-06c】 房间素材同步核心 // private fun syncRoomMaterials()
-
+    // 【A-06】 素材同步
+    /**
+     * 同步房间所有素材（Scene A + B）
+     * @param roomId       房间 ID
+     * @param folderMappingsA  Scene A 的 folder_mappings
+     * @param scenes       完整 scenes JSON（包含 A/B 两套配置）
+     * 流程：分别调用 syncRoomMaterials 同步 Scene A 和 Scene B
+     */
     // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
     // 分别同步 Scene A 和 B，不合并（避免 B 的 numeric key 覆盖 A）
     private fun syncRoomMaterialsAllScenes(roomId: String, folderMappingsA: org.json.JSONObject, scenes: org.json.JSONObject?) {
@@ -1175,8 +1204,6 @@ class MainActivity : AppCompatActivity() {
                         try {
                             applySceneConfigs(org.json.JSONObject(scenesJson))
                         } catch (e: Exception) {
-
-// 【A-06d】 下载单个文件夹素材 // private fun syncFolderWithIds()
                             Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
                         }
                     }
@@ -1191,7 +1218,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 按 material IDs 精确同步单个文件夹（传入预获取的云端素材列表，避免重复请求）
+    /**
+     * 按 material IDs 精确同步单个文件夹
+     * @param folderId   文件夹 ID（支持 scene-prefixed 格式，如 "A01"）
+     * @param materialIds 要同步的素材 ID 数组
+     * @param cloudList  预获取的云端素材列表（可避免重复请求）
+     * 流程：比对本地与云端素材，下载缺失/变化的，删除多余的
+     */
     private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?) {
         try {
             if (cloudList == null || cloudList.length() == 0) {
@@ -1246,8 +1279,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-
-// 【A-06e】 删除本地素材文件 // private fun deleteMaterialFile()
             for (file in localFiles) {
                 if (!shouldExist.contains(file.name)) {
                     Log.d(TAG, "删除不在清单中的文件: " + file.name)
@@ -1274,8 +1305,6 @@ class MainActivity : AppCompatActivity() {
             if (file.exists()) {
                 // 清除 ETag/Last-Modified 缓存，避免删后重加时 APK 因 304 跳过下载
                 prefs.edit()
-
-// 【A-06f】 清空文件夹 // private fun deleteFolderFiles()
                     .remove(PREF_ETAG_PREFIX + filename)
                     .remove(PREF_LM_PREFIX + filename)
                     .apply()
@@ -1291,6 +1320,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 清空指定文件夹下的所有视频文件
+     * @param folderId 文件夹 ID（支持 scene-prefixed 格式）
+     * 同时清除本地缓存的 ETag/Last-Modified，避免删文件后重加时 APK 因 304 跳过下载
+     */
     private fun deleteFolderFiles(folderId: String) {
         try {
             val localFolder = File(videoFolderPath, folderId)
@@ -1300,8 +1334,6 @@ class MainActivity : AppCompatActivity() {
             } ?: emptyList()
             for (file in files) {
                 Log.d(TAG, "清空文件夹" + folderId + "，删除: " + file.name)
-
-// A-07a】 扫描并播放本地视频 // private fun playFolderVideos()
                 logToFile("清空删除: " + file.name)
                 // 清除缓存的 ETag，避免删文件后重加时 APK 因 304 跳过下载
                 prefs.edit()
@@ -1315,8 +1347,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 下载并播放指定文件夹
-    // 播放本地文件夹的视频
+    /**
+     * 扫描并播放指定文件夹中的所有视频
+     * @param folderId 文件夹 ID（支持 scene-prefixed 格式，如 "A01"）
+     * 按文件名排序，循环播放所有视频文件
+     */
     private fun playFolderVideos(folderId: String) {
         Log.d(TAG, "playFolderVideos called: folderId=$folderId")
         
@@ -1370,7 +1405,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 检查存储权限
+    // 【A-10】 权限 & 系统 UI
+    /**
+     * 检查并申请存储权限
+     * Android 6-10: 动态申请 READ/WRITE_EXTERNAL_STORAGE
+     * Android 11+: 申请 MANAGE_EXTERNAL_STORAGE
+     */
     private fun checkStoragePermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // Android 11+ 需要 MANAGE_EXTERNAL_STORAGE
@@ -1399,6 +1439,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 隐藏系统 UI，实现全屏沉浸式播放
+     * 设置 IMMERSIVE_STICKY 标志，隐藏导航栏和状态栏
+     */
     private fun hideSystemUI() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
             window.decorView.systemUiVisibility = (
@@ -1417,6 +1461,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 【A-09】 本地文件扫描
+    /**
+     * 扫描本地视频文件
+     * 优先扫描 videoFolderPath，若不存在则扫描默认路径（DCIM/Movies/Video/Download）
+     */
     private fun scanLocalVideos() {
         val dir = File(videoFolderPath)
 
@@ -1428,6 +1477,9 @@ class MainActivity : AppCompatActivity() {
         loadVideosFromFolder(dir)
     }
 
+    /**
+     * 扫描默认路径列表，寻找第一个包含视频文件的目录
+     */
     private fun scanDefaultPaths() {
         val defaultPaths = listOf(
             "/storage/emulated/0/DCIM",
@@ -1449,6 +1501,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 从指定目录加载视频文件列表
+     * @param dir 要扫描的目录
+     * 过滤常见视频扩展名，按文件名排序
+     */
     private fun loadVideosFromFolder(dir: File) {
         videoList = dir.listFiles()?.filter {
             it.isFile && isVideoFile(it.extension)
@@ -2010,8 +2067,6 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 logToFile("下载APK失败: ${e.message}")
                 mqttHandler.post {
-
-// 【A-07】 应用场景配置 // private fun applySceneConfigs()
                     try {
                         android.widget.Toast.makeText(this, "更新下载失败: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                     } catch(e: Exception) {}
@@ -2022,6 +2077,7 @@ class MainActivity : AppCompatActivity() {
 
     // ========== 多窗口系统实现 ==========
 
+    // 【A-07】 窗口配置 & 渲染
     /**
      * 应用场景配置（MQTT同步后或启动时调用）
      * scenes: 完整 scenes JSON（包含 A 和 B 两套）
@@ -2154,8 +2210,6 @@ class MainActivity : AppCompatActivity() {
 
     /** 纯色背景窗口 */
     private fun createColorView(w: JSONObject, content: JSONObject): View {
-
-// 【A-07b】 创建窗口视图 // private fun createWindowView()
         val color = content.optString("color", "#000000")
         val name = w.optString("name", "")
         return TextView(this).apply {
@@ -2191,7 +2245,6 @@ class MainActivity : AppCompatActivity() {
         playerView.player = player
         windowPlayers[winId] = player
 
-// 【A-08】 场景切换 // fun switchScene()
         return playerView
     }
 
@@ -2246,6 +2299,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 【A-08】 场景切换
     /** 切换到 A 或 B 场景并重新渲染 */
     fun switchScene(sceneId: String) {
         currentSceneId = sceneId.uppercase()
