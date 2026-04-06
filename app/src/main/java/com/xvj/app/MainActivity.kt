@@ -895,6 +895,13 @@ class MainActivity : AppCompatActivity() {
                         Log.d(TAG, "OTA: 当前已是最新版本 ($VERSION_CODE >= $serverCode)")
                     }
                 }
+                "set_debug" -> {
+                    // 【B-2】接收调试模式切换命令，立即生效
+                    val debug = cmd.optBoolean("debug", false)
+                    prefs.edit().putBoolean("debug_mode", debug).apply()
+                    Log.d(TAG, "set_debug: debug=$debug")
+                    logToFile("调试模式变更: debug=$debug")
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Command parse error: ${e.message}")
