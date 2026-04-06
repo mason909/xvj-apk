@@ -407,6 +407,7 @@ class MainActivity : AppCompatActivity() {
                 Log.d(TAG, "启动时从本地缓存恢复 scenes 成功")
             } catch (e: Exception) {
                 Log.e(TAG, "启动时恢复 scenes 失败: ${e.message}")
+                logToFile("启动恢复 scenes 失败: ${e.message}")
             }
         }
     }
@@ -435,6 +436,7 @@ class MainActivity : AppCompatActivity() {
                 mqttClient?.setCallback(object : MqttCallback {
                     override fun connectionLost(cause: Throwable?) {
                         Log.w(TAG, "MQTT Connection Lost: ${cause?.message}")
+                        logToFile("MQTT Connection Lost: ${cause?.message}")
                         mqttHandler.post {
                             binding.statusText?.text = "连接断开,重连中..."
                         }
@@ -456,6 +458,7 @@ class MainActivity : AppCompatActivity() {
                             }
                         } catch (e: Exception) {
                             Log.e(TAG, "Error handling message: ${e.message}")
+                            logToFile("消息处理异常: ${e.message}")
                         }
                     }
 
@@ -518,6 +521,7 @@ class MainActivity : AppCompatActivity() {
             startStatusTimer()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register device: ${e.message}")
+            logToFile("注册设备失败: ${e.message}")
         }
     }
 
@@ -536,6 +540,7 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "Status sent: $status")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send status: ${e.message}")
+            logToFile("发送状态失败: ${e.message}")
         }
     }
 
@@ -636,6 +641,7 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Auth response parse error: ${e.message}")
+            logToFile("Auth response 解析失败: ${e.message}")
         }
     }
 
@@ -671,6 +677,7 @@ class MainActivity : AppCompatActivity() {
                 Log.d(TAG, "开始播放欢迎视频")
             } catch (e: Exception) {
                 Log.e(TAG, "播放欢迎视频失败: ${e.message}")
+                logToFile("播放欢迎视频失败: ${e.message}")
             }
         }
     }
@@ -718,6 +725,7 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "请求授权状态同步")
         } catch (e: Exception) {
             Log.e(TAG, "请求授权同步失败: ${e.message}")
+            logToFile("请求授权同步失败: ${e.message}")
         }
     }
 
@@ -835,6 +843,7 @@ class MainActivity : AppCompatActivity() {
                                 Log.d(TAG, "从本地缓存恢复 scenes 成功")
                             } catch (e: Exception) {
                                 Log.e(TAG, "从本地缓存恢复 scenes 失败: ${e.message}")
+                                logToFile("从本地缓存恢复 scenes 失败: ${e.message}")
                             }
                         }
                     }
