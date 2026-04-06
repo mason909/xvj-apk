@@ -409,23 +409,6 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "Device ID: $deviceId")
     }
 
-    private fun connectMQTT() {
-        Log.d(TAG, "MQTT Server: $mqttServer")
-        logToFile("DeviceID: $deviceId, MQTT: $mqttServer")
-
-        // 启动时从本地缓存恢复 scenes 配置（离线多窗口）
-        val cachedScenes = prefs.getString("scenes_json", null)
-        if (cachedScenes != null) {
-            try {
-                applySceneConfigs(org.json.JSONObject(cachedScenes))
-                Log.d(TAG, "启动时从本地缓存恢复 scenes 成功")
-            } catch (e: Exception) {
-                Log.e(TAG, "启动时恢复 scenes 失败: ${e.message}")
-                logToFile("启动恢复 scenes 失败: ${e.message}")
-            }
-        }
-    }
-
     // 【A-02】 MQTT 连接
     // @tag: connectMQTT mqtt连接 broker连接
     /**
