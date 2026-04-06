@@ -142,12 +142,17 @@ class MainActivity : AppCompatActivity() {
     /**
      * 写入文件日志（xvj.log）
      * 若 debug_mode 开启，同时通过 MQTT 上报到 device_logs 表
+     * 结构化日志写入
      * @param msg 日志内容
-     * @param level 日志级别: ERROR, WARN, INFO, DEBUG
-     * @param module 模块: APP, MQTT, AUTH, SYNC, PLAYER, UI
-     * @param action 动作: START, STOP, ERROR, CONNECT, REGISTER, SYNC 等
+     * @param level 日志级别: ERROR, WARN, INFO, DEBUG（默认 INFO）
+     * @param module 模块: APP, MQTT, AUTH, SYNC, PLAYER, UI（默认 APP）
+     * @param action 动作: START, STOP, ERROR, CONNECT, REGISTER, SYNC 等（默认 LOG）
+     *
+     * 调用示例：
+     *   logToFile("应用启动")                        // INFO, APP, LOG
+     *   logToFile("连接失败", "ERROR", "MQTT")     // ERROR, MQTT, LOG
      */
-    private fun logToFile(level: String = "INFO", module: String = "APP", action: String = "LOG", msg: String) {
+    private fun logToFile(msg: String, level: String = "INFO", module: String = "APP", action: String = "LOG") {
         try {
             val logFile = File(filesDir, "xvj.log")
             val logLine = "${System.currentTimeMillis()} $level $module $action $msg"
@@ -160,7 +165,8 @@ class MainActivity : AppCompatActivity() {
                     mqttHandler.post {
                         try {
                             val topic = "xvj/device/${fid}/log"
-                            // 新格式: 时间戳 级别 消息 (后端会解析第二个字段作为级别)
+                            // 新格式: 时间戳 级别 模块 动作 消息
+                            // 后端解析第二个字段(级别)存入 device_logs.level
                             val payload = "${System.currentTimeMillis()} $level $module $action $msg"
                             mqttClient?.publish(topic, payload.toByteArray(), 1, false)
                         } catch (e: Exception) { Log.e(TAG, "MQTT log failed: ${e.message}") }
@@ -398,6 +404,7 @@ class MainActivity : AppCompatActivity() {
         mqttClientId = "xvj_device_$deviceId"
 
         Log.d(TAG, "Device ID: $deviceId")
+    }
 
     private fun connectMQTT() {
         Log.d(TAG, "MQTT Server: $mqttServer")
