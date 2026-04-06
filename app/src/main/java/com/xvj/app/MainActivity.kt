@@ -143,21 +143,25 @@ class MainActivity : AppCompatActivity() {
      * 写入文件日志（xvj.log）
      * 若 debug_mode 开启，同时通过 MQTT 上报到 device_logs 表
      * @param msg 日志内容
+     * @param level 日志级别: ERROR, WARN, INFO, DEBUG
+     * @param module 模块: APP, MQTT, AUTH, SYNC, PLAYER, UI
+     * @param action 动作: START, STOP, ERROR, CONNECT, REGISTER, SYNC 等
      */
-    private fun logToFile(msg: String) {
+    private fun logToFile(level: String = "INFO", module: String = "APP", action: String = "LOG", msg: String) {
         try {
             val logFile = File(filesDir, "xvj.log")
-            PrintWriter(FileWriter(logFile, true)).use { it.println("${System.currentTimeMillis()} $msg") }
+            val logLine = "${System.currentTimeMillis()} $level $module $action $msg"
+            PrintWriter(FileWriter(logFile, true)).use { it.println(logLine) }
 
             // 只有debug_mode开启时才MQTT上报日志
             if (prefs.getBoolean("debug_mode", false)) {
-                val _msg = msg
                 val fid = deviceFingerprint
                 if (fid.isNotEmpty()) {
                     mqttHandler.post {
                         try {
                             val topic = "xvj/device/${fid}/log"
-                            val payload = "${System.currentTimeMillis()} $_msg"
+                            // 新格式: 时间戳 级别 消息 (后端会解析第二个字段作为级别)
+                            val payload = "${System.currentTimeMillis()} $level $module $action $msg"
                             mqttClient?.publish(topic, payload.toByteArray(), 1, false)
                         } catch (e: Exception) { Log.e(TAG, "MQTT log failed: ${e.message}") }
                     }
