@@ -139,6 +139,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 【A-11】 工具方法
+    // @tag: logToFile 日志记录 log文件 MQTT上报
+    // @tag: generateDeviceFingerprint 设备指纹生成
+    // @tag: sha256 md5计算 文件校验
     /**
      * 写入文件日志（xvj.log）
      * 若 debug_mode 开启，同时通过 MQTT 上报到 device_logs 表
@@ -424,6 +427,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 【A-02】 MQTT 连接
+    // @tag: connectMQTT mqtt连接 broker连接
     /**
      * 连接 MQTT Broker
      * - 设置 MqttConnectOptions（持久会话、保活15秒、30秒超时）
@@ -507,6 +511,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 【A-03】 设备注册 & 授权
+    // @tag: registerDevice 设备注册 authorization授权
     /**
      * 向云端注册设备
      */
@@ -724,6 +729,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 【A-04】 MQTT 消息处理 & 分发
+    // @tag: handleCommand 命令分发 mqtt命令处理
+    // @tag: requestAuthSync 授权请求 状态同步
     // 请求同步授权状态
     private fun requestAuthSync() {
         try {
@@ -929,6 +936,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 【A-05】 视频播放
+    // @tag: playFromUrl url播放 网络播放
+    // @tag: playFromCloud 云端播放 素材播放
+    // @tag: playLocalVideo 本地播放 文件播放
+    // @tag: downloadAndPlay 下载播放 边下边播
     /**
      * 从网络 URL 播放视频
      * @param url 视频文件网络 URL
@@ -1148,6 +1159,9 @@ class MainActivity : AppCompatActivity() {
     // 同步房间素材到本地文件夹
 
     // 【A-06】 素材同步
+    // @tag: syncRoomMaterials 素材同步 房间同步
+    // @tag: syncFolderWithIds 文件夹同步 下载同步
+    // @tag: deleteMaterialFile 删除素材 文件删除
     /**
      * 同步房间所有素材（Scene A + B）
      * @param roomId       房间 ID
