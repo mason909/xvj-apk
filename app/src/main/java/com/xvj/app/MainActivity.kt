@@ -2108,8 +2108,10 @@ class MainActivity : AppCompatActivity() {
      * 场景A无窗口时，自动创建全屏窗口1播放文件夹01
      */
     private fun applySceneConfigs(scenes: JSONObject?) {
+        logToFile("开始应用场景配置", "INFO", "WINDOW", "CONFIG")
         if (scenes == null) {
             Log.w(TAG, "applySceneConfigs: scenes 为空")
+            logToFile("scenes 为空，跳过窗口配置", "WARN", "WINDOW", "CONFIG")
             return
         }
 
@@ -2202,8 +2204,10 @@ class MainActivity : AppCompatActivity() {
 
     /** 创建单个窗口视图并加入 flSurface */
     private fun createWindowView(winId: String, w: JSONObject) {
+        logToFile("开始创建窗口: id=$winId", "INFO", "WINDOW", "CREATE")
         if (flSurface == null) {
             Log.e(TAG, "flSurface 为 null，无法创建窗口")
+            logToFile("flSurface 为 null，无法创建窗口", "ERROR", "WINDOW", "CREATE")
             return
         }
 
@@ -2280,8 +2284,10 @@ class MainActivity : AppCompatActivity() {
      */
 
     private fun playFolderInWindow(winId: String, folderId: String, folderPath: String) {
+        logToFile("开始播放窗口: winId=$winId, folderId=$folderId", "INFO", "PLAYBACK", "START")
         val player = windowPlayers[winId] ?: run {
             Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
+            logToFile("找不到窗口 $winId 的播放器", "ERROR", "PLAYBACK", "START")
             return
         }
         // scene-prefixed folderId：A01 → scenea/01/, B01 → sceneb/01/, 01 → 01/(root)
