@@ -171,12 +171,33 @@ class MainActivity : AppCompatActivity() {
                             // 新格式: 时间戳 级别 模块 动作 消息
                             // 后端解析第二个字段(级别)存入 device_logs.level
                             val payload = "${System.currentTimeMillis()} $level $module $action $msg"
-                            mqttClient?.publish(topic, payload.toByteArray(), 1, false)
-                        } catch (e: Exception) { Log.e(TAG, "MQTT log failed: ${e.message}") }
+                            if (mqttClient == null) {
+                                Log.e(TAG, "MQTT client is null, cannot send log")
+                            } else if (!mqttClient.isConnected) {
+                                Log.e(TAG, "MQTT not connected, cannot send log")
+                            } else {
+                                mqttClient.publish(topic, payload.toByteArray(), 1, false)
+                                Log.d(TAG, "Log sent via MQTT: $msg")
+                            }
+                        } catch (e: Exception) { 
+                            Log.e(TAG, "MQTT log failed: ${e.message}", e)
+                            // 也写入本地文件
+                            try {
+                                PrintWriter(FileWriter(File(filesDir, "xvj_mqtt_error.log"), true)).use { 
+                                    it.println("${System.currentTimeMillis()} ERROR LOG MQTT_FAIL ${e.message}")
+                                }
+                            } catch (e2: Exception) { }
+                        }
                     }
+                } else {
+                    Log.w(TAG, "Device fingerprint empty, cannot send log")
                 }
+            } else {
+                Log.d(TAG, "Debug mode off, log not sent via MQTT: $msg")
             }
-        } catch (e: Exception) { }
+        } catch (e: Exception) { 
+            Log.e(TAG, "logToFile failed: ${e.message}", e)
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
