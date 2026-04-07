@@ -168,9 +168,7 @@ class MainActivity : AppCompatActivity() {
                     mqttHandler.post {
                         try {
                             val topic = "xvj/device/${fid}/log"
-                            // 新格式: 时间戳 级别 模块 动作 消息
-                            // 后端解析第二个字段(级别)存入 device_logs.level
-                            val payload = "${System.currentTimeMillis()} $level $module $action $msg"
+                            val payload = "${System.currentTimeMillis()} $level $module $msg"
                             if (mqttClient == null) {
                                 Log.e(TAG, "MQTT client is null, cannot send log")
                             } else if (!mqttClient.isConnected) {
@@ -181,12 +179,6 @@ class MainActivity : AppCompatActivity() {
                             }
                         } catch (e: Exception) { 
                             Log.e(TAG, "MQTT log failed: ${e.message}", e)
-                            // 也写入本地文件
-                            try {
-                                PrintWriter(FileWriter(File(filesDir, "xvj_mqtt_error.log"), true)).use { 
-                                    it.println("${System.currentTimeMillis()} ERROR LOG MQTT_FAIL ${e.message}")
-                                }
-                            } catch (e2: Exception) { }
                         }
                     }
                 } else {
