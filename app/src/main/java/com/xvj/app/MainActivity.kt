@@ -49,6 +49,7 @@ import android.view.View
 import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import android.widget.FrameLayout
@@ -215,6 +216,29 @@ class MainActivity : AppCompatActivity() {
 
         // 使用 app 内部存储目录存放视频（不需要权限）
         videoFolderPath = filesDir.absolutePath
+
+        // 全局崩溃捕获：崩溃原因同步写本地并尽力同步 MQTT 上报。
+        // 不走 mqttHandler.post（主线程崩溃时队列任务不再执行），直接同步 publish
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                val crashMsg = "APP崩溃: ${throwable.javaClass.simpleName}: ${throwable.message}" +
+                    " at " + throwable.stackTrace.take(6).joinToString(" <- ") {
+                        "${it.className.substringAfterLast('.')}.${it.methodName}(${it.fileName}:${it.lineNumber})"
+                    }
+                PrintWriter(FileWriter(File(filesDir, "xvj.log"), true)).use {
+                    it.println("${System.currentTimeMillis()} ERROR APP $crashMsg")
+                }
+                val client = mqttClient
+                if (client != null && client.isConnected && deviceFingerprint.isNotEmpty()) {
+                    client.publish(
+                        "xvj/device/$deviceFingerprint/log",
+                        "${System.currentTimeMillis()} ERROR APP $crashMsg".toByteArray(), 1, false
+                    )
+                }
+            } catch (e: Exception) {}
+            defaultHandler?.uncaughtException(thread, throwable)
+        }
 
         logToFile("=== XVJ App Starting ===")
         logToFile("Video folder: $videoFolderPath")
@@ -759,6 +783,7 @@ class MainActivity : AppCompatActivity() {
         try {
             val cmd = JSONObject(json)
             val action = cmd.getString("action")
+            logToFile("收到命令: $action", "INFO", "MQTT", "COMMAND")
 
             when (action) {
                 "stop" -> {
@@ -1467,18 +1492,22 @@ class MainActivity : AppCompatActivity() {
             val connection = url.openConnection()
             connection.connectTimeout = 30000
             connection.readTimeout = 30000
+            var totalBytes = 0L
             connection.getInputStream().use { input ->
                 FileOutputStream(destFile).use { output ->
                     val buffer = ByteArray(65536)
                     var bytesRead: Int
                     while (input.read(buffer).also { bytesRead = it } != -1) {
                         output.write(buffer, 0, bytesRead)
+                        totalBytes += bytesRead
                     }
                 }
             }
             Log.d(TAG, "下载完成: ${destFile.name}")
+            logToFile("下载完成: ${destFile.name} (${totalBytes / 1024}KB)", "INFO", "SYNC", "DOWNLOAD")
         } catch (e: Exception) {
             Log.e(TAG, "下载失败: ${e.message}")
+            logToFile("下载失败: ${destFile.name} (${e.message})", "ERROR", "SYNC", "DOWNLOAD")
         }
     }
     
@@ -1871,22 +1900,30 @@ class MainActivity : AppCompatActivity() {
                         when {
                             entry == null -> {
                                 Log.w(TAG, "窗口 $winId [$type] 指定文件夹 $requested 不在场景 $sceneKey 的映射中，跳过播放")
+                                logToFile("窗口 [$type] 指定文件夹 $requested 不在场景 $sceneKey 映射中，跳过播放", "WARN", "PLAYBACK", "SKIP")
                                 null
                             }
                             entry.second.length() == 0 -> {
                                 Log.w(TAG, "窗口 $winId [$type] 指定文件夹 ${entry.first} 无素材，跳过播放")
+                                logToFile("窗口 [$type] 指定文件夹 ${entry.first} 无素材，跳过播放", "WARN", "PLAYBACK", "SKIP")
                                 null
                             }
                             else -> {
                                 Log.d(TAG, "窗口 $winId [$type] -> 指定文件夹 ${entry.first}")
+                                logToFile("窗口 [$type] -> 指定文件夹 ${entry.first}", "INFO", "PLAYBACK", "SELECT")
                                 prefixedPhysicalFolder(entry.first, sceneKey)
                             }
                         }
                     } else {
                         // 未指定：自动选场景中第一个有素材的文件夹（旧配置向后兼容）
                         val auto = allEntries.firstOrNull { it.second.length() > 0 }?.first
-                        if (auto == null) Log.d(TAG, "窗口 $winId [$type] 场景 $sceneKey 无素材，跳过播放")
-                        else Log.d(TAG, "窗口 $winId [$type] -> 自动选择文件夹 $auto")
+                        if (auto == null) {
+                            Log.d(TAG, "窗口 $winId [$type] 场景 $sceneKey 无素材，跳过播放")
+                            logToFile("窗口 [$type] 场景 $sceneKey 无素材，跳过播放（黑屏最常见原因）", "WARN", "PLAYBACK", "SKIP")
+                        } else {
+                            Log.d(TAG, "窗口 $winId [$type] -> 自动选择文件夹 $auto")
+                            logToFile("窗口 [$type] -> 自动选择文件夹 $auto", "INFO", "PLAYBACK", "SELECT")
+                        }
                         auto?.let { prefixedPhysicalFolder(it, sceneKey) }
                     }
                 }
@@ -2159,6 +2196,12 @@ class MainActivity : AppCompatActivity() {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
             setVideoTextureView(textureView)
+            addListener(object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) {
+                    // 播放器级错误（文件损坏/编码不支持/源丢失）此前只进 logcat，后台完全黑盒
+                    logToFile("窗口 $winId 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "PLAYBACK", "ERROR")
+                }
+            })
         }
         windowPlayers[winId] = player
 
@@ -2194,6 +2237,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (!physicalDir.exists()) {
             Log.w(TAG, "playFolderInWindow: 物理文件夹不存在 $physicalDir")
+            logToFile("窗口 $winId 播放失败: 物理文件夹不存在 ${physicalDir.name}", "ERROR", "PLAYBACK", "ERROR")
             return
         }
         val videos = physicalDir.listFiles()
@@ -2201,12 +2245,14 @@ class MainActivity : AppCompatActivity() {
             ?.sortedBy { it.name } ?: return
         if (videos.isEmpty()) {
             Log.w(TAG, "playFolderInWindow: 物理文件夹 $physicalDir 内无视频")
+            logToFile("窗口 $winId 播放失败: 文件夹 ${physicalDir.name} 内无视频文件", "WARN", "PLAYBACK", "SKIP")
             return
         }
         val items = videos.map { MediaItem.fromUri(Uri.fromFile(it)) }
         player.setMediaItems(items)
         player.prepare()
         Log.d(TAG, "窗口 $winId 开始播放 $folderId -> ${physicalDir.absolutePath} (${videos.size}个视频)")
+        logToFile("窗口 $winId 开始播放 $folderId (${videos.size}个视频)", "INFO", "PLAYBACK", "START")
     }
 
     /** 停止指定窗口的播放 */
