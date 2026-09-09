@@ -9,11 +9,9 @@
  * 【A-02】MQTT 连接（connectMQTT / onMqttConnected）
  * 【A-03】设备注册 & 授权（registerDevice / handleAuthResponse）
  * 【A-04】MQTT 消息处理 & 分发（handleCommand → when(action)）
- * 【A-05】视频播放（playFromUrl / playFromCloud / playLocalVideo）
  * 【A-06】素材同步（syncRoomMaterials / syncFolderWithIds / deleteMaterialFile）
- * 【A-07】窗口配置 & 渲染（applySceneConfigs / createWindowView / playFolderVideos）
+ * 【A-07】窗口配置 & 渲染（applySceneConfigs / createWindowView / playFolderInWindow）
  * 【A-08】场景切换（switchScene）
- * 【A-09】本地文件扫描（scanLocalVideos / loadVideosFromFolder）
  * 【A-10】权限 & 系统 UI（checkStoragePermission / hideSystemUI）
  * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint）
  * ─────────────────────────────────────────────────
@@ -86,14 +84,12 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var player: ExoPlayer? = null
-    private var videoList: MutableList<File> = mutableListOf()
 
     // 配置项
     private val prefs by lazy { getSharedPreferences("xvj_prefs", MODE_PRIVATE) }
     // 使用 app 内部存储目录，确保可写
     private var videoFolderPath: String = ""
     private var loopPlay: Boolean = true
-    private var autoPlay: Boolean = true
 
     // MQTT配置 - 云端地址
     private var mqttServer = "tcp://47.102.106.237:1883"
@@ -410,7 +406,6 @@ class MainActivity : AppCompatActivity() {
 
         // 本地配置
         loopPlay = prefs.getBoolean("loop_play", true)
-        autoPlay = prefs.getBoolean("auto_play", true)
         mqttServer = prefs.getString("mqtt_server", "tcp://47.102.106.237:1883") ?: "tcp://47.102.106.237:1883"
 
         // 恢复调试模式标志（MQTT 命令或 HTTP API 设置的值）
@@ -757,8 +752,8 @@ class MainActivity : AppCompatActivity() {
     /**
      * 处理 MQTT 命令
      * @param json 命令 JSON，包含 action 字段
-     * 支持的动作：play, play_local, push_file, stop, pause, resume, next,
-     *            config, sync, preset_sync, sync_room_materials, delete_material, update
+     * 支持的动作：stop, config, sync, preset_sync, sync_room_materials,
+     *            update_windows, delete_material, update
      */
     private fun handleCommand(json: String) {
         try {
@@ -766,53 +761,8 @@ class MainActivity : AppCompatActivity() {
             val action = cmd.getString("action")
 
             when (action) {
-                "play" -> {
-                    val url = cmd.optString("url", "")
-                    val videoId = cmd.optString("id", "")
-                    if (url.isNotEmpty()) {
-                        playFromUrl(url)
-                    } else if (videoId.isNotEmpty()) {
-                        playFromCloud(videoId)
-                    }
-                }
-                "play_local" -> {
-                    // scene-prefixed folder ID（A01, B02）
-                    val rawFolder = cmd.optString("folder", "01").trim()
-                    val filename = cmd.optString("filename", "")
-                    if (filename.isNotEmpty() && isValidFilepath(filename)) {
-                        val scenePrefix = if (rawFolder.length == 3 && rawFolder[0].isLetter()) rawFolder[0].uppercaseChar().toString() else "A"
-                        val folderNum = if (rawFolder.length == 3 && rawFolder[0].isLetter()) rawFolder.substring(1) else rawFolder
-                        val safeFolder = if (folderNum.matches(Regex("[0-9]{2}"))) folderNum else "01"
-                        playLocalVideo(scenePrefix + safeFolder, filename.trim())
-                    } else {
-                        Log.w(TAG, "play_local 拒绝非法参数: folder=$rawFolder, filename=$filename")
-                    }
-                }
-                "push_file" -> {
-                    // scene-prefixed folder ID（A01, B02）
-                    val rawFolder = cmd.optString("folder", "01").trim()
-                    val filename = cmd.optString("filename", "")
-                    val url = cmd.optString("url", "")
-                    if (filename.isNotEmpty() && isValidFilepath(filename) && url.isNotEmpty()) {
-                        val scenePrefix = if (rawFolder.length == 3 && rawFolder[0].isLetter()) rawFolder[0].uppercaseChar().toString() else "A"
-                        val folderNum = if (rawFolder.length == 3 && rawFolder[0].isLetter()) rawFolder.substring(1) else rawFolder
-                        val safeFolder = if (folderNum.matches(Regex("[0-9]{2}"))) folderNum else "01"
-                        downloadAndPlay(scenePrefix + safeFolder, filename.trim(), url)
-                    } else {
-                        Log.w(TAG, "push_file 拒绝非法参数: folder=$rawFolder, filename=$filename, url=$url")
-                    }
-                }
                 "stop" -> {
                     stopPlayback()
-                }
-                "pause" -> {
-                    player?.pause()
-                }
-                "resume" -> {
-                    player?.play()
-                }
-                "next" -> {
-                    player?.seekToNext()
                 }
                 "config" -> {
                     // 更新配置
@@ -952,176 +902,6 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Command parse error: ${e.message}")
-        }
-    }
-
-    // 【A-05】 视频播放
-    // @tag: playFromUrl url播放 网络播放
-    // @tag: playFromCloud 云端播放 素材播放
-    // @tag: playLocalVideo 本地播放 文件播放
-    // @tag: downloadAndPlay 下载播放 边下边播
-    /**
-     * 从网络 URL 播放视频
-     * @param url 视频文件网络 URL
-     */
-    private fun playFromUrl(url: String) {
-        Log.d(TAG, "Playing from URL: $url")
-        mqttHandler.post {
-            releasePlayer()
-            player = ExoPlayer.Builder(this).build().apply {
-                binding.playerView.player = this
-                val mediaItem = MediaItem.fromUri(url)
-                setMediaItems(listOf(mediaItem))
-                repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
-                playWhenReady = true
-                prepare()
-            }
-            binding.statusText?.text = "播放中"
-        }
-    }
-
-    /**
-     * 通过素材 ID 从云端播放视频
-     * @param videoId 云端素材 ID
-     * 流程：调用 /api/materials/{videoId} 获取 URL，再调用 playFromUrl 播放
-     */
-    private fun playFromCloud(videoId: String) {
-        Log.d(TAG, "Playing from cloud: $videoId")
-        mqttHandler.post {
-            binding.statusText?.text = "正在下载素材..."
-        }
-
-        downloadExecutor.submit {
-            try {
-                val apiUrl = "http://47.102.106.237/api/materials/$videoId"
-                val connection = java.net.URL(apiUrl).openConnection()
-                connection.connectTimeout = 10000
-                val response = connection.getInputStream().bufferedReader().readText()
-                val json = JSONObject(response)
-                val url = json.getString("url")
-                val videoUrl = "http://47.102.106.237$url"
-
-                playFromUrl(videoUrl)
-            } catch (e: Exception) {
-                Log.e(TAG, "Play from cloud error: ${e.message}")
-                mqttHandler.post {
-                    binding.statusText?.text = "素材下载失败"
-                }
-            }
-        }
-    }
-
-    /**
-     * 播放本地视频
-     * @param folder 文件夹名 (01-20)
-     * @param filename 文件名
-     */
-    // folder: scene-prefixed（A01, B02）或 numeric（01）
-    private fun playLocalVideo(folder: String, filename: String) {
-        // 解析 scene-prefixed folder（A01 → sceneA/01/filename）
-        val scenePrefixChar = if (folder.length == 3 && folder[0].isLetter()) folder[0] else null
-        val folderNum = scenePrefixChar?.let { folder.removePrefix(it.toString()) } ?: folder
-        val physicalFolder = if (scenePrefixChar != null) {
-            File(File(videoFolderPath, "scene" + scenePrefixChar.lowercaseChar()), folderNum)
-        } else {
-            File(videoFolderPath, folderNum)
-        }
-        val videoFile = File(physicalFolder, filename)
-        Log.d(TAG, "Playing local: ${videoFile.absolutePath}, exists=${videoFile.exists()}, size=${if(videoFile.exists()) videoFile.length() else 0}")
-
-        if (!videoFile.exists()) {
-            Log.w(TAG, "File not found: ${videoFile.absolutePath}, waiting for sync...")
-            mqttHandler.post {
-                binding.statusText?.text = "等待素材同步..."
-            }
-            return
-        }
-
-        mqttHandler.post {
-            try {
-                releasePlayer()
-                player = ExoPlayer.Builder(this).build().apply {
-                    binding.playerView.player = this
-                    val mediaItem = MediaItem.fromUri(android.net.Uri.parse("file://${android.net.Uri.encode(videoFile.absolutePath, null)}"))
-                    setMediaItems(listOf(mediaItem))
-                    repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
-                    playWhenReady = true
-                    prepare()
-                }
-                binding.statusText?.text = "播放: $folder/$filename"
-            } catch (e: Exception) {
-                Log.e(TAG, "ExoPlayer init error: ${e.message}")
-                binding.statusText?.text = "播放器初始化失败: ${e.message}"
-            }
-        }
-    }
-
-    /**
-     * 下载文件并播放
-     * @param folder 文件夹名 (01-20)
-     * @param filename 文件名
-     * @param url 云端URL
-     */
-    private fun downloadAndPlay(folder: String, filename: String, url: String) {
-        val serverUrl = if (url.startsWith("http")) url else "http://47.102.106.237$url"
-        // 解析 scene-prefixed folder（A01 → sceneA/01/filename）
-        val scenePrefixChar = if (folder.length == 3 && folder[0].isLetter()) folder[0] else null
-        val folderNum = scenePrefixChar?.let { folder.removePrefix(it.toString()) } ?: folder
-        val physicalFolder = if (scenePrefixChar != null) {
-            File(File(videoFolderPath, "scene" + scenePrefixChar.lowercaseChar()), folderNum)
-        } else {
-            File(videoFolderPath, folderNum)
-        }
-        val localFile = File(physicalFolder, filename)
-
-        Log.d(TAG, "Downloading: $serverUrl -> ${localFile.absolutePath}")
-                Log.d(TAG, "videoFolderPath=$videoFolderPath, physicalFolder=${physicalFolder.absolutePath}, exists=${physicalFolder.exists()}")
-        mqttHandler.post {
-            binding.statusText?.text = "正在下载素材..."
-        }
-
-        downloadExecutor.submit {
-            try {
-                // 确保文件夹存在
-                if (!physicalFolder.exists()) {
-                    physicalFolder.mkdirs()
-                }
-
-                // 下载文件
-                val connection = java.net.URL(serverUrl).openConnection()
-                connection.connectTimeout = 30000
-                connection.readTimeout = 30000
-                val input = connection.getInputStream()
-                val output = java.io.FileOutputStream(localFile)
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                while (input.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
-                }
-                output.close()
-                input.close()
-
-                Log.d(TAG, "Download complete: ${localFile.absolutePath} (${localFile.length()} bytes)")
-
-                // 下载完成后播放（完整 try-catch 确保异常不漏出）
-                try {
-                    mqttHandler.post {
-                        binding.statusText?.text = "下载完成，播放: $filename"
-                    }
-                    playLocalVideo(folder, filename)
-                } catch (e: Exception) {
-                    Log.e(TAG, "playLocalVideo exception: ${e.message}")
-                    mqttHandler.post {
-                        binding.statusText?.text = "播放失败: ${e.message}"
-                    }
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Download error: ${e.message}")
-                mqttHandler.post {
-                    binding.statusText?.text = "素材下载失败: ${e.message}"
-                }
-            }
         }
     }
 
@@ -1415,64 +1195,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 扫描并播放指定文件夹中的所有视频
-     * @param folderId 文件夹 ID（支持 scene-prefixed 格式，如 "A01"）
-     * 按文件名排序，循环播放所有视频文件
-     */
-    private fun playFolderVideos(folderId: String) {
-        Log.d(TAG, "playFolderVideos called: folderId=$folderId")
-        
-        // 已经在主线程执行，直接处理
-        // 先释放旧播放器
-        releasePlayer()
-        
-        // 确保文件夹存在
-        val folderDir = File(videoFolderPath, folderId)
-        Log.d(TAG, "Video folder path: ${folderDir.absolutePath}")
-        
-        if (!folderDir.exists()) {
-            folderDir.mkdirs()
-            Log.d(TAG, "Created folder: ${folderDir.absolutePath}")
-        }
-        
-        if (!folderDir.exists() || !folderDir.isDirectory) {
-            binding.statusText?.text = "无法创建文件夹: $folderId"
-            Log.e(TAG, "Cannot create folder: $folderId")
-            return
-        }
-        
-        val videos = folderDir.listFiles()?.filter { 
-            it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
-        }?.sortedBy { it.name } ?: emptyList()
-        
-        Log.d(TAG, "Found videos: ${videos.size}")
-        
-        if (videos.isEmpty()) {
-            binding.statusText?.text = "文件夹为空: $folderId"
-            Log.w(TAG, "Folder is empty: $folderId")
-            return
-        }
-        
-        videoList.clear()
-        videoList.addAll(videos)
-        
-        if (videoList.isNotEmpty()) {
-            // 直接创建新播放器播放
-            Log.d(TAG, "Creating new player for folder $folderId")
-            player = ExoPlayer.Builder(this).build().apply {
-                binding.playerView.player = this
-                val mediaItems = videoList.map { MediaItem.fromUri(android.net.Uri.fromFile(it)) }
-                setMediaItems(mediaItems)
-                repeatMode = Player.REPEAT_MODE_ALL
-                playWhenReady = true
-                prepare()
-            }
-            binding.statusText?.text = "播放文件夹$folderId: ${videoList.size}个视频"
-            Log.d(TAG, "Player created, 开始播放文件夹$folderId")
-        }
-    }
-
     // 【A-10】 权限 & 系统 UI
     /**
      * 检查并申请存储权限
@@ -1527,79 +1249,6 @@ class MainActivity : AppCompatActivity() {
                 or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
             )
         }
-    }
-
-    // 【A-09】 本地文件扫描
-    /**
-     * 扫描本地视频文件
-     * 优先扫描 videoFolderPath，若不存在则扫描默认路径（DCIM/Movies/Video/Download）
-     */
-    private fun scanLocalVideos() {
-        val dir = File(videoFolderPath)
-
-        if (!dir.exists() || !dir.isDirectory) {
-            scanDefaultPaths()
-            return
-        }
-
-        loadVideosFromFolder(dir)
-    }
-
-    /**
-     * 扫描默认路径列表，寻找第一个包含视频文件的目录
-     */
-    private fun scanDefaultPaths() {
-        val defaultPaths = listOf(
-            "/storage/emulated/0/DCIM",
-            "/storage/emulated/0/Movies",
-            "/storage/emulated/0/Video",
-            "/storage/emulated/0/VIDEOS",
-            "/storage/emulated/0/Download",
-            "/storage/emulated/0"
-        )
-
-        for (path in defaultPaths) {
-            val dir = File(path)
-            if (dir.exists() && dir.isDirectory) {
-                loadVideosFromFolder(dir)
-                if (videoList.isNotEmpty()) {
-                    return
-                }
-            }
-        }
-    }
-
-    /**
-     * 从指定目录加载视频文件列表
-     * @param dir 要扫描的目录
-     * 过滤常见视频扩展名，按文件名排序
-     */
-    private fun loadVideosFromFolder(dir: File) {
-        videoList = dir.listFiles()?.filter {
-            it.isFile && isVideoFile(it.extension)
-        }?.sortedBy { it.name }?.toMutableList() ?: mutableListOf()
-    }
-
-    private fun isVideoFile(ext: String): Boolean {
-        return ext.lowercase() in listOf("mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "3gp", "m4v")
-    }
-
-    private fun startPlayback() {
-        releasePlayer()
-
-        player = ExoPlayer.Builder(this).build().apply {
-            binding.playerView.player = this
-
-            val mediaItems = videoList.map { MediaItem.fromUri(it.toURI().toString()) }
-            setMediaItems(mediaItems)
-
-            repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
-            playWhenReady = autoPlay
-
-            prepare()
-        }
-
-        binding.statusText?.text = "播放本地视频: ${videoList.size}个"
     }
 
     private fun stopPlayback() {
