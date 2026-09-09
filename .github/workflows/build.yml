@@ -40,6 +40,23 @@ jobs:
           exit 1
         fi
 
+    - name: Diagnose failure
+      if: failure()
+      run: |
+        {
+          echo "## Gradle 失败摘要"
+          echo '```'
+          grep -E "^[eE]rror|e: |FAILURE:|What went wrong|> Task.*FAILED|Caused by" /tmp/gradle_output.txt | head -50
+          echo '```'
+          echo "### 末尾 120 行"
+          echo '```'
+          tail -120 /tmp/gradle_output.txt
+          echo '```'
+        } >> "${GITHUB_STEP_SUMMARY}"
+        grep -E "^[eE]rror|e: |FAILURE:|What went wrong|Caused by" /tmp/gradle_output.txt | head -30 | while IFS= read -r line; do
+          echo "::error::${line:0:300}"
+        done
+
     - name: Check APK exists
       id: check-apk
       run: |
