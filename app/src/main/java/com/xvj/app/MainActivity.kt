@@ -174,15 +174,17 @@ class MainActivity : AppCompatActivity() {
                         try {
                             val topic = "xvj/device/${fid}/log"
                             val payload = "${System.currentTimeMillis()} $level $module $msg"
-                            if (mqttClient == null) {
+                            // 局部 val 捕获：mqttClient 是可变属性，Kotlin 禁止判空后 smart cast
+                            val client = mqttClient
+                            if (client == null) {
                                 Log.e(TAG, "MQTT client is null, cannot send log")
-                            } else if (!mqttClient.isConnected) {
+                            } else if (!client.isConnected) {
                                 Log.e(TAG, "MQTT not connected, cannot send log")
                             } else {
-                                mqttClient.publish(topic, payload.toByteArray(), 1, false)
+                                client.publish(topic, payload.toByteArray(), 1, false)
                                 Log.d(TAG, "Log sent via MQTT: $msg")
                             }
-                        } catch (e: Exception) { 
+                        } catch (e: Exception) {
                             Log.e(TAG, "MQTT log failed: ${e.message}", e)
                         }
                     }
