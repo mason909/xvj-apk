@@ -53,12 +53,13 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
 import android.widget.FrameLayout
 import android.widget.TextView
 import android.view.Gravity
 import android.graphics.Color
+import android.graphics.Matrix
 import android.net.Uri
+import android.view.TextureView
 import org.json.JSONArray
 import com.xvj.app.databinding.ActivityMainBinding
 import org.eclipse.paho.client.mqttv3.*
@@ -107,6 +108,8 @@ class MainActivity : AppCompatActivity() {
     private val windowPlayers = mutableMapOf<String, ExoPlayer>()
     /** windowId -> View 实例（窗口视图）*/
     private val windowViews = mutableMapOf<String, View>()
+    /** windowId -> 内容签名（type|folderId|color|inputIndex），实时更新时判定结构变化用 */
+    private val windowContentSigs = mutableMapOf<String, String>()
     /** 默认窗口 ID（场景A默认播放文件夹01）*/
     private val DEFAULT_WINDOW_ID = "win_1"
     private val DEFAULT_FOLDER = "01"
@@ -128,8 +131,10 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "XVJPlayer"
-        const val VERSION = "1.2.0"
-        const val VERSION_CODE = 159
+        const val VERSION = "1.3.1"
+        const val VERSION_CODE = 161
+        /** 窗口容器内亮度遮罩视图的 tag 标识（实时更新时定位/增删遮罩） */
+        const val DIM_TAG = "xvj_dim"
         const val APK_URL = "http://47.102.106.237"
         private const val MQTT_TOPIC = "xvj/device/+/command"
         private const val AUTH_TOPIC = "xvj/auth/response"
@@ -613,6 +618,8 @@ class MainActivity : AppCompatActivity() {
                             if (scenes != null) {
                                 prefs.edit().putString("scenes_json", scenes.toString()).apply()
                                 Log.d(TAG, "授权成功，已保存 scenes: ${scenes.names()}")
+                                // 立即应用窗口配置（离线期间云端可能已改过布局）
+                                applySceneConfigs(scenes)
                                 // 服务器授权后可能分配新的 uuid，切换 MQTT 订阅到新 topic
                                 val newDeviceId = resp.optString("device_id", "")
                                 if (newDeviceId.isNotEmpty() && newDeviceId != deviceId) {
@@ -674,6 +681,8 @@ class MainActivity : AppCompatActivity() {
             try {
                 // 先释放旧播放器
                 releasePlayer()
+                // 清除多窗口（含视图），避免欢迎视频被旧窗口遮挡
+                releaseAllWindows()
 
                 // 创建新播放器播放欢迎视频
                 player = ExoPlayer.Builder(this@MainActivity).build().apply {
@@ -847,13 +856,14 @@ class MainActivity : AppCompatActivity() {
                     if (scenes != null) {
                         prefs.edit().putString("scenes_json", scenes.toString()).apply()
                         Log.d(TAG, "已保存 scenes 到本地: ${scenes.names()}")
-                        applySceneConfigs(scenes)
+                        // applySceneConfigs 含 addView/removeView 等 UI 操作，必须在主线程执行
+                        mqttHandler.post { applySceneConfigs(scenes) }
                     } else {
                         // 无 scenes 时尝试从本地缓存恢复（离线场景）
                         val cached = prefs.getString("scenes_json", null)
                         if (cached != null) {
                             try {
-                                applySceneConfigs(org.json.JSONObject(cached))
+                                mqttHandler.post { applySceneConfigs(org.json.JSONObject(cached)) }
                                 Log.d(TAG, "从本地缓存恢复 scenes 成功")
                             } catch (e: Exception) {
                                 Log.e(TAG, "从本地缓存恢复 scenes 失败: ${e.message}")
@@ -871,6 +881,18 @@ class MainActivity : AppCompatActivity() {
                         syncRoomMaterialsAllScenes(roomId, folderMappings, scenes)
                     } else {
                         logToFile("folderMappings 为 null，跳过素材同步")
+                    }
+                }
+                "update_windows" -> {
+                    // 实时窗口预览（云端编辑器拖动/调参的轻量推送）：
+                    // 只更新现有视图的位置/透明度/亮度/变换，不动播放器不触发素材同步；
+                    // 结构变化（增删窗口/内容/显隐/z序）内部自动回退全量重建
+                    val scenes = cmd.optJSONObject("scenes")
+                    if (scenes != null) {
+                        prefs.edit().putString("scenes_json", scenes.toString()).apply()
+                        mqttHandler.post { applyLiveWindowUpdate(scenes) }
+                    } else {
+                        logToFile("update_windows: scenes 为空，忽略", "WARN", "WINDOW", "CONFIG")
                     }
                 }
                 "delete_material" -> {
@@ -2135,15 +2157,11 @@ class MainActivity : AppCompatActivity() {
         // 移除旧的窗口视图
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
+        windowContentSigs.clear()
 
-        // 收集所有场景的窗口，A 和 B 的 windows 合并后统一处理
-        // currentSceneId（外部信号状态）仅决定初始文件夹，后续 RS485 切换时各窗口自行更新
-        val allWindows = JSONArray()
-        scenes.keys().forEach { sceneKey ->
-            scenes.optJSONObject(sceneKey)?.optJSONArray("windows")?.let { arr ->
-                for (i in 0 until arr.length()) { allWindows.put(arr.getJSONObject(i)) }
-            }
-        }
+        // 收集所有场景的窗口，A 和 B 的 windows 合并后统一渲染
+        // 每个窗口播什么由自身 content.type/folderId 决定，与 currentSceneId（RS485 预留）无关
+        val allWindows = mergeSceneWindows(scenes)
 
         // 若所有场景均无窗口，为 Scene A 创建默认全屏窗口
         if (allWindows.length() == 0) {
@@ -2170,7 +2188,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 每个窗口根据自身 content.type 播放对应文件夹，与 currentSceneId 完全解耦
+        // 每个窗口根据自身 content.type 播放对应文件夹（SCENE_A/SCENE_B 指向各自场景的素材）
         windowPlayers.forEach { (winId, player) ->
             // 找到对应窗口的 content 配置（遍历 allWindows 查找）
             val winObj = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }.find { it.optString("id") == winId }
@@ -2179,22 +2197,39 @@ class MainActivity : AppCompatActivity() {
 
             val folderId: String? = when (type) {
                 "SCENE_A", "SCENE_B" -> {
-                    // 用窗口的 content.type（SCENE_A/SCENE_B）直接映射到对应场景的 folder_mappings
-                    // scene-prefixed folderId：A01/B01 格式，物理隔离不同场景的文件夹
+                    // 场景 folder_mappings 的 key 已带场景前缀（A01/B01，见 buildPrefixedScenes）
                     val sceneKey = type.removePrefix("SCENE_")  // "SCENE_A" → "A"
                     val sceneData = scenes.optJSONObject(sceneKey)
                     val mappings = sceneData?.optJSONObject("folder_mappings") ?: JSONObject()
-                    val folderEntries = mappings.keys().asSequence()
-                        .map { folderId -> folderId to (mappings.get(folderId) as? org.json.JSONArray ?: org.json.JSONArray()) }
-                        .filter { (_, ids) -> ids.length() > 0 }  // 跳过空数组（无素材的文件夹）
+                    val allEntries = mappings.keys().asSequence()
+                        .map { fid -> fid to (mappings.get(fid) as? org.json.JSONArray ?: org.json.JSONArray()) }
                         .toList()
-                    if (folderEntries.isEmpty()) {
-                        Log.d(TAG, "窗口 $winId [${type}] 场景 $sceneKey 无素材，跳过播放")
-                        null
+                    // 指定了文件夹（content.folderId，纯编号如 "02"）：只播指定目录，
+                    // 该目录无素材/未映射时告警跳过，不偷偷换播别的文件夹
+                    val requested = content.optString("folderId", "").trim()
+                    if (requested.isNotEmpty()) {
+                        val entry = allEntries.find { it.first == sceneKey + requested }
+                            ?: allEntries.find { it.first == requested }  // 兼容已带前缀的 folderId
+                        when {
+                            entry == null -> {
+                                Log.w(TAG, "窗口 $winId [$type] 指定文件夹 $requested 不在场景 $sceneKey 的映射中，跳过播放")
+                                null
+                            }
+                            entry.second.length() == 0 -> {
+                                Log.w(TAG, "窗口 $winId [$type] 指定文件夹 ${entry.first} 无素材，跳过播放")
+                                null
+                            }
+                            else -> {
+                                Log.d(TAG, "窗口 $winId [$type] -> 指定文件夹 ${entry.first}")
+                                entry.first
+                            }
+                        }
                     } else {
-                        val (folderId, _) = folderEntries.first()
-                        Log.d(TAG, "窗口 $winId [${type}] -> 场景 $sceneKey 文件夹 $folderId (由 playFolderInWindow 解析到物理路径)")
-                        folderId
+                        // 未指定：自动选场景中第一个有素材的文件夹（旧配置向后兼容）
+                        val auto = allEntries.firstOrNull { it.second.length() > 0 }?.first
+                        if (auto == null) Log.d(TAG, "窗口 $winId [$type] 场景 $sceneKey 无素材，跳过播放")
+                        else Log.d(TAG, "窗口 $winId [$type] -> 自动选择文件夹 $auto")
+                        auto
                     }
                 }
                 "HDMI", "VIDEO_INPUT" -> "01"  // HDMI 输入默认文件夹01
@@ -2215,6 +2250,117 @@ class MainActivity : AppCompatActivity() {
         return JSONArray(list)
     }
 
+    /** 合并 A/B 场景窗口并打上各自 master 亮度标记（scenes.A/B.master.brightness → _masterB） */
+    private fun mergeSceneWindows(scenes: JSONObject): JSONArray {
+        val allWindows = JSONArray()
+        scenes.keys().forEach { sceneKey ->
+            val sceneObj = scenes.optJSONObject(sceneKey)
+            // 此 scenes 为每次 MQTT/启动时新解析的临时对象，打标不会污染持久化数据
+            val sceneMasterB = sceneObj?.optJSONObject("master")?.optDouble("brightness", 1.0) ?: 1.0
+            sceneObj?.optJSONArray("windows")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val wObj = arr.getJSONObject(i)
+                    wObj.put("_masterB", sceneMasterB)
+                    allWindows.put(wObj)
+                }
+            }
+        }
+        return allWindows
+    }
+
+    /** 窗口内容签名：type/folderId/color/inputIndex 任一变化即视为结构变化（需重建播放器） */
+    private fun contentSignature(c: JSONObject): String =
+        c.optString("type", "SCENE_A").uppercase() + "|" + c.optString("folderId", "") +
+            "|" + c.optString("color", "") + "|" + c.optInt("inputIndex", 0)
+
+    /**
+     * 实时窗口更新（update_windows 轻量路径）：编辑器拖动/调参的亚秒级跟随。
+     * 仅几何/视觉属性变化 → 原地改 LayoutParams/alpha/遮罩/矩阵，播放器持续播放不重建；
+     * 结构变化（窗口增删/内容签名/显隐/z序）→ 回退 applySceneConfigs 全量重建。
+     */
+    private fun applyLiveWindowUpdate(scenes: JSONObject) {
+        val allWindows = mergeSceneWindows(scenes)
+        val desiredSorted = sortWindowsByZ(allWindows).let { arr ->
+            (0 until arr.length()).map { arr.getJSONObject(it) }.filter { it.optBoolean("enabled", true) }
+        }
+        val desiredIds = desiredSorted.map { it.optString("id") }
+
+        // 当前 flSurface 上窗口容器的 z 序（后加入者在上层）
+        val currentIds = mutableListOf<String>()
+        flSurface?.let { fs ->
+            for (i in 0 until fs.childCount) {
+                val ch = fs.getChildAt(i)
+                for ((k, v) in windowViews) if (v === ch) { currentIds.add(k); break }
+            }
+        }
+
+        var structural = desiredIds != currentIds
+        if (!structural) {
+            for (w in desiredSorted) {
+                val winId = w.optString("id")
+                if (windowContentSigs[winId] != contentSignature(w.optJSONObject("content") ?: JSONObject())) {
+                    structural = true
+                    break
+                }
+            }
+        }
+        if (structural) {
+            logToFile("实时更新含结构变化，回退全量重建", "INFO", "WINDOW", "CONFIG")
+            applySceneConfigs(scenes)
+            return
+        }
+
+        val dm = resources.displayMetrics
+        val sx = dm.widthPixels.toFloat() / 1920f
+        val sy = dm.heightPixels.toFloat() / 1080f
+
+        for (w in desiredSorted) {
+            val winId = w.optString("id")
+            val c = windowViews[winId] as? FrameLayout ?: continue
+
+            val x = Math.round(w.optInt("x", 0) * sx)
+            val y = Math.round(w.optInt("y", 0) * sy)
+            val wd = Math.round(w.optInt("width", 1920).coerceAtLeast(64) * sx)
+            val ht = Math.round(w.optInt("height", 1080).coerceAtLeast(64) * sy)
+            val p = c.layoutParams as? FrameLayout.LayoutParams ?: continue
+            if (p.leftMargin != x || p.topMargin != y || p.width != wd || p.height != ht) {
+                p.leftMargin = x
+                p.topMargin = y
+                p.width = wd
+                p.height = ht
+                c.layoutParams = p
+            }
+
+            c.alpha = w.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f)
+
+            val effB = (w.optDouble("brightness", 1.0).toFloat() * w.optDouble("_masterB", 1.0).toFloat()).coerceIn(0f, 1f)
+            var dim: View? = null
+            for (i in 0 until c.childCount) {
+                val ch = c.getChildAt(i)
+                if (ch.tag == DIM_TAG) { dim = ch; break }
+            }
+            if (effB < 1f) {
+                if (dim == null) {
+                    val d = View(this).apply {
+                        setBackgroundColor(Color.BLACK)
+                        alpha = 1f - effB
+                        tag = DIM_TAG
+                    }
+                    c.addView(d, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                } else {
+                    dim.alpha = 1f - effB
+                }
+            } else {
+                dim?.let { c.removeView(it) }
+            }
+
+            // 布局稳定后重算旋转/镜像矩阵（90°/270° 预缩放依赖视图实际尺寸）
+            val cv = c.getChildAt(0)
+            if (cv != null) c.post { applyFlipRotation(cv, w) }
+        }
+        Log.d(TAG, "applyLiveWindowUpdate: 轻量应用 ${desiredSorted.size} 个窗口")
+    }
+
     /** 创建单个窗口视图并加入 flSurface */
     private fun createWindowView(winId: String, w: JSONObject) {
         logToFile("开始创建窗口: id=$winId", "INFO", "WINDOW", "CREATE")
@@ -2224,10 +2370,22 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val x = w.optInt("x", 0)
-        val y = w.optInt("y", 0)
-        val width = w.optInt("width", 1920).coerceAtLeast(64)
-        val height = w.optInt("height", 1080).coerceAtLeast(64)
+        // Arena 对标：enabled=false 的窗口不创建视图、不占用 ExoPlayer 实例
+        if (!w.optBoolean("enabled", true)) {
+            Log.d(TAG, "窗口 $winId enabled=false，跳过创建")
+            logToFile("窗口 $winId 已隐藏(enabled=false)，跳过创建", "INFO", "WINDOW", "CREATE")
+            return
+        }
+
+        // 分辨率适配：云端编辑器画布固定为 1920x1080，窗口坐标/尺寸按设备真实分辨率轴向等比换算，
+        // 保证在 4K、竖屏盒子等非 1080p 设备上布局与设计稿占屏比例一致
+        val dm = resources.displayMetrics
+        val scaleX = dm.widthPixels.toFloat() / 1920f
+        val scaleY = dm.heightPixels.toFloat() / 1080f
+        val x = Math.round(w.optInt("x", 0) * scaleX)
+        val y = Math.round(w.optInt("y", 0) * scaleY)
+        val width = Math.round(w.optInt("width", 1920).coerceAtLeast(64) * scaleX)
+        val height = Math.round(w.optInt("height", 1080).coerceAtLeast(64) * scaleY)
 
         val content = w.optJSONObject("content") ?: JSONObject()
         val type = content.optString("type", "SCENE_A").uppercase()
@@ -2238,15 +2396,73 @@ class MainActivity : AppCompatActivity() {
             else    -> createVideoWindowView(winId, w, content)  // VIDEO / 默认
         }
 
+        // Arena 对标属性：透明度直接作用容器；亮度=窗口亮度×所在屏总亮度，用黑色遮罩实现
+        // （ExoPlayer 无直接亮度接口，遮罩法对 COLOR/VIDEO/HDMI 三类内容统一适用）
+        val opacity = w.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f)
+        val brightness = w.optDouble("brightness", 1.0).toFloat().coerceIn(0f, 1f)
+        val masterB = w.optDouble("_masterB", 1.0).toFloat().coerceIn(0f, 1f)
+        val effB = (brightness * masterB).coerceIn(0f, 1f)
+
+        val container = FrameLayout(this).apply { alpha = opacity }
+        container.addView(view, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        if (effB < 1f) {
+            val dim = View(this).apply {
+                setBackgroundColor(Color.BLACK)
+                alpha = 1f - effB
+                tag = DIM_TAG
+            }
+            container.addView(dim, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        }
+
         val params = FrameLayout.LayoutParams(width, height).apply {
             leftMargin = x
             topMargin = y
             gravity = Gravity.TOP or Gravity.START
         }
 
-        flSurface?.addView(view, params)
-        windowViews[winId] = view
-        Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y)")
+        flSurface?.addView(container, params)
+        windowViews[winId] = container
+        windowContentSigs[winId] = contentSignature(content)
+        // 布局完成后应用旋转/镜像（矩阵中心依赖实际视图尺寸）
+        container.post { applyFlipRotation(view, w) }
+        Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y) opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)}")
+    }
+
+    /**
+     * Arena 对标：窗口内容在框内旋转/镜像（窗口 x/y/w/h 不变）。
+     * TextureView 用矩阵（90°/270° 时预缩放使内容填满非方形框）；普通 View 用 rotation/scale 属性。
+     */
+    private fun applyFlipRotation(view: View, w: JSONObject) {
+        val rot = w.optInt("rotation", 0)
+        val flip = w.optString("flip", "none")
+        if (rot == 0 && flip == "none") return
+        val vw = view.width.toFloat()
+        val vh = view.height.toFloat()
+        if (vw <= 0f || vh <= 0f) return
+        val cx = vw / 2f
+        val cy = vh / 2f
+        if (view is TextureView) {
+            val m = Matrix()
+            if (rot == 90 || rot == 270) {
+                m.postScale(vh / vw, vw / vh, cx, cy)
+            }
+            m.postRotate(rot.toFloat(), cx, cy)
+            if (flip == "h") m.postScale(-1f, 1f, cx, cy)
+            if (flip == "v") m.postScale(1f, -1f, cx, cy)
+            view.setTransform(m)
+        } else {
+            var sx = 1f
+            var sy = 1f
+            if (rot == 90 || rot == 270) {
+                sx = vh / vw
+                sy = vw / vh
+            }
+            if (flip == "h") sx = -sx
+            if (flip == "v") sy = -sy
+            view.rotation = rot.toFloat()
+            view.scaleX = sx
+            view.scaleY = sy
+        }
     }
 
     /** 纯色背景窗口 */
@@ -2258,7 +2474,6 @@ class MainActivity : AppCompatActivity() {
             text = name
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            alpha = 0.85f
         }
     }
 
@@ -2273,20 +2488,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 视频播放窗口（每个窗口独立 ExoPlayer）*/
+    /** 视频播放窗口（每个窗口独立 ExoPlayer，TextureView 承载以支持旋转/镜像矩阵变换）*/
     private fun createVideoWindowView(winId: String, w: JSONObject, content: JSONObject): View {
-        val playerView = PlayerView(this).apply {
-            useController = false
-            setBackgroundColor(Color.BLACK)
-        }
+        val container = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val textureView = TextureView(this)
+        container.addView(textureView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         val player = ExoPlayer.Builder(this).build().apply {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
+            setVideoTextureView(textureView)
         }
-        playerView.player = player
         windowPlayers[winId] = player
 
-        return playerView
+        return container
     }
 
     /**
