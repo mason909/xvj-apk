@@ -1248,7 +1248,8 @@ class MainActivity : AppCompatActivity() {
                 for (i in 1..30) {
                     val folderNum = String.format("%02d", i)
                     val prefixedKey = scenePrefix + folderNum  // "A01", "B02"
-                    val materialIds = folderMappings.optJSONArray(folderNum)
+                    // folder_mappings 键格式兼容：授权/notify 路径带场景前缀（"A01"），房间同步路径为纯编号（"01"）
+                    val materialIds = folderMappings.optJSONArray(prefixedKey) ?: folderMappings.optJSONArray(folderNum)
                     if (materialIds != null && materialIds.length() > 0) {
                         val cloudList = allMaterials[prefixedKey]
                         syncFolderWithIds(prefixedKey, materialIds, cloudList)
@@ -1388,7 +1389,13 @@ class MainActivity : AppCompatActivity() {
      */
     private fun deleteFolderFiles(folderId: String) {
         try {
-            val localFolder = File(videoFolderPath, folderId)
+            // 与 syncFolderWithIds 落盘目录一致：A01 → scenea/01，纯编号 → 根目录
+            val prefixChar = if (folderId.length == 3 && folderId[0].isLetter()) folderId[0].lowercaseChar() else null
+            val localFolder = if (prefixChar != null) {
+                File(File(videoFolderPath, "scene" + prefixChar), folderId.substring(1))
+            } else {
+                File(videoFolderPath, folderId)
+            }
             if (!localFolder.exists()) return
             val files = localFolder.listFiles()?.filter {
                 it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
@@ -2223,7 +2230,7 @@ class MainActivity : AppCompatActivity() {
                             }
                             else -> {
                                 Log.d(TAG, "窗口 $winId [$type] -> 指定文件夹 ${entry.first}")
-                                entry.first
+                                prefixedPhysicalFolder(entry.first, sceneKey)
                             }
                         }
                     } else {
@@ -2231,7 +2238,7 @@ class MainActivity : AppCompatActivity() {
                         val auto = allEntries.firstOrNull { it.second.length() > 0 }?.first
                         if (auto == null) Log.d(TAG, "窗口 $winId [$type] 场景 $sceneKey 无素材，跳过播放")
                         else Log.d(TAG, "窗口 $winId [$type] -> 自动选择文件夹 $auto")
-                        auto
+                        auto?.let { prefixedPhysicalFolder(it, sceneKey) }
                     }
                 }
                 "HDMI", "VIDEO_INPUT" -> "01"  // HDMI 输入默认文件夹01
@@ -2274,6 +2281,10 @@ class MainActivity : AppCompatActivity() {
     private fun contentSignature(c: JSONObject): String =
         c.optString("type", "SCENE_A").uppercase() + "|" + c.optString("folderId", "") +
             "|" + c.optString("color", "") + "|" + c.optInt("inputIndex", 0)
+
+    /** 物理文件夹统一带场景前缀：映射键可能是 "01"（纯编号）或 "A01"，但落盘/播放目录只认 scenea/01 形态 */
+    private fun prefixedPhysicalFolder(key: String, sceneKey: String): String =
+        if (key.startsWith(sceneKey)) key else sceneKey + key
 
     /**
      * 实时窗口更新（update_windows 轻量路径）：编辑器拖动/调参的亚秒级跟随。
