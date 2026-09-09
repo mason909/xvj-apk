@@ -9,7 +9,7 @@
  * 【A-02】MQTT 连接（connectMQTT / onMqttConnected）
  * 【A-03】设备注册 & 授权（registerDevice / handleAuthResponse）
  * 【A-04】MQTT 消息处理 & 分发（handleCommand → when(action)）
- * 【A-06】素材同步（syncRoomMaterials / syncFolderWithIds / deleteMaterialFile）
+ * 【A-06】素材同步（syncRoomMaterialsAllScenes / fetchRoomMaterials / syncSceneFolders / syncFolderWithIds / deleteMaterialFile）
  * 【A-07】窗口配置 & 渲染（applySceneConfigs / createWindowView / playFolderInWindow）
  * 【A-08】场景切换（switchScene）
  * 【A-10】权限 & 系统 UI（checkStoragePermission / hideSystemUI）
@@ -19,9 +19,9 @@
  * 核心流程：
  *   1. MQTT 连接（持久连接，复用于所有通信）
  *   2. 设备注册 → authorized=1 → 等待房间分配
- *   3. syncRoomMaterials() → /api/room-materials/{roomId}
- *      → 下载文件夹 → 精确同步本地文件
- *   4. 播放循环：按 folder_mappings 顺序播放
+ *   3. sync_room_materials 命令 → /api/room-materials-v2/{roomId} 拉全量清单
+ *      → 按 Scene A/B 逐文件夹 ETag 对账（缺的下、多的删）
+ *   4. 播放循环：applySceneConfigs 按 scenes 配置渲染窗口
  * 
  * 房间调试模式（debug_mode）：
  *   - 由 /api/room-materials 响应中的 debug 字段控制
@@ -652,12 +652,11 @@ class MainActivity : AppCompatActivity() {
                                     Log.d(TAG, "授权后更新订阅: $newCommandTopic")
                                 }
                             }
-                            // 保存 folder_mappings 并合并 A+B 一次同步
-                            if (folderMappings != null) {
-                                prefs.edit().putString("room_folder_mappings", folderMappings.toString()).apply()
-                                Log.d(TAG, "授权成功: room_id=$roomId, folder_mappings=$folderMappings")
+                            // 触发素材同步（映射真相在 scenes 里，folderMappings 仅作旧服务端兜底）
+                            if (folderMappings != null || scenes != null) {
+                                Log.d(TAG, "授权成功: room_id=$roomId")
                                 logToFile("开始根据房间配置同步素材...")
-                                syncRoomMaterialsAllScenes(roomId, folderMappings, scenes)
+                                syncRoomMaterialsAllScenes(roomId, folderMappings ?: org.json.JSONObject(), scenes)
                             }
                         } else {
                             binding.statusText?.text = "设备未授权"
@@ -673,7 +672,6 @@ class MainActivity : AppCompatActivity() {
                         prefs.edit()
                             .putBoolean("authorized", false)
                             .remove("room_id")
-                            .remove("folder_mappings")
                             .apply()
                         showUnauthorizedAlert("设备已被远程废止，请联系管理员")
                     }
@@ -800,16 +798,6 @@ class MainActivity : AppCompatActivity() {
                         player?.repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
                     }
                 }
-                "sync" -> {
-                    val roomId = prefs.getString("room_id", "") ?: ""
-                    val mappingsStr = prefs.getString("room_folder_mappings", "{}") ?: "{}"
-                    val scenesStr = prefs.getString("scenes_json", null)
-                    if (roomId.isNotEmpty()) {
-                        val scenes = scenesStr?.let { try { org.json.JSONObject(it) } catch(e: Exception) { null } }
-                        val folderMappingsA = org.json.JSONObject(mappingsStr)
-                        syncRoomMaterialsAllScenes(roomId, folderMappingsA, scenes)
-                    }
-                }
                 "preset_sync" -> {
                     // 接收预设素材同步
                     val folders = cmd.optJSONArray("folders")
@@ -849,15 +837,15 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
-                    // 合并 Scene A + B 的 folder_mappings，一次调用，避免覆盖问题
-                    if (folderMappings != null) {
+                    // 合并 Scene A + B，一次同步完成（映射真相在 scenes 里，folderMappings 为兜底）
+                    if (folderMappings != null || scenes != null) {
                         val foldersStr = java.lang.StringBuilder()
-                        val k = folderMappings.keys()
-                        while (k.hasNext()) { foldersStr.append(k.next()).append(",") }
+                        val k = folderMappings?.keys()
+                        k?.let { while (it.hasNext()) { foldersStr.append(it.next()).append(",") } }
                         logToFile("准备同步素材: roomId=$roomId, folders=" + foldersStr)
-                        syncRoomMaterialsAllScenes(roomId, folderMappings, scenes)
+                        syncRoomMaterialsAllScenes(roomId, folderMappings ?: org.json.JSONObject(), scenes)
                     } else {
-                        logToFile("folderMappings 为 null，跳过素材同步")
+                        logToFile("folderMappings 与 scenes 均为 null，跳过素材同步")
                     }
                 }
                 "update_windows" -> {
@@ -990,27 +978,12 @@ class MainActivity : AppCompatActivity() {
     /**
      * 同步房间所有素材（Scene A + B）
      * @param roomId       房间 ID
-     * @param folderMappingsA  Scene A 的 folder_mappings
+     * @param folderMappingsFallback 旧版服务端 folder_mappings 字段兜底（新服务端读 scenes）
      * @param scenes       完整 scenes JSON（包含 A/B 两套配置）
-     * 流程：分别调用 syncRoomMaterials 同步 Scene A 和 Scene B
      */
-    // 同步房间素材主流程：调用 /api/room-materials/:roomId 一次性获取所有文件夹的素材，再精确同步
-    // 分别同步 Scene A 和 B，不合并（避免 B 的 numeric key 覆盖 A）
-    private fun syncRoomMaterialsAllScenes(roomId: String, folderMappingsA: org.json.JSONObject, scenes: org.json.JSONObject?) {
-        scenesJsonCache = scenes  // 缓存供 syncRoomMaterials 写入 prefs
-        // 先同步 Scene A（HTTP API 返回 "A01"、"A02"...）
-        syncRoomMaterials(roomId, folderMappingsA, "A")
-        // 再同步 Scene B（HTTP API 返回 "B01"、"B02"...）
-        scenes?.optJSONObject("B")?.optJSONObject("folder_mappings")?.let { fmB ->
-            syncRoomMaterials(roomId, fmB, "B")
-        }
-    }
-
-    // scenePrefix: "A" 或 "B"，用于拼接 HTTP API 返回的 scene-prefixed folder key（如 "A01"）
-    // scenesJsonCache: 缓存 scenes JSON，供 syncRoomMaterials 写入 SharedPreferences（MQTT sync 命令需要）
-    private var scenesJsonCache: org.json.JSONObject? = null
-
-    private fun syncRoomMaterials(roomId: String, folderMappings: org.json.JSONObject, scenePrefix: String) {
+    // 同步房间素材主流程：一次 HTTP 拉取 A+B 全量清单，A/B 两幕对账后统一应用场景配置。
+    // 素材映射唯一真相是 scenes.A/B.folder_mappings；folderMappingsFallback 仅兼容旧版服务端字段
+    private fun syncRoomMaterialsAllScenes(roomId: String, folderMappingsFallback: org.json.JSONObject, scenes: org.json.JSONObject?) {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
         }
@@ -1019,57 +992,26 @@ class MainActivity : AppCompatActivity() {
             try {
                 prefs.edit()
                     .putString("current_room_id", roomId)
-                    .putString("room_folder_mappings", folderMappings.toString())
-                    .putString("scenes_json", scenesJsonCache?.toString() ?: "")
+                    .putString("scenes_json", scenes?.toString() ?: "")
                     .apply()
 
-                // 一次性获取该房间所有素材（合并 materials + preset_materials）
-                // v2: 使用 /api/room-materials-v2/ 同时查 materials + preset_materials 表
-                val allMaterials = mutableMapOf<String, org.json.JSONArray>() // folderId -> materials[]
-                try {
-                    val apiUrl = java.net.URL(APK_URL + "/api/room-materials-v2/" + roomId)
-                    logToFile("HTTP 请求: $apiUrl")
-                    val connection = apiUrl.openConnection()
-                    connection.connectTimeout = 15000
-                    connection.readTimeout = 30000
-                    val response = connection.inputStream.bufferedReader().readText()
-                    logToFile("HTTP 响应长度: ${response.length}, 前100字符: ${response.take(100)}")
-                    val resultJson = org.json.JSONObject(response)
-                    // 解析成 { "A01": [...], "A02": [...], "B01": [...] } 结构（scene-prefixed keys）
-                    val keys = resultJson.keys()
-                    while (keys.hasNext()) {
-                        val folderId = keys.next()
-                        if (folderId != "debug") {
-                            allMaterials[folderId] = resultJson.getJSONArray(folderId)
-                        }
-                    }
-                    logToFile("获取房间素材成功: " + allMaterials.size + " 个文件夹")
-                } catch (e: Exception) {
-                    Log.e(TAG, "获取房间素材失败: " + e.message)
-                    logToFile("获取房间素材失败: " + e.message)
-                }
+                val fmA = scenes?.optJSONObject("A")?.optJSONObject("folder_mappings") ?: folderMappingsFallback
+                val fmB = scenes?.optJSONObject("B")?.optJSONObject("folder_mappings") ?: org.json.JSONObject()
 
-                // 遍历30个文件夹，拼接 scene-prefixed key（如 scenePrefix="A" + "01" → "A01"）
-                for (i in 1..30) {
-                    val folderNum = String.format("%02d", i)
-                    val prefixedKey = scenePrefix + folderNum  // "A01", "B02"
-                    // folder_mappings 键格式兼容：授权/notify 路径带场景前缀（"A01"），房间同步路径为纯编号（"01"）
-                    val materialIds = folderMappings.optJSONArray(prefixedKey) ?: folderMappings.optJSONArray(folderNum)
-                    if (materialIds != null && materialIds.length() > 0) {
-                        val cloudList = allMaterials[prefixedKey]
-                        syncFolderWithIds(prefixedKey, materialIds, cloudList)
-                    } else {
-                        deleteFolderFiles(prefixedKey)
-                    }
-                }
+                // 拉取失败返回 null：保持本地现状中止本轮，绝不进入清空分支
+                val allMaterials = fetchRoomMaterials(roomId) ?: return@submit
+
+                syncSceneFolders("A", fmA, allMaterials)
+                syncSceneFolders("B", fmB, allMaterials)
 
                 mqttHandler.post {
                     binding.statusText?.text = "素材同步完成"
-                    // 素材同步完成后，应用场景配置并开始默认播放
-                    val scenesJson = prefs.getString("scenes_json", null)
-                    if (scenesJson != null) {
+                    val scenesToApply = scenes ?: prefs.getString("scenes_json", null)?.let {
+                        try { org.json.JSONObject(it) } catch (e: Exception) { null }
+                    }
+                    if (scenesToApply != null) {
                         try {
-                            applySceneConfigs(org.json.JSONObject(scenesJson))
+                            applySceneConfigs(scenesToApply)
                         } catch (e: Exception) {
                             Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
                         }
@@ -1078,9 +1020,59 @@ class MainActivity : AppCompatActivity() {
                 logToFile("房间素材同步完成: " + roomId)
             } catch (e: Exception) {
                 Log.e(TAG, "Room materials sync error: " + e.message)
+                logToFile("房间素材同步异常: ${e.message}", "ERROR", "SYNC", "ERROR")
                 mqttHandler.post {
                     binding.statusText?.text = "素材同步失败"
                 }
+            }
+        }
+    }
+
+    /**
+     * 拉取房间素材清单（/api/room-materials-v2，A01/B01 键）
+     * 失败返回 null——与「清单为空」严格区分：只有成功拉取的空清单才允许触发清空
+     */
+    private fun fetchRoomMaterials(roomId: String): MutableMap<String, org.json.JSONArray>? {
+        return try {
+            val apiUrl = java.net.URL(APK_URL + "/api/room-materials-v2/" + roomId)
+            logToFile("HTTP 请求: $apiUrl")
+            val connection = apiUrl.openConnection()
+            connection.connectTimeout = 15000
+            connection.readTimeout = 30000
+            val response = connection.inputStream.bufferedReader().readText()
+            logToFile("HTTP 响应长度: ${response.length}, 前100字符: ${response.take(100)}")
+            val resultJson = org.json.JSONObject(response)
+            val allMaterials = mutableMapOf<String, org.json.JSONArray>()
+            val keys = resultJson.keys()
+            while (keys.hasNext()) {
+                val folderId = keys.next()
+                if (folderId != "debug") {
+                    allMaterials[folderId] = resultJson.getJSONArray(folderId)
+                }
+            }
+            logToFile("获取房间素材成功: " + allMaterials.size + " 个文件夹")
+            allMaterials
+        } catch (e: Exception) {
+            Log.e(TAG, "获取房间素材失败: " + e.message)
+            logToFile("获取房间素材失败，中止本轮同步保持本地现状: " + e.message, "ERROR", "SYNC", "ERROR")
+            mqttHandler.post { binding.statusText?.text = "素材同步失败（云端不可达）" }
+            null
+        }
+    }
+
+    /**
+     * 对账单幕 30 个文件夹：映射有素材 → 按云端清单下载/删除；未映射或空 → 清空本地目录
+     */
+    private fun syncSceneFolders(scenePrefix: String, folderMappings: org.json.JSONObject, allMaterials: MutableMap<String, org.json.JSONArray>) {
+        for (i in 1..30) {
+            val folderNum = String.format("%02d", i)
+            val prefixedKey = scenePrefix + folderNum  // "A01", "B02"
+            // 键格式兼容：统一带前缀（"A01"）；纯编号（"01"）为旧数据兜底
+            val materialIds = folderMappings.optJSONArray(prefixedKey) ?: folderMappings.optJSONArray(folderNum)
+            if (materialIds != null && materialIds.length() > 0) {
+                syncFolderWithIds(prefixedKey, materialIds, allMaterials[prefixedKey])
+            } else {
+                deleteFolderFiles(prefixedKey)
             }
         }
     }
@@ -1142,7 +1134,8 @@ class MainActivity : AppCompatActivity() {
                     }
                     Log.d(TAG, "下载: " + filename)
                     logToFile("下载: " + filename)
-                    downloadFile(downloadUrl, localFile)
+                    // ETag 条件请求下载：md5 为空的素材（如预设素材）靠 ETag 避免每轮重下
+                    downloadWithETag(downloadUrl, localFile, filename)
                 }
             }
 
@@ -1163,7 +1156,13 @@ class MainActivity : AppCompatActivity() {
     // 删除指定文件夹下的指定素材文件
     private fun deleteMaterialFile(folderId: String, filename: String, materialId: String) {
         try {
-            val localFolder = File(videoFolderPath, folderId)
+            // 支持场景前缀（"A01" → scenea/01），与服务端 delete_material 下发格式对齐
+            val prefixChar = if (folderId.length == 3 && folderId[0].isLetter()) folderId[0].lowercaseChar() else null
+            val localFolder = if (prefixChar != null) {
+                File(File(videoFolderPath, "scene" + prefixChar), folderId.substring(1))
+            } else {
+                File(videoFolderPath, folderId)
+            }
             if (!localFolder.exists()) {
                 Log.d(TAG, "deleteMaterialFile: folder $folderId not exist")
                 return
@@ -1476,41 +1475,15 @@ class MainActivity : AppCompatActivity() {
             }
             conn2.disconnect()
             Log.d(TAG, "下载完成: $filename")
+            logToFile("下载完成: $filename (${destFile.length() / 1024}KB)", "INFO", "SYNC", "DOWNLOAD")
             true
         } catch (e: Exception) {
             Log.e(TAG, "下载失败 [${filename}]: ${e.message}")
+            logToFile("下载失败 [$filename]: ${e.message}", "ERROR", "SYNC", "DOWNLOAD")
             false
         }
     }
 
-    /**
-     * 兼容旧逻辑的下载（无 ETag，用于 OTA APK 等一次性文件）
-     */
-    private fun downloadFile(urlStr: String, destFile: File) {
-        try {
-            val url = java.net.URL(urlStr)
-            val connection = url.openConnection()
-            connection.connectTimeout = 30000
-            connection.readTimeout = 30000
-            var totalBytes = 0L
-            connection.getInputStream().use { input ->
-                FileOutputStream(destFile).use { output ->
-                    val buffer = ByteArray(65536)
-                    var bytesRead: Int
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                        totalBytes += bytesRead
-                    }
-                }
-            }
-            Log.d(TAG, "下载完成: ${destFile.name}")
-            logToFile("下载完成: ${destFile.name} (${totalBytes / 1024}KB)", "INFO", "SYNC", "DOWNLOAD")
-        } catch (e: Exception) {
-            Log.e(TAG, "下载失败: ${e.message}")
-            logToFile("下载失败: ${destFile.name} (${e.message})", "ERROR", "SYNC", "DOWNLOAD")
-        }
-    }
-    
     // 计算文件MD5
     // P3 fix: 流式 MD5 计算，防止大文件 OOM
     private fun calculateMd5(file: File): String {
