@@ -11,8 +11,8 @@ android {
         applicationId "com.xvj.app"
         minSdk 24
         targetSdk 34
-        versionCode 164
-        versionName "164"
+        versionCode 165
+        versionName "165"
     }
 
     buildTypes {
