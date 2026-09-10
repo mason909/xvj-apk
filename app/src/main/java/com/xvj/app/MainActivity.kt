@@ -126,10 +126,17 @@ class MainActivity : AppCompatActivity() {
     // 设备指纹信息
     private var deviceFingerprint: String = ""
 
+    // 运行时版本号（onCreate 读 packageInfo，OTA 比较与指纹用，勿硬编码）
+    private var VERSION_CODE: Int = 0
+
+    // 运行时版本名（onCreate 读 packageInfo，随版本上报）
+    private var VERSION_NAME: String = ""
+
+    // 待安装的 APK：无"安装未知应用"权限时暂存，授权回来自动续装
+    private var pendingInstallApk: File? = null
+
     companion object {
         private const val TAG = "XVJPlayer"
-        const val VERSION = "1.3.1"
-        const val VERSION_CODE = 161
         /** 窗口容器内亮度遮罩视图的 tag 标识（实时更新时定位/增删遮罩） */
         const val DIM_TAG = "xvj_dim"
         const val APK_URL = "http://47.102.106.237"
@@ -250,6 +257,17 @@ class MainActivity : AppCompatActivity() {
 
         // 创建20个素材文件夹 (01-20)
         createMaterialFolders()
+
+        // 读取真实版本号（与 build.gradle versionCode 一致；旧实现硬编码 161 导致 OTA 误判循环下载）
+        try {
+            val pi = packageManager.getPackageInfo(packageName, 0)
+            VERSION_CODE = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode.toInt() else pi.versionCode
+            VERSION_NAME = pi.versionName ?: ""
+        } catch (e: Exception) {
+            Log.e(TAG, "读取版本号失败: ${e.message}")
+            VERSION_CODE = 0
+            VERSION_NAME = ""
+        }
 
         // 生成设备指纹
         deviceFingerprint = generateDeviceFingerprint()
@@ -572,10 +590,12 @@ class MainActivity : AppCompatActivity() {
             val statusTopic = "xvj/device/$deviceId/status"
             val payload = JSONObject().apply {
                 put("status", status)
+                put("version", VERSION_NAME)
+                put("version_code", VERSION_CODE)
                 put("timestamp", System.currentTimeMillis())
             }
             mqttClient?.publish(statusTopic, payload.toString().toByteArray(), 1, false)
-            Log.d(TAG, "Status sent: $status")
+            Log.d(TAG, "Status sent: $status (v$VERSION_CODE)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send status: ${e.message}")
             logToFile("发送状态失败: ${e.message}")
@@ -899,8 +919,8 @@ class MainActivity : AppCompatActivity() {
                                 android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_LONG).show()
                             } catch(e: Exception) {}
                         }
-                        // 下载并提示用户安装
-                        downloadAndInstall(url, version)
+                        // 下载并提示用户安装（云端命令现已携带 md5）
+                        downloadAndInstall(url, version, cmd.optString("md5", null))
                     } else if (serverCode <= VERSION_CODE) {
                         Log.d(TAG, "OTA: 当前已是最新版本 ($VERSION_CODE >= $serverCode)")
                     }
@@ -1292,6 +1312,16 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         hideSystemUI()
         player?.play()
+        // 从"安装未知应用"授权页返回：已授权则续装挂起的 APK
+        val pending = pendingInstallApk
+        if (pending != null) {
+            pendingInstallApk = null
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
+                installApk(pending)
+            } else {
+                logToFile("用户未授予安装权限，放弃续装")
+            }
+        }
     }
 
     override fun onPause() {
@@ -1617,48 +1647,6 @@ class MainActivity : AppCompatActivity() {
         }, 5000)
     }
 
-    // 显示更新通知
-    private fun showUpdateNotification(version: String) {
-        try {
-            // Android 13+ 需要请求通知权限
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                    requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
-                    logToFile("请求通知权限")
-                }
-            }
-
-            val channel = android.app.NotificationChannel(
-                "update_channel", "更新",
-                android.app.NotificationManager.IMPORTANCE_HIGH
-            ).apply { description = "APK更新通知" }
-
-            val notificationManager = getSystemService(android.app.NotificationManager::class.java)
-            notificationManager.createNotificationChannel(channel)
-
-            // 使用显式Intent
-            val intent = android.content.Intent(this, MainActivity::class.java)
-            val pendingIntent = android.app.PendingIntent.getActivity(
-                this, 0, intent,
-                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
-            )
-
-            val notification = android.app.Notification.Builder(this, "update_channel")
-                .setContentTitle("发现新版本 $version")
-                .setContentText("点击安装")
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setAutoCancel(true)
-                .setContentIntent(pendingIntent)
-                .build()
-
-            notificationManager.notify(1001, notification)
-            logToFile("通知已显示")
-        } catch (e: Exception) {
-            Log.e(TAG, "Show notification error: ${e.message}")
-            logToFile("通知错误: ${e.message}")
-        }
-    }
-
     /**
      * 下载并安装APK
      */
@@ -1756,22 +1744,7 @@ class MainActivity : AppCompatActivity() {
                             .setTitle("更新已下载")
                             .setMessage("版本: $version\n点击确定开始安装")
                             .setPositiveButton("确定") { _, _ ->
-                                try {
-                                    logToFile("开始安装APK: ${installFile.absolutePath}, exists=${installFile.exists()}, size=${installFile.length()}")
-                                    val apkUri = androidx.core.content.FileProvider.getUriForFile(
-                                        this, "${packageName}.fileprovider", installFile
-                                    )
-                                    logToFile("APK URI: $apkUri")
-                                    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                                        setDataAndType(apkUri, "application/vnd.android.package-archive")
-                                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                    }
-                                    startActivity(intent)
-                                } catch (e: Exception) {
-                                    logToFile("安装APK失败: ${e.message}")
-                                    android.widget.Toast.makeText(this, "安装失败: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
-                                }
+                                installApk(installFile)
                             }
                             .setNegativeButton("取消", null)
                             .setCancelable(false)
@@ -1792,6 +1765,56 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }.start()
+    }
+
+    /**
+     * 安装已下载的 APK（带"安装未知应用"权限闸门）。
+     * 无权限时跳系统授权页，授权回来自动续装（onResume）。
+     * 未来接入静默安装（root pm install / device-owner PackageInstaller）只需替换本函数实现。
+     */
+    private fun installApk(file: File) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !packageManager.canRequestPackageInstalls()) {
+            logToFile("缺少安装未知应用权限，跳转授权页")
+            pendingInstallApk = file
+            try {
+                val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                    data = android.net.Uri.parse("package:$packageName")
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+                mqttHandler.post {
+                    try {
+                        android.widget.Toast.makeText(this, "请允许本应用安装未知应用，授权后自动继续安装", android.widget.Toast.LENGTH_LONG).show()
+                    } catch (e: Exception) {}
+                }
+            } catch (e: Exception) {
+                logToFile("跳转安装授权页失败: ${e.message}")
+                pendingInstallApk = null
+            }
+            return
+        }
+        performInstall(file)
+    }
+
+    /** 发起系统安装器（FileProvider URI） */
+    private fun performInstall(file: File) {
+        try {
+            logToFile("开始安装APK: ${file.absolutePath}, exists=${file.exists()}, size=${file.length()}")
+            val apkUri = androidx.core.content.FileProvider.getUriForFile(
+                this, "${packageName}.fileprovider", file
+            )
+            logToFile("APK URI: $apkUri")
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(apkUri, "application/vnd.android.package-archive")
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            logToFile("安装APK失败: ${e.message}")
+            android.widget.Toast.makeText(this, "安装失败: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+        }
     }
 
     // ========== 多窗口系统实现 ==========
