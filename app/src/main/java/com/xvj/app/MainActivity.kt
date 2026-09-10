@@ -698,6 +698,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 "deauthorize" -> {
                     // 被远程废掉
+                    logToFile("本机被废止: $targetId ${resp.optString("message", "")}", "ERROR", "AUTH")
                     mqttHandler.post {
                         binding.statusText?.text = "已废止"
                         prefs.edit()
