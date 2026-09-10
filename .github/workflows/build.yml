@@ -25,6 +25,19 @@ jobs:
     - name: Create local.properties
       run: echo "sdk.dir=$ANDROID_HOME" > local.properties
 
+    - name: Restore fixed debug keystore
+      env:
+        KS_B64: ${{ secrets.XVJ_DEBUG_KEYSTORE }}
+      run: |
+        if [ -z "$KS_B64" ]; then
+          echo "::warning::未配置 secret XVJ_DEBUG_KEYSTORE，本次将用 runner 随机 debug keystore 签名（设备无法覆盖安装/OTA）"
+          exit 0
+        fi
+        mkdir -p "$HOME/.android"
+        printf '%s' "$KS_B64" | base64 -d > "$HOME/.android/debug.keystore"
+        ls -l "$HOME/.android/debug.keystore"
+        keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey
+
     - name: Build with Gradle
       id: gradle-build
       env:
