@@ -11,8 +11,8 @@ android {
         applicationId "com.xvj.app"
         minSdk 24
         targetSdk 34
-        versionCode 165
-        versionName "165"
+        versionCode 166
+        versionName "166"
     }
 
     signingConfigs {

@@ -70,8 +70,8 @@ import java.io.PrintWriter
 import java.io.RandomAccessFile
 import java.util.concurrent.Executors
 
-// 上线前替换为实际 SHA-256 指纹；未配置时跳过验证，方便测试
-private const val EXPECTED_CERT_FINGERPRINT = "YOUR_CERT_FINGERPRINT_HERE"
+// CI 固定 keystore（XVJ_DEBUG_KEYSTORE）证书 DER 的 SHA-256；改动签名必须同步更新，否则设备端 OTA 校验会拒绝安装
+private const val EXPECTED_CERT_FINGERPRINT = "d2b08c51a0bcca1f2bc29f20fd8ff5f3927725a9ce3d8355b770ef03c5c960df"
 
 /**
  * XVJ 终端播放器
