@@ -34,9 +34,16 @@ jobs:
           exit 0
         fi
         mkdir -p "$HOME/.android"
-        printf '%s' "$KS_B64" | base64 -d > "$HOME/.android/debug.keystore"
-        ls -l "$HOME/.android/debug.keystore"
-        keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey
+        printf '%s' "$KS_B64" | base64 -d > /tmp/seed.p12
+        # openssl 生成的 p12 会被 AGP 判为不适用并静默重生成随机钥匙，必须用 runner 自己的
+        # JDK keytool 重新封装成 JDK 原生 p12 再落位
+        keytool -importkeystore \
+          -srckeystore /tmp/seed.p12 -srcstoretype PKCS12 -srcstorepass android \
+          -destkeystore "$HOME/.android/debug.keystore" -deststoretype PKCS12 \
+          -deststorepass android -destkeypass android -noprompt
+        rm -f /tmp/seed.p12
+        echo "=== 最终 debug.keystore（证书 SHA-256 必须是 D2:B0:8C:51:A0:BC:CA:1F:2B:C2:9F:20:FD:8F:F5:F3:92:77:25:A9:CE:3D:83:55:B7:70:EF:03:C5:C9:60:DF）==="
+        keytool -list -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey
 
     - name: Build with Gradle
       id: gradle-build
@@ -44,6 +51,8 @@ jobs:
         GRADLE_OPTS: "-Xmx2048m -Dorg.gradle.daemon=false"
       run: |
         chmod +x gradlew
+        # 把 Gradle 实际使用的签名配置与证书指纹打进日志，作为固定签名是否生效的判据
+        ./gradlew :app:signingReport --no-daemon 2>&1 | grep -E "Variant: debug|Config: debug|Store:|Alias:|SHA-256:|Valid until" | head -20 || true
         ./gradlew clean assembleDebug --no-daemon 2>&1 | tee /tmp/gradle_output.txt
         GRADLE_EXIT=${PIPESTATUS[0]}
         echo "Gradle exit code: $GRADLE_EXIT"

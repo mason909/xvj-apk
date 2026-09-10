@@ -15,10 +15,23 @@ android {
         versionName "165"
     }
 
+    signingConfigs {
+        debug {
+            // 固定签名：CI 从 secret 恢复的 keystore（本地缺文件时 validateSigningDebug 会按同名参数自动生成）
+            storeFile file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+            storeType "PKCS12"
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            signingConfig signingConfigs.debug
         }
     }
     compileOptions {
