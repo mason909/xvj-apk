@@ -635,7 +635,18 @@ class MainActivity : AppCompatActivity() {
     private fun handleAuthResponse(payload: String) {
         try {
             val resp = JSONObject(payload)
-            when (resp.getString("action")) {
+            val action = resp.optString("action", "")
+            // AUTH_TOPIC 是全设备共享的广播通道，device_id 才是目标；不校验会把别台设备的废止/授权照单执行
+            val targetId = resp.optString("device_id", "")
+            if (targetId.isNotEmpty() && targetId != deviceId && targetId != deviceFingerprint) {
+                Log.d(TAG, "忽略非本机 auth 广播: $action -> $targetId")
+                return
+            }
+            if (action == "deauthorize" && targetId.isEmpty()) {
+                Log.w(TAG, "忽略无目标设备的废止广播")
+                return
+            }
+            when (action) {
                 "auth_result" -> {
                     val authorized = resp.getBoolean("authorized")
                     val message = resp.optString("message", "")
