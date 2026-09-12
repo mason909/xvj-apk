@@ -460,7 +460,8 @@ class MainActivity : AppCompatActivity() {
             prefs.edit().putString("device_id", deviceId).apply()
         }
 
-        mqttClientId = "xvj_device_$deviceId"
+        // clientId 必须严格等于 deviceId：broker ACL 用 pattern xvj/device/%c/# 做设备间隔离
+        mqttClientId = deviceId
 
         Log.d(TAG, "Device ID: $deviceId")
     }
@@ -683,7 +684,7 @@ class MainActivity : AppCompatActivity() {
                                 if (newDeviceId.isNotEmpty() && newDeviceId != deviceId) {
                                     deviceId = newDeviceId
                                     prefs.edit().putString("device_id", deviceId).apply()
-                                    mqttClientId = "xvj_device_$deviceId"
+                                    mqttClientId = deviceId
                                     val newCommandTopic = "xvj/device/$deviceId/command"
                                     mqttClient?.subscribe(newCommandTopic, 0)
                                     Log.d(TAG, "授权后更新订阅: $newCommandTopic")
