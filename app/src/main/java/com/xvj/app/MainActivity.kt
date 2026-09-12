@@ -490,7 +490,7 @@ class MainActivity : AppCompatActivity() {
                 // broker 鉴权：secret 未配置时 BuildConfig 为空串，此时不带凭据（兼容 allow_anonymous 阶段）
                 if (BuildConfig.MQTT_DEVICE_PASSWORD.isNotEmpty()) {
                     options.userName = "xvj_device"
-                    options.password = BuildConfig.MQTT_DEVICE_PASSWORD.toByteArray()
+                    options.password = BuildConfig.MQTT_DEVICE_PASSWORD.toCharArray()
                     Log.d(TAG, "MQTT: 使用设备凭据连接")
                 } else {
                     Log.d(TAG, "MQTT: 未配置设备凭据，匿名连接")
