@@ -49,8 +49,12 @@ jobs:
       id: gradle-build
       env:
         GRADLE_OPTS: "-Xmx2048m -Dorg.gradle.daemon=false"
+        XVJ_MQTT_DEVICE_PW: ${{ secrets.XVJ_MQTT_DEVICE_PW }}
       run: |
         chmod +x gradlew
+        if [ -z "$XVJ_MQTT_DEVICE_PW" ]; then
+          echo "::warning::secret XVJ_MQTT_DEVICE_PW 为空，BuildConfig.MQTT_DEVICE_PASSWORD 将是空串，APK 无法通过 broker 鉴权"
+        fi
         # 把 Gradle 实际使用的签名配置与证书指纹打进日志，作为固定签名是否生效的判据
         ./gradlew :app:signingReport --no-daemon 2>&1 | grep -E "Variant: debug|Config: debug|Store:|Alias:|SHA-256:|Valid until" | head -20 || true
         ./gradlew clean assembleDebug --no-daemon 2>&1 | tee /tmp/gradle_output.txt

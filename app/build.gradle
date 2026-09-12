@@ -11,8 +11,14 @@ android {
         applicationId "com.xvj.app"
         minSdk 24
         targetSdk 34
-        versionCode 166
-        versionName "166"
+        versionCode 167
+        versionName "167"
+
+        // MQTT 设备凭据（broker 鉴权改造）：密码绝不进公开仓库。
+        // CI 由 GitHub Secret 注入环境变量 XVJ_MQTT_DEVICE_PW；本地构建可 -PXVJ_MQTT_DEVICE_PW=xxx 或同名环境变量；
+        // 缺省空串 = 匿名连接（broker 未切换 allow_anonymous false 前的正常形态）
+        def mqttPw = System.getenv("XVJ_MQTT_DEVICE_PW") ?: (project.findProperty("XVJ_MQTT_DEVICE_PW") ?: "")
+        buildConfigField "String", "MQTT_DEVICE_PASSWORD", "\"${mqttPw}\""
     }
 
     signingConfigs {
@@ -43,6 +49,7 @@ android {
     }
     buildFeatures {
         viewBinding true
+        buildConfig true  // AGP8 默认关闭；MQTT_DEVICE_PASSWORD 等 BuildConfig 字段需要
     }
 }
 

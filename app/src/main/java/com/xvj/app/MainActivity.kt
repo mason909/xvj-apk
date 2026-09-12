@@ -172,11 +172,12 @@ class MainActivity : AppCompatActivity() {
 
             // 只有debug_mode开启时才MQTT上报日志
             if (prefs.getBoolean("debug_mode", false)) {
-                val fid = deviceFingerprint
-                if (fid.isNotEmpty()) {
+                // 身份统一用 deviceId：服务端 device_logs.device_id 取自 topic，前端按 devices.id 查询
+                val lid = deviceId.ifEmpty { deviceFingerprint }
+                if (lid.isNotEmpty()) {
                     mqttHandler.post {
                         try {
-                            val topic = "xvj/device/${fid}/log"
+                            val topic = "xvj/device/${lid}/log"
                             val payload = "${System.currentTimeMillis()} $level $module $msg"
                             // 局部 val 捕获：mqttClient 是可变属性，Kotlin 禁止判空后 smart cast
                             val client = mqttClient
@@ -193,7 +194,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 } else {
-                    Log.w(TAG, "Device fingerprint empty, cannot send log")
+                    Log.w(TAG, "Device identity empty, cannot send log")
                 }
             } else {
                 Log.d(TAG, "Debug mode off, log not sent via MQTT: $msg")
@@ -237,9 +238,10 @@ class MainActivity : AppCompatActivity() {
                     it.println("${System.currentTimeMillis()} ERROR APP $crashMsg")
                 }
                 val client = mqttClient
-                if (client != null && client.isConnected && deviceFingerprint.isNotEmpty()) {
+                val lid = deviceId.ifEmpty { deviceFingerprint }
+                if (client != null && client.isConnected && lid.isNotEmpty()) {
                     client.publish(
-                        "xvj/device/$deviceFingerprint/log",
+                        "xvj/device/$lid/log",
                         "${System.currentTimeMillis()} ERROR APP $crashMsg".toByteArray(), 1, false
                     )
                 }
@@ -346,9 +348,6 @@ class MainActivity : AppCompatActivity() {
             if (sb.isNotEmpty()) sb.append("|")
             sb.append("hw:$hardware")
         } catch (e: Exception) {}
-
-        // 7. APK版本号 — 不同版本号=不同设备，防止升级后被旧记录覆盖
-        sb.append("|vc:$VERSION_CODE")
 
         // 返回SHA256哈希作为最终指纹
         val raw = sb.toString()
@@ -487,6 +486,14 @@ class MainActivity : AppCompatActivity() {
                 options.isCleanSession = false
                 options.connectionTimeout = 30
                 options.keepAliveInterval = 15
+                // broker 鉴权：secret 未配置时 BuildConfig 为空串，此时不带凭据（兼容 allow_anonymous 阶段）
+                if (BuildConfig.MQTT_DEVICE_PASSWORD.isNotEmpty()) {
+                    options.userName = "xvj_device"
+                    options.password = BuildConfig.MQTT_DEVICE_PASSWORD.toByteArray()
+                    Log.d(TAG, "MQTT: 使用设备凭据连接")
+                } else {
+                    Log.d(TAG, "MQTT: 未配置设备凭据，匿名连接")
+                }
                 // P4 fix: 连接成功/失败通过 setCallback + isConnected 标志判断
                 mqttClient?.setCallback(object : MqttCallback {
                     override fun connectionLost(cause: Throwable?) {
@@ -533,7 +540,6 @@ class MainActivity : AppCompatActivity() {
                     }
                     // P4 fix: 连接成功后执行，不要在闭包外裸调
                     checkForUpdate()
-                    requestAuthSync()
                 } catch (e: Exception) {
                     Log.e(TAG, "MQTT Connection Error: ${e.message}")
                     logToFile("MQTT Connection Error: ${e.message}")
@@ -764,9 +770,8 @@ class MainActivity : AppCompatActivity() {
         mqttHandler.postDelayed({
             try { mqttClient?.close() } catch (e: Exception) {}
             connectMQTT()
-            // P4 fix: checkForUpdate 和 requestAuthSync 移入 postDelayed 闭包内，等待连接建立后再执行
+            // P4 fix: checkForUpdate 移入 postDelayed 闭包内，等待重连窗口再执行
             checkForUpdate()
-            requestAuthSync()
         }, delayMs)
     }
 
@@ -786,22 +791,6 @@ class MainActivity : AppCompatActivity() {
 
     // 【A-04】 MQTT 消息处理 & 分发
     // @tag: handleCommand 命令分发 mqtt命令处理
-    // @tag: requestAuthSync 授权请求 状态同步
-    // 请求同步授权状态
-    private fun requestAuthSync() {
-        try {
-            val topic = "xvj/auth/request"
-            val payload = JSONObject().apply {
-                put("device_id", deviceId)
-                put("fingerprint", deviceFingerprint)
-            }
-            mqttClient?.publish(topic, payload.toString().toByteArray(), 1, false)
-            Log.d(TAG, "请求授权状态同步")
-        } catch (e: Exception) {
-            Log.e(TAG, "请求授权同步失败: ${e.message}")
-            logToFile("请求授权同步失败: ${e.message}")
-        }
-    }
 
     /**
      * 处理 MQTT 命令
