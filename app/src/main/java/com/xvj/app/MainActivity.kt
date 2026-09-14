@@ -46,6 +46,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
@@ -2051,9 +2052,9 @@ class MainActivity : AppCompatActivity() {
                 dim?.let { c.removeView(it) }
             }
 
-            // 布局稳定后重算旋转/镜像矩阵（90°/270° 预缩放依赖视图实际尺寸）
+            // 布局稳定后重算截取/旋转/镜像矩阵（取景与 90°/270° 预缩放都依赖视图实际尺寸）
             val cv = c.getChildAt(0)
-            if (cv != null) c.post { applyFlipRotation(cv, w) }
+            if (cv != null) c.post { applyWindowTransform(cv, w) }
         }
         Log.d(TAG, "applyLiveWindowUpdate: 轻量应用 ${desiredSorted.size} 个窗口")
     }
@@ -2120,46 +2121,83 @@ class MainActivity : AppCompatActivity() {
         flSurface?.addView(container, params)
         windowViews[winId] = container
         windowContentSigs[winId] = contentSignature(content)
-        // 布局完成后应用旋转/镜像（矩阵中心依赖实际视图尺寸）
-        container.post { applyFlipRotation(view, w) }
-        Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y) opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)}")
+        // 布局完成后应用截取/旋转/镜像（取景与矩阵中心都依赖实际视图尺寸）
+        container.post { applyWindowTransform(view, w) }
+        val cr = cropRect(w)
+        Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y) opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)} crop=(${cr[0]},${cr[1]},${cr[2]},${cr[3]})")
     }
 
     /**
-     * Arena 对标：窗口内容在框内旋转/镜像（窗口 x/y/w/h 不变）。
-     * TextureView 用矩阵（90°/270° 时预缩放使内容填满非方形框）；普通 View 用 rotation/scale 属性。
+     * Arena 对标：窗口内容变换 = 输入截取（InputRect）+ 框内旋转 + 镜像，窗口 x/y/w/h 不变。
+     * 截取只能落在真正的 TextureView 上（视频窗口外层还有容器 FrameLayout），故递归查找；
+     * 无 TextureView 的内容（COLOR/HDMI 占位 View）退化为 View 属性做旋转/镜像。
+     * 每次调用都完整重设变换（含恒等情况），保证编辑器把截取/旋转改回默认时画面能复位。
      */
-    private fun applyFlipRotation(view: View, w: JSONObject) {
+    private fun applyWindowTransform(view: View, w: JSONObject) {
         val rot = w.optInt("rotation", 0)
         val flip = w.optString("flip", "none")
-        if (rot == 0 && flip == "none") return
-        val vw = view.width.toFloat()
-        val vh = view.height.toFloat()
-        if (vw <= 0f || vh <= 0f) return
-        val cx = vw / 2f
-        val cy = vh / 2f
-        if (view is TextureView) {
+        val crop = cropRect(w)
+        val tv = if (view is TextureView) view else findTextureView(view)
+        if (tv != null) {
+            val vw = tv.width.toFloat()
+            val vh = tv.height.toFloat()
+            if (vw <= 0f || vh <= 0f) return
+            val cx = vw / 2f
+            val cy = vh / 2f
             val m = Matrix()
+            // 取景框左上角落到原点，再放大到铺满窗口框（允许变形，与 Arena InputRect→OutputRect 同语义）
+            m.setTranslate(-crop[0] * vw, -crop[1] * vh)
+            m.postScale(1f / crop[2], 1f / crop[3])
             if (rot == 90 || rot == 270) {
                 m.postScale(vh / vw, vw / vh, cx, cy)
             }
             m.postRotate(rot.toFloat(), cx, cy)
             if (flip == "h") m.postScale(-1f, 1f, cx, cy)
             if (flip == "v") m.postScale(1f, -1f, cx, cy)
-            view.setTransform(m)
-        } else {
-            var sx = 1f
-            var sy = 1f
-            if (rot == 90 || rot == 270) {
-                sx = vh / vw
-                sy = vw / vh
-            }
-            if (flip == "h") sx = -sx
-            if (flip == "v") sy = -sy
-            view.rotation = rot.toFloat()
-            view.scaleX = sx
-            view.scaleY = sy
+            tv.setTransform(if (m.isIdentity) null else m)
+            return
         }
+        val vw = view.width.toFloat()
+        val vh = view.height.toFloat()
+        if (vw <= 0f || vh <= 0f) return
+        var sx = 1f
+        var sy = 1f
+        if (rot == 90 || rot == 270) {
+            sx = vh / vw
+            sy = vw / vh
+        }
+        if (flip == "h") sx = -sx
+        if (flip == "v") sy = -sy
+        view.rotation = rot.toFloat()
+        view.scaleX = sx
+        view.scaleY = sy
+    }
+
+    /** 递归取窗口内第一个 TextureView（视频画面承载体） */
+    private fun findTextureView(v: View): TextureView? {
+        if (v is TextureView) return v
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) {
+                findTextureView(v.getChildAt(i))?.let { return it }
+            }
+        }
+        return null
+    }
+
+    /** 归一化取景区 [x, y, w, h]：缺省/非法一律回退全画面，宽高下限 5% 且不会越出画面（避免零除） */
+    private fun cropRect(w: JSONObject): FloatArray {
+        val c = w.optJSONObject("crop") ?: return floatArrayOf(0f, 0f, 1f, 1f)
+        fun num(name: String, def: Double): Float {
+            val v = c.optDouble(name, def)
+            return if (v.isNaN()) def.toFloat() else v.toFloat()
+        }
+        val x = num("x", 0.0).coerceIn(0f, 0.95f)
+        val y = num("y", 0.0).coerceIn(0f, 0.95f)
+        var wd = num("w", 1.0).coerceIn(0.05f, 1f)
+        var ht = num("h", 1.0).coerceIn(0.05f, 1f)
+        if (x + wd > 1f) wd = (1f - x).coerceAtLeast(0.05f)
+        if (y + ht > 1f) ht = (1f - y).coerceAtLeast(0.05f)
+        return floatArrayOf(x, y, wd, ht)
     }
 
     /** 纯色背景窗口 */
