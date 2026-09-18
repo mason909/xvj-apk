@@ -63,6 +63,8 @@
  *   - 素材落盘在 getFilesDir() 下：无前缀键 "01" → filesDir/01，带幕前缀 "A01" → filesDir/scenea/01、
  *     "B01" → filesDir/sceneb/01（不是旧注释说的 filesDir/videos/xxx，那是单播放器时代的布局）
  *     卸载即清；filesDir/videos 是旧单播放器布局的遗留目录，已无代码引用
+ *     folderId → 目录的解析只有 materialDirOf 一个入口（同步/删除/播放共用），folderId 与
+ *     filename 都是云端/MQTT 原文，未过校验的路径一律拒绝，不做 File(...) 硬拼
  *   - 所有网络请求在下载线程执行，UI 更新 post 到 mqttHandler
  */
 
@@ -951,8 +953,14 @@ class MainActivity : AppCompatActivity() {
         mqttReconnectScheduled = true
         val delayMs = (mqttReconnectDelaySeconds * 1000).toLong()
         mqttHandler.postDelayed({
-            // 先放行闸门：本次尝试若再失败，失败分支需要能重新排下一次
+            // 放行闸门：本次尝试若再失败，失败分支需要能重新排下一次
             mqttReconnectScheduled = false
+            // Activity 已退场（OTA 安装/系统回收/kiosk 重启）就别再起连接：重连成功后 MQTT 回调
+            // 会继续往已销毁的界面 post 状态文本、弹窗，客户端也再没人 disconnect
+            if (isFinishing || isDestroyed) {
+                Log.w(TAG, "Activity 已退场，放弃本次 MQTT 重连")
+                return@postDelayed
+            }
             try { mqttClient?.close() } catch (e: Exception) {}
             connectMQTT()
             // P4 fix: checkForUpdate 移入 postDelayed 闭包内，等待重连窗口再执行
@@ -1470,7 +1478,18 @@ class MainActivity : AppCompatActivity() {
     private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?): List<SyncTask> {
         val tasks = ArrayList<SyncTask>()
         try {
-            if (cloudList == null || cloudList.length() == 0) {
+            if (cloudList == null) {
+                // 映射说这个文件夹有 N 个素材，清单里却连键都没有 —— 两份视图对不上，
+                // 这是信息缺失而不是"云端说这里空了"。以前一律当后者处理，等于清单少一个键
+                // 就把本地整个目录删光（服务端一次异常/版本不一致就能清空现场素材）。
+                // 现在跳过这个文件夹：不下也不删，等下一轮对账（rev 没记账，一定会再来）。
+                logToFile("清单缺少 $folderId 的条目（映射有 ${materialIds.length()} 个），本轮跳过该文件夹",
+                    "WARN", "SYNC", "SKIP")
+                return tasks
+            }
+            if (cloudList.length() == 0) {
+                // 键在、数组为空 = 云端按这些 id 查过素材表，一只都不存在（多半是素材被删了而映射还留着）。
+                // 这是明确指令，本地该文件夹就该清空。
                 Log.d(TAG, "文件夹 " + folderId + " 无云端素材")
                 deleteFolderFiles(folderId)
                 return tasks
@@ -1481,15 +1500,12 @@ class MainActivity : AppCompatActivity() {
                 idsSet.add(materialIds.getString(i))
             }
 
-            // 解析 scene-prefixed folder ID（"A01" → scene="a", num="01"）
-            val scenePrefixChar = if (folderId.length == 3 && folderId[0].isLetter()) folderId[0] else null
-            val folderNum = scenePrefixChar?.let { folderId.removePrefix(it.toString()) } ?: folderId
-            val physicalFolder = if (scenePrefixChar != null) {
-                File(File(videoFolderPath, "scene" + scenePrefixChar.lowercaseChar()), folderNum)
-            } else {
-                File(videoFolderPath, folderNum)
+            // 解析 scene-prefixed folder ID（"A01" → scenea/01）；目录名也来自云端，一并校验
+            val localFolder = materialDirOf(folderId)
+            if (localFolder == null) {
+                logToFile("清单里 $folderId 的目录名非法，本轮跳过该文件夹", "WARN", "SYNC", "SKIP")
+                return tasks
             }
-            val localFolder = physicalFolder
             if (!localFolder.exists()) localFolder.mkdirs()
 
             val localFiles = localFolder.listFiles()?.filter {
@@ -1504,8 +1520,14 @@ class MainActivity : AppCompatActivity() {
                 if (cloudId.isNotEmpty() && idsSet.contains(cloudId)) {
                     val filename = item.getString("filename")
                     val urlPath = item.optString("url", "")
-                    shouldExist.add(filename)
-                    val localFile = File(localFolder, filename)
+                    // filename 同样来自云端 JSON：过 materialFileOf，避免 "../" 写到目录外
+                    val localFile = materialFileOf(localFolder, filename)
+                    if (localFile == null) {
+                        Log.w(TAG, "跳过非法素材文件名: $filename")
+                        logToFile("清单里文件名非法，跳过: folder=$folderId file=$filename", "WARN", "SYNC", "SKIP")
+                        continue
+                    }
+                    shouldExist.add(localFile.name)
                     val downloadUrl = if (urlPath.startsWith("http")) urlPath else APK_URL + urlPath
 
                     val md5 = item.optString("md5", "")
@@ -1541,24 +1563,67 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * folderId → 本地目录的唯一解析入口（"A01" → <素材根>/scenea/01；"01" → <素材根>/01）。
+     * 返回 null 表示这个 folderId 不可信，调用方必须跳过它而不是硬拼路径。
+     * folderId 来自 MQTT 命令与云端清单，属外部输入：不校验直接 File() 拼接时，
+     * "../../sdcard/x" 这类取值能把删除/写入指到应用私有目录之外（OTA 侧有 isValidFilepath，
+     * 素材侧此前没有）。这里同时做字符集校验和 canonicalPath 归属校验。
+     */
+    private fun materialDirOf(folderId: String): File? {
+        val prefixChar = if (folderId.length == 3 && folderId[0].isLetter()) folderId[0].lowercaseChar() else null
+        val folderNum = if (prefixChar != null) folderId.substring(1) else folderId
+        if (prefixChar != null && prefixChar != 'a' && prefixChar != 'b') return null
+        if (!folderNum.matches(Regex("^[A-Za-z0-9_-]{1,10}$"))) return null
+        val dir = if (prefixChar != null) {
+            File(File(videoFolderPath, "scene$prefixChar"), folderNum)
+        } else {
+            File(videoFolderPath, folderNum)
+        }
+        return if (isUnderMaterialRoot(dir)) dir else null
+    }
+
+    /** filename → 目录内的素材文件；只接受纯文件名（含路径分隔、"." / ".."、越出素材根的一律 null） */
+    private fun materialFileOf(dir: File, filename: String): File? {
+        if (filename.isEmpty() || filename == "." || filename == "..") return null
+        if (filename != File(filename).name) return null
+        val file = File(dir, filename)
+        return if (isUnderMaterialRoot(file)) file else null
+    }
+
+    /** canonicalPath 归属判定：软链与 ".." 都按真实路径算，无法解析时按不安全处理 */
+    private fun isUnderMaterialRoot(target: File): Boolean {
+        return try {
+            val root = File(videoFolderPath).canonicalPath + File.separator
+            target.canonicalPath.startsWith(root)
+        } catch (e: Exception) {
+            Log.e(TAG, "isUnderMaterialRoot 失败: " + e.message)
+            false
+        }
+    }
+
+    /**
      * 删除单个本地素材（由 MQTT action:'delete_material' 触发）。
      * 定位方式是 <素材根>/<folderId 解析出的目录>/<filename>，materialId 只进日志不参与查找；
      * ETag/LM 缓存键用的是文件名，所以删文件前必须先 remove 这两个键（见下面的约定）。
      */
     private fun deleteMaterialFile(folderId: String, filename: String, materialId: String) {
         try {
-            // 支持场景前缀（"A01" → scenea/01），与服务端 delete_material 下发格式对齐
-            val prefixChar = if (folderId.length == 3 && folderId[0].isLetter()) folderId[0].lowercaseChar() else null
-            val localFolder = if (prefixChar != null) {
-                File(File(videoFolderPath, "scene" + prefixChar), folderId.substring(1))
-            } else {
-                File(videoFolderPath, folderId)
+            // 支持场景前缀（"A01" → scenea/01），与服务端 delete_material 下发格式对齐；
+            // folderId/filename 都是 MQTT 原文，必须过 materialDirOf/materialFileOf 两道校验
+            val localFolder = materialDirOf(folderId)
+            if (localFolder == null) {
+                logToFile("delete_material 拒绝：folderId 非法 ($folderId) id=$materialId", "WARN", "SYNC", "SKIP")
+                return
+            }
+            val file = materialFileOf(localFolder, filename)
+            if (file == null) {
+                logToFile("delete_material 拒绝：filename 非法 ($filename) id=$materialId", "WARN", "SYNC", "SKIP")
+                return
             }
             if (!localFolder.exists()) {
                 Log.d(TAG, "deleteMaterialFile: folder $folderId not exist")
                 return
             }
-            val file = File(localFolder, filename)
             if (file.exists()) {
                 // 清除 ETag/Last-Modified/md5 缓存，避免删后重加时 APK 因 304 跳过下载
                 clearMaterialCache(filename)
@@ -1581,12 +1646,12 @@ class MainActivity : AppCompatActivity() {
      */
     private fun deleteFolderFiles(folderId: String) {
         try {
-            // 与 syncFolderWithIds 落盘目录一致：A01 → scenea/01，纯编号 → 根目录
-            val prefixChar = if (folderId.length == 3 && folderId[0].isLetter()) folderId[0].lowercaseChar() else null
-            val localFolder = if (prefixChar != null) {
-                File(File(videoFolderPath, "scene" + prefixChar), folderId.substring(1))
-            } else {
-                File(videoFolderPath, folderId)
+            // 与 syncFolderWithIds 落盘目录一致（走同一个 materialDirOf，杜绝两处口径漂移）；
+            // 这是「整目录删除」路径，folderId 非法时必须拒绝而不是猜一个目录
+            val localFolder = materialDirOf(folderId)
+            if (localFolder == null) {
+                logToFile("清空文件夹被拒绝：folderId 非法 ($folderId)", "WARN", "SYNC", "SKIP")
+                return
             }
             if (!localFolder.exists()) return
             val files = localFolder.listFiles()?.filter {
@@ -1679,6 +1744,9 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         // 撤销挂起的续装轮询（retryPendingInstall），Activity 没了再复查只会崩
         installRetryHandler.removeCallbacksAndMessages(null)
+        // mqttHandler 上挂着窗口启播、rev 记账、重连倒计时、进度条刷新，全部按"界面还在"写的，
+        // 必须在 releaseAllWindows 之前清空，否则播放器 release 后仍有 post 排队进来
+        mqttHandler.removeCallbacksAndMessages(null)
         releaseAllWindows()
         releasePlayer()
         // 停止定时器并发送离线状态
@@ -2311,6 +2379,11 @@ class MainActivity : AppCompatActivity() {
                 put("content", defaultContent)
             }
             createWindowView(DEFAULT_WINDOW_ID, defaultWin)
+            // ⚠️ 必须把它塞回 allWindows：下面那圈"每个窗口按自身 content.type 选文件夹"的循环
+            // 是按 allWindows 查配置的，漏了这一步就查不到 winObj → content 为空 → type="" →
+            // 一个播放器都不启，画面全黑（视图建了、素材也在，就是不播）。
+            // 表现：房间没配任何窗口时（新建房间/配置被清空）设备黑屏。
+            allWindows.put(defaultWin)
             Log.d(TAG, "所有场景无窗口，自动创建默认全屏窗口1 -> SCENE_A")
         } else {
             // 按 zIndex 升序创建所有窗口（A 和 B 的窗口都加载）
@@ -2378,8 +2451,7 @@ class MainActivity : AppCompatActivity() {
                 else -> null
             }
             if (folderId != null && player != null) {
-                val folderPath = videoFolderPath.ifEmpty { filesDir.absolutePath }
-                playFolderInWindow(winId, folderId, folderPath)
+                playFolderInWindow(winId, folderId)
             }
         }
         appliedScenesFp = fp
@@ -2519,9 +2591,10 @@ class MainActivity : AppCompatActivity() {
                 dim?.let { c.removeView(it) }
             }
 
-            // 布局稳定后重算截取/旋转/镜像矩阵（取景与 90°/270° 预缩放都依赖视图实际尺寸）
+            // 布局稳定后重算截取/旋转/镜像矩阵（取景与 90°/270° 预缩放都依赖视图实际尺寸）；
+            // 尺寸仍为 0 时由 applyTransformWhenReady 挂一次性布局监听补做
             val cv = c.getChildAt(0)
-            if (cv != null) c.post { applyWindowTransform(cv, w) }
+            if (cv != null) c.post { applyTransformWhenReady(cv, w) }
         }
         // 屏上现在就是这份配置了：指纹跟着走，否则下一轮素材对账收尾会白重建一次、视频重头播
         appliedScenesFp = scenesFingerprint(scenes)
@@ -2590,8 +2663,8 @@ class MainActivity : AppCompatActivity() {
         flSurface?.addView(container, params)
         windowViews[winId] = container
         windowContentSigs[winId] = contentSignature(content)
-        // 布局完成后应用截取/旋转/镜像（取景与矩阵中心都依赖实际视图尺寸）
-        container.post { applyWindowTransform(view, w) }
+        // 布局完成后应用截取/旋转/镜像（取景与矩阵中心都依赖实际视图尺寸），未就绪则等首次布局再补
+        container.post { applyTransformWhenReady(view, w) }
         val cr = cropRect(w)
         Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y) opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)} crop=(${cr[0]},${cr[1]},${cr[2]},${cr[3]})")
     }
@@ -2601,8 +2674,9 @@ class MainActivity : AppCompatActivity() {
      * 截取只能落在真正的 TextureView 上（视频窗口外层还有容器 FrameLayout），故递归查找；
      * 无 TextureView 的内容（COLOR/HDMI 占位 View）退化为 View 属性做旋转/镜像。
      * 每次调用都完整重设变换（含恒等情况），保证编辑器把截取/旋转改回默认时画面能复位。
+     * @return true = 已应用；false = 目标尺寸还是 0（尚未布局），调用方需要重试（见 [applyTransformWhenReady]）
      */
-    private fun applyWindowTransform(view: View, w: JSONObject) {
+    private fun applyWindowTransform(view: View, w: JSONObject): Boolean {
         val rot = w.optInt("rotation", 0)
         val flip = w.optString("flip", "none")
         val crop = cropRect(w)
@@ -2610,7 +2684,7 @@ class MainActivity : AppCompatActivity() {
         if (tv != null) {
             val vw = tv.width.toFloat()
             val vh = tv.height.toFloat()
-            if (vw <= 0f || vh <= 0f) return
+            if (vw <= 0f || vh <= 0f) return false
             val cx = vw / 2f
             val cy = vh / 2f
             val m = Matrix()
@@ -2624,11 +2698,11 @@ class MainActivity : AppCompatActivity() {
             if (flip == "h") m.postScale(-1f, 1f, cx, cy)
             if (flip == "v") m.postScale(1f, -1f, cx, cy)
             tv.setTransform(if (m.isIdentity) null else m)
-            return
+            return true
         }
         val vw = view.width.toFloat()
         val vh = view.height.toFloat()
-        if (vw <= 0f || vh <= 0f) return
+        if (vw <= 0f || vh <= 0f) return false
         var sx = 1f
         var sy = 1f
         if (rot == 90 || rot == 270) {
@@ -2640,6 +2714,25 @@ class MainActivity : AppCompatActivity() {
         view.rotation = rot.toFloat()
         view.scaleX = sx
         view.scaleY = sy
+        return true
+    }
+
+    /**
+     * 等目标视图真正拿到尺寸后再应用截取/旋转/镜像，应用成功即摘掉监听。
+     * 此前只有一句 container.post { applyWindowTransform(...) }：post 只排到下一轮消息，
+     * 冷启动时那一步布局/SurfaceTexture 常常还没跑完，宽度为 0 直接 return，
+     * 于是取景裁切、90°/270° 预缩放、镜像整条丢掉且不再补 —— 表现就是"重启后画面没裁"。
+     * 监听挂在真正承载画面的 TextureView 上（找不到时退回容器本身），首次非零布局即生效。
+     */
+    private fun applyTransformWhenReady(view: View, w: JSONObject) {
+        if (applyWindowTransform(view, w)) return
+        val watched: View = findTextureView(view) ?: view
+        watched.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(v: View, left: Int, top: Int, right: Int, bottom: Int,
+                                        oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int) {
+                if (applyWindowTransform(v, w)) v.removeOnLayoutChangeListener(this)
+            }
+        })
     }
 
     /** 递归取窗口内第一个 TextureView（视频画面承载体） */
@@ -2729,30 +2822,23 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 在指定窗口内播放指定文件夹的视频
-     * @param winId      窗口 ID
-     * @param folderId   文件夹 ID（如 "01"）
-     * @param folderPath 设备上文件夹的绝对路径
+     * @param winId    窗口 ID
+     * @param folderId 文件夹 ID（"A01" → scenea/01，纯编号 → 根目录；解析统一走 materialDirOf）
      */
-
-    private fun playFolderInWindow(winId: String, folderId: String, folderPath: String) {
+    private fun playFolderInWindow(winId: String, folderId: String) {
         logToFile("开始播放窗口: winId=$winId, folderId=$folderId", "INFO", "PLAYBACK", "START")
         val player = windowPlayers[winId] ?: run {
             Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
             logToFile("找不到窗口 $winId 的播放器", "ERROR", "PLAYBACK", "START")
             return
         }
-        // scene-prefixed folderId：A01 → scenea/01/, B01 → sceneb/01/, 01 → 01/(root)
-        // 注意：scenePrefix 只取首字母小写，与 syncFolderWithIds 保持一致
-        val scenePrefixRaw = when {
-            folderId.startsWith("A") || folderId.startsWith("a") -> "a"
-            folderId.startsWith("B") || folderId.startsWith("b") -> "b"
-            else -> null
-        }
-        val pureFolderId = if (scenePrefixRaw != null) folderId.removePrefix(scenePrefixRaw.uppercase()).removePrefix(scenePrefixRaw) else folderId
-        val physicalDir = if (scenePrefixRaw != null) {
-            java.io.File(folderPath, "scene" + scenePrefixRaw + "/" + pureFolderId)
-        } else {
-            java.io.File(folderPath, pureFolderId)
+        // 目录解析与同步/删除用同一个入口：三处各自实现时口径已经漂过一次（这里曾把
+        // 任何以 a/A/b/B 开头的 id 都当带前缀处理），非法 id 一律不播并留日志
+        val physicalDir = materialDirOf(folderId)
+        if (physicalDir == null) {
+            Log.w(TAG, "playFolderInWindow: folderId 非法 $folderId")
+            logToFile("窗口 $winId 播放失败: folderId 非法 $folderId", "ERROR", "PLAYBACK", "ERROR")
+            return
         }
         if (!physicalDir.exists()) {
             Log.w(TAG, "playFolderInWindow: 物理文件夹不存在 $physicalDir")
