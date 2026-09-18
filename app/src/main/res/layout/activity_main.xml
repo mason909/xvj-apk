@@ -15,7 +15,11 @@
         android:background="@android:color/black"
         app:use_controller="false" />
 
-    <!-- Status Text - Debug Mode -->
+    <!-- 运维层·左下角状态文字：默认 gone（安全侧）。真正的开关在 MainActivity.applyDebugUi()——
+         房间调试模式（prefs.debug_mode）开着才 VISIBLE。
+         这里写死 gone 是为了关掉调试的设备连启动的第一帧都不会把「初始化中...」画到投影上：
+         onCreate 里 setContentView 之后主线程消息队列已有 Choreographer 同步屏障，
+         loadConfig() 那次 post 会排在首次遍历之后，靠代码收会有极短暂的一帧泄漏。 -->
     <TextView
         android:id="@+id/statusText"
         android:layout_width="wrap_content"
@@ -28,7 +32,7 @@
         android:text="初始化中..."
         android:textColor="#FFFFFF"
         android:textSize="14sp"
-        android:visibility="visible" />
+        android:visibility="gone" />
 
     <!-- 素材下载进度条：只在房间调试模式（prefs.debug_mode）下由 updateSyncProgress 置 VISIBLE，
          非调试模式常态播放不给观众看到进度。轨道压成半透明灰，只让绿色填充显眼。

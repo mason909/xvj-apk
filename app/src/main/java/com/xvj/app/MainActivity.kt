@@ -525,6 +525,7 @@ class MainActivity : AppCompatActivity() {
      * 按 debug_mode 收放"运维层"= 左下角状态文字（statusText）+ 底部同步进度条（syncProgressBar）。
      * 设备接投影/大屏，观众看得到画面：调试模式关掉时整层 GONE，
      * 因此全文那十几处 statusText.text 赋值不必各自判 debug（隐藏容器就够了，文字照常更新）。
+     * 两个视图在 XML 里都默认 gone（安全侧：启动第一帧也不会漏出运维文字），所以这里只管开的一面。
      * 任意线程可调（内部 post 到主线程）。
      */
     private fun applyDebugUi() {
@@ -1259,7 +1260,8 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 收掉进度条（可选同时改写左下角状态文字）。
-     * syncProgressBar 的显与隐分别只有 updateSyncProgress / 本函数两个出口，别处不要再直接碰它。
+     * syncProgressBar 只有一处显（updateSyncProgress）和两处隐（本函数、applyDebugUi 关调试模式），
+     * 别处不要再直接碰它。
      * 不带 status 时只收条不动文字（失败文案已由 fetchRoomMaterials 等处自己写好）。
      */
     private fun hideSyncProgress(status: String? = null) {
