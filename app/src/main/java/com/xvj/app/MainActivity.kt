@@ -5,32 +5,47 @@
  *
  * 【代码索引】搜索 "【A-XX】" 快速定位
  * ─────────────────────────────────────────────────
- * 【A-01】生命周期 & 初始化（onCreate / onDestroy）
- * 【A-02】MQTT 连接（connectMQTT / onMqttConnected）
- * 【A-03】设备注册 & 授权（registerDevice / handleAuthResponse）
+ * 【A-01】生命周期 & 初始化（onCreate / loadConfig / onResume / onPause / onDestroy）
+ * 【A-02】MQTT 连接（connectMQTT / onMqttConnected / reconnectMQTT）
+ * 【A-03】设备注册 & 授权（registerDevice / sendStatus / handleAuthResponse）
  * 【A-04】MQTT 消息处理 & 分发（handleCommand → when(action)）
- * 【A-06】素材同步（syncRoomMaterialsAllScenes / fetchRoomMaterials / syncSceneFolders / syncFolderWithIds / deleteMaterialFile）
- * 【A-07】窗口配置 & 渲染（applySceneConfigs / createWindowView / playFolderInWindow）
- * 【A-08】场景切换（switchScene）
+ * 【A-06】素材同步（syncRoomMaterialsAllScenes / fetchRoomMaterials / syncSceneFolders / syncFolderWithIds / downloadWithETag / deleteMaterialFile）
+ * 【A-07】窗口配置 & 渲染（applySceneConfigs / applyLiveWindowUpdate / createWindowView / playFolderInWindow）
+ * 【A-08】场景切换（switchScene / releaseAllWindows）
+ * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk）
  * 【A-10】权限 & 系统 UI（checkStoragePermission / hideSystemUI）
- * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint）
+ * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint / calculateMd5）
+ * （A-05 已随"单播放器点播"旧链路一起删除，编号保留空位）
  * ─────────────────────────────────────────────────
  * 
  * 核心流程：
  *   1. MQTT 连接（持久连接，复用于所有通信）
- *   2. 设备注册 → authorized=1 → 等待房间分配
+ *   2. 设备注册 → 服务端审核 authorized=1 → 回 xvj/auth/response（带 scenes + debug）
  *   3. sync_room_materials 命令 → /api/room-materials-v2/{roomId} 拉全量清单
- *      → 按 Scene A/B 逐文件夹 ETag 对账（缺的下、多的删）
+ *      → 按 Scene A/B 逐文件夹对账（缺的下、多的删）
  *   4. 播放循环：applySceneConfigs 按 scenes 配置渲染窗口
  * 
  * 房间调试模式（debug_mode）：
- *   - 由 /api/room-materials 响应中的 debug 字段控制
- *   - SharedPreferences 持久化
- *   - true 时 logToFile() 通过 MQTT 上报日志到 device_logs 表
+ *   - 来源只有两处 MQTT 载荷：auth_result 与 sync_room_materials 的 debug 字段，
+ *     以及 set_debug 指令；HTTP 侧从不设置它（旧注释里的 /api/room-materials 已废弃）
+ *   - SharedPreferences 持久化，重启后由 loadConfig() 读回
+ *   - true 时 logToFile() 通过 xvj/device/{id}/log 上报到 device_logs 表
+ * 
+ * 素材文件校验契约（改同步前必读）：
+ *   - 云端 materials.md5 存的是 **faststart 重封装之后** 的字节摘要（服务端上传时就地重写文件），
+ *     设备下载到的也正是这份字节，所以下载成功一次 md5 就对齐了；
+ *     不要把 md5 理解成"用户原始上传文件的 md5"，拿本地素材目录去比对会永远对不上
+ *   - 一轮同步里 md5 判定先于 ETag：md5 不同才进 downloadWithETag，
+ *     而它内部按 **文件名** 取 If-None-Match —— 若服务端 ETag 没变而 md5 变了，
+ *     HEAD 会拿回 304 直接 return false，本地仍是旧文件，下一轮再报不一致（表现为"永远同步不完"）
+ *   - 因此服务端就地替换素材文件时必须让 ETag/Last-Modified 一起变（nginx 自动重算，正常没问题）
  * 
  * 重要约定：
- *   - device_id 注册前为 fingerprint，注册后为 uuid
- *   - 本地文件存 getFilesDir()，与服务器素材解耦
+ *   - 设备身份 = deviceId：首启用 fingerprint 播种后写进 SharedPreferences 就不再变，
+ *     服务端不会改派 uuid（handleAuthResponse 里那段"换 uuid 重订阅"是死分支，见该函数注释）
+ *   - 素材落盘在 getFilesDir() 下：无前缀键 "01" → filesDir/01，带幕前缀 "A01" → filesDir/scenea/01、
+ *     "B01" → filesDir/sceneb/01（不是旧注释说的 filesDir/videos/xxx，那是单播放器时代的布局）
+ *     卸载即清；downloadDir=filesDir/videos 只剩 onCreate 里一次 mkdirs，已是遗留空目录
  *   - 所有网络请求在下载线程执行，UI 更新 post 到 mqttHandler
  */
 
@@ -85,11 +100,12 @@ private const val EXPECTED_CERT_FINGERPRINT = "d2b08c51a0bcca1f2bc29f20fd8ff5f39
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
+    /** 单播放器（仅供未授权时的欢迎视频等 playerView 链路）；窗口播放用下面的 windowPlayers */
     private var player: ExoPlayer? = null
 
     // 配置项
     private val prefs by lazy { getSharedPreferences("xvj_prefs", MODE_PRIVATE) }
-    // 使用 app 内部存储目录，确保可写
+    // 素材根 = filesDir（内部存储，免权限）；物理目录形如 <root>/01、<root>/scenea/01
     private var videoFolderPath: String = ""
     private var loopPlay: Boolean = true
 
@@ -100,7 +116,7 @@ class MainActivity : AppCompatActivity() {
 
     // ========== 多窗口系统 ==========
     // TODO: RS485/DMX512 external signal integration — currentSceneId currently has no active update path
-    /** 当前活跃场景 ID："A" 或 "B" */
+    /** 当前场景 ID："A" 或 "B"。渲染/状态上报都不读它，只有 switchScene 会写（而 switchScene 无人调用） */
     private var currentSceneId = "A"
     /** windowId -> ExoPlayer 实例（每个窗口独立播放器）*/
     private val windowPlayers = mutableMapOf<String, ExoPlayer>()
@@ -108,20 +124,21 @@ class MainActivity : AppCompatActivity() {
     private val windowViews = mutableMapOf<String, View>()
     /** windowId -> 内容签名（type|folderId|color|inputIndex），实时更新时判定结构变化用 */
     private val windowContentSigs = mutableMapOf<String, String>()
-    /** 默认窗口 ID（场景A默认播放文件夹01）*/
+    /** 兜底窗口 ID：scenes 里两幕都没有任何窗口时，applySceneConfigs 自动建这一个 1920x1080 全屏 SCENE_A 窗口*/
     private val DEFAULT_WINDOW_ID = "win_1"
-    private val DEFAULT_FOLDER = "01"
     /** 窗口容器 FrameLayout（根视图）*/
     private val flSurface: FrameLayout? get() = binding.root as? FrameLayout
     // ==============================
     private var mqttClient: MqttClient? = null
     private val mqttHandler = Handler(Looper.getMainLooper())
     private val statusHandler = Handler(Looper.getMainLooper())
-    // 4线程下载池，支持并行素材同步
+    // 单线程语义：submit 的是"整轮同步任务"，一轮只占 1 个线程；
+    // 池给到 4 只是为了让 auth 触发的同步和手动 sync 不互相排队，文件夹内部仍是逐个串行下载。
     private val downloadExecutor = Executors.newFixedThreadPool(4)
     private var statusTimerRunnable: Runnable? = null
 
-    // 下载的视频缓存目录
+    // 遗留：单播放器时代素材放在 filesDir/videos/ 下。现在同步/播放一律用 videoFolderPath（= filesDir 根），
+    // 这里只剩 onCreate 里一次 mkdirs，跑起来是个空的遗留目录，别再往它写东西。
     private val downloadDir by lazy { File(filesDir, "videos") }
 
     // 设备指纹信息
@@ -141,7 +158,7 @@ class MainActivity : AppCompatActivity() {
         /** 窗口容器内亮度遮罩视图的 tag 标识（实时更新时定位/增删遮罩） */
         const val DIM_TAG = "xvj_dim"
         const val APK_URL = "http://47.102.106.237"
-        private const val MQTT_TOPIC = "xvj/device/+/command"
+        // 订阅用的通配符主题在 connectMQTT() 里按 deviceId 拼具体路径，不再用常量
         private const val AUTH_TOPIC = "xvj/auth/response"
         // ETag/Last-Modified 缓存的 SharedPreferences key 前缀
         private const val PREF_ETAG_PREFIX = "etag_"
@@ -151,19 +168,22 @@ class MainActivity : AppCompatActivity() {
     // 【A-11】 工具方法
     // @tag: logToFile 日志记录 log文件 MQTT上报
     // @tag: generateDeviceFingerprint 设备指纹生成
-    // @tag: sha256 md5计算 文件校验
+    // @tag: sha256 签名校验指纹计算（注意：算的是证书 DER 的 SHA-256，不是素材 md5）
+    // @tag: calculateMd5 素材文件校验
     /**
      * 写入文件日志（xvj.log）
      * 若 debug_mode 开启，同时通过 MQTT 上报到 device_logs 表
      * 结构化日志写入
      * @param msg 日志内容
      * @param level 日志级别: ERROR, WARN, INFO, DEBUG（默认 INFO）
-     * @param module 模块: APP, MQTT, AUTH, SYNC, PLAYER, UI（默认 APP）
-     * @param action 动作: START, STOP, ERROR, CONNECT, REGISTER, SYNC 等（默认 LOG）
+     * @param module 模块: APP(默认), MQTT, AUTH, SYNC, WINDOW, PLAYBACK
+     * @param action 动作: LOG(默认), COMMAND, CONFIG, CREATE, START, SELECT, SKIP, DOWNLOAD, ERROR, AUTH
      *
      * 调用示例：
      *   logToFile("应用启动")                        // INFO, APP, LOG
      *   logToFile("连接失败", "ERROR", "MQTT")     // ERROR, MQTT, LOG
+     * level/module/action 都是自由字符串，服务端 device_logs 只按 level 白名单过滤查询，
+     * 加新值不用改服务端；但前端日志页的 level 下拉只认 ERROR/WARN/INFO/DEBUG。
      */
     private fun logToFile(msg: String, level: String = "INFO", module: String = "APP", action: String = "LOG") {
         try {
@@ -205,6 +225,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 【A-01】 生命周期 & 初始化
+    // ==================== 生命周期 & 初始化 ====================
+    // onCreate 一次性装配：权限/横屏/常亮/全屏 → 崩溃兜底 handler → 建素材目录 → 读版本号 →
+    //   生成指纹 → loadConfig（deviceId/mqttServer 等本机配置）→ connectMQTT → checkForUpdate。
+    // 窗口画面不由 onCreate 直接起，只由云端触发：auth_result 带 scenes 时立即 applySceneConfigs，
+    // 或 sync_room_materials 同步完成后用载荷里的 scenes（没有就回落到 prefs 的 scenes_json 缓存）。
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -258,7 +284,7 @@ class MainActivity : AppCompatActivity() {
             downloadDir.mkdirs()
         }
 
-        // 创建20个素材文件夹 (01-20)
+        // 预建素材目录（根 + scenea + sceneb 各 01..30，详见 createMaterialFolders）
         createMaterialFolders()
 
         // 读取真实版本号（与 build.gradle versionCode 一致；旧实现硬编码 161 导致 OTA 误判循环下载）
@@ -277,10 +303,10 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "Device Fingerprint: $deviceFingerprint")
         logToFile("Fingerprint: $deviceFingerprint")
 
-        // 加载配置（包含 scenes 缓存恢复，设备开机直接进入窗口1）
+        // 加载本机配置（deviceId 等），不含窗口/scenes —— 窗口要等云端指令
         loadConfig()
 
-        // 连接MQTT（窗口系统由 sync_room_materials 触发，或从本地缓存恢复）
+        // 连接MQTT（注册→授权回执里带 scenes 时才第一次 applySceneConfigs）
         connectMQTT()
         checkForUpdate() // 检查更新
     }
@@ -440,6 +466,13 @@ class MainActivity : AppCompatActivity() {
         return hashBytes.joinToString("") { "%02x".format(it) }
     }
 
+    /**
+     * 从 SharedPreferences 读回本机态：loop_play / mqtt_server / debug_mode / deviceId。
+     * deviceId 为空时用刚算出的 fingerprint 播种并写回 —— 之后即使指纹因硬件或算法改动变了，
+     * 身份仍以 prefs 里那份为准（这正是"换 uuid"分支成为死分支的同一层原因）。
+     * mqttClientId 必须与 deviceId 完全一致，broker ACL 用 xvj/device/%c/# 做设备间隔离。
+     * 不恢复窗口：scenes_json 的回落发生在同步完成的地方，不在这里。
+     */
     private fun loadConfig() {
         // 使用 app 内部存储目录，不需要权限
         if (videoFolderPath.isEmpty()) {
@@ -450,7 +483,7 @@ class MainActivity : AppCompatActivity() {
         loopPlay = prefs.getBoolean("loop_play", true)
         mqttServer = prefs.getString("mqtt_server", "tcp://47.102.106.237:1883") ?: "tcp://47.102.106.237:1883"
 
-        // 恢复调试模式标志（MQTT 命令或 HTTP API 设置的值）
+        // 恢复调试模式标志（只可能由 MQTT 写入：set_debug 指令，或 auth_result / sync_room_materials 的 debug 字段）
         val debugMode = prefs.getBoolean("debug_mode", false)
         Log.d(TAG, "Debug mode: $debugMode")
 
@@ -476,6 +509,9 @@ class MainActivity : AppCompatActivity() {
      * - 注册设备并请求授权状态同步
      * - 连接成功后触发 checkForUpdate
      * - 支持指数退避重连（5s → 最大300s）
+     * 注：command/auth 两个订阅都是 QoS 0，服务端即便按 QoS 1 发布，链路仍降级为 0（不重发）。
+     *     会话是 isCleanSession=false，所以断线期间服务端以 QoS 1 发的指令会由 broker 排队、重连后补投；
+     *     但服务端部分 publish（如 xvj/auth/response 的多数分支）没带 qos 选项，那是 QoS 0，错过就没有。
      */
     private fun connectMQTT() {
         downloadExecutor.submit {
@@ -561,7 +597,10 @@ class MainActivity : AppCompatActivity() {
     // 【A-03】 设备注册 & 授权
     // @tag: registerDevice 设备注册 authorization授权
     /**
-     * 向云端注册设备
+     * 注册设备：QoS1 publish 到 xvj/device/register，载荷同时带 device_id 与 fingerprint
+     * （服务端用 "id = ? OR fingerprint = ?" 命中即视为同一台设备，所以指纹变化不会另立新档）
+     * 随后立即发一次 online 并起 30s 心跳。
+     * 授权结果不在这里回，由服务端另发 xvj/auth/response（见 handleAuthResponse）。
      */
     private fun registerDevice() {
         try {
@@ -591,6 +630,11 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 发送设备状态到MQTT
+     * 主题 xvj/device/{id}/status，载荷只有 status/version/version_code/timestamp；
+     * 服务端把 status 落到 devices.status、整段原文存 devices.status_data（该列没有读侧），
+     * 并因带了 version/version_code 而 UPSERT device_versions —— 后台"版本管理"页看的正是这张表。
+     * 未授权设备同样在上报，服务端不区分；心跳本身 30s 一次，不写 operation_logs。
+     * id 直接读 prefs 而不是成员变量，故用局部 val 遮蔽了同名的 deviceId 成员。
      */
     private fun sendStatus(status: String) {
         try {
@@ -610,9 +654,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 启动定时发送状态
-     */
+    /** 起 30s 心跳：先撤掉旧的 Runnable 再挂新的，所以重复调用不会叠加定时器 */
     private fun startStatusTimer() {
         statusTimerRunnable?.let { statusHandler.removeCallbacks(it) }
         statusTimerRunnable = object : Runnable {
@@ -626,9 +668,7 @@ class MainActivity : AppCompatActivity() {
         statusHandler.post(statusTimerRunnable!!)
     }
 
-    /**
-     * 停止定时发送状态
-     */
+    /** 撤心跳并补发一次 offline；onDestroy 里它排在 disconnect 之前，顺序反了这条 offline 就发不出去 */
     private fun stopStatusTimer() {
         statusTimerRunnable?.let {
             statusHandler.removeCallbacks(it)
@@ -638,7 +678,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 处理授权响应
+     * 处理 xvj/auth/response 上的两类载荷：auth_result（授权结果，成功即带 scenes 直接渲染窗口）
+     * 与 deauthorize（远程废止，回到未授权态并播欢迎视频）。
+     * ⚠️ AUTH_TOPIC 是全设备共享广播，所以开头那道 device_id 校验是唯一的隔离手段：
+     *    targetId 非空且既不是本机 deviceId 也不是指纹 → 直接忽略；deauthorize 缺 targetId 也忽略。
+     *    targetId 为空串的 auth_result 例外放行（老服务端不回带 id）。
+     * 每次注册后服务端都会回一份，本机不靠 prefs 里的 authorized/room_id 自行恢复画面（那两个键只写不读）。
      */
     private fun handleAuthResponse(payload: String) {
         try {
@@ -680,7 +725,10 @@ class MainActivity : AppCompatActivity() {
                                 Log.d(TAG, "授权成功，已保存 scenes: ${scenes.names()}")
                                 // 立即应用窗口配置（离线期间云端可能已改过布局）
                                 applySceneConfigs(scenes)
-                                // 服务器授权后可能分配新的 uuid，切换 MQTT 订阅到新 topic
+                                // 死分支，保留仅作前向兼容：服务端 sendAuthResponse 只是把 topic 里的
+                                // deviceId 原样回显，不会改派新 uuid；而上面的 targetId 校验已经保证
+                                // "要么等于本机 id 要么不处理"，所以这里 newDeviceId != deviceId 恒不成立。
+                                // 真要让服务端改派身份，得先加"订阅新 topic + 退订旧 topic"的成对逻辑再启用。
                                 val newDeviceId = resp.optString("device_id", "")
                                 if (newDeviceId.isNotEmpty() && newDeviceId != deviceId) {
                                     deviceId = newDeviceId
@@ -733,7 +781,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 播放欢迎视频（循环）
+     * 未授权/被废止时循环播放 res/raw/welcome：先 releasePlayer + releaseAllWindows 清掉窗口画面，
+     * 再把单播放器 player 挂到 binding.playerView 上播 raw 资源。
+     * 之后要等授权通过（auth_result 带 scenes）或下一次 sync_room_materials 重新 applySceneConfigs，
+     * 画面才会回到窗口模式 —— 本函数自身不做"恢复窗口"这件事。
      */
     private fun playWelcomeVideo() {
         mqttHandler.post {
@@ -795,10 +846,19 @@ class MainActivity : AppCompatActivity() {
     // @tag: handleCommand 命令分发 mqtt命令处理
 
     /**
-     * 处理 MQTT 命令
-     * @param json 命令 JSON，包含 action 字段
-     * 支持的动作：stop, config, sync, preset_sync, sync_room_materials,
-     *            update_windows, delete_material, update
+     * 处理 MQTT 命令（xvj/device/{deviceId}/command）
+     * @param json 命令 JSON，必须含 action 字段
+     * 实际支持的 action（与服务端发送方一一对应）：
+     *   stop                停掉全部播放
+     *   config              改 mqtt_server / loop（只影响单播放器 player，不影响窗口播放器）
+     *   preset_sync         预设素材同步（folders 数组）→ syncPresetFolders
+     *   sync_room_materials 房间素材全量对账（服务端【S-07】/授权链路发出）
+     *   update_windows      轻量窗口重排，不下素材（编辑器 live 实时预览）
+     *   delete_material     删单个本地素材文件
+     *   update              OTA：带 url/version/md5 → downloadAndInstall
+     *   set_debug           立即开关 debug_mode（前端没有入口，只能手工 POST /api/devices/:id/command；
+     *                       正常途径是 sync_room_materials / auth_result 载荷里的 debug 字段）
+     * ⚠️ 没有 "sync"：服务端的 action:'sync' 只是 HTTP 入参，publish 前已改写成 sync_room_materials
      */
     private fun handleCommand(json: String) {
         try {
@@ -808,6 +868,10 @@ class MainActivity : AppCompatActivity() {
 
             when (action) {
                 "stop" -> {
+                    // ⚠️ 只停"单播放器 player"（欢迎视频那条链），窗口播放器 windowPlayers 不受影响，
+                    //    所以多窗口模式下发 stop 画面其实不会停 —— 待补 releaseAllWindows。
+                    //    服务端有两处发送方：废止设备（另有一条 deauthorize 广播会切欢迎视频，顺带清了窗口，
+                    //    所以那条路是通的）和 DELETE /api/rooms/:id 删房间（这条真的停不下来）。
                     stopPlayback()
                 }
                 "config" -> {
@@ -832,7 +896,7 @@ class MainActivity : AppCompatActivity() {
                     // 接收房间素材同步，下载到本地文件夹
                     val roomId = cmd.optString("room_id", "")
                     val folderMappings = cmd.optJSONObject("folder_mappings")
-                    // 保存 debug 标志（来自 MQTT 命令或后续 HTTP API，MQTT 先收到就先保存）
+                    // debug 字段以命令为准：每次都覆盖 prefs（服务端从房间配置里带过来）
                     val debug = cmd.optBoolean("debug", false)
                     prefs.edit().putBoolean("debug_mode", debug).apply()
                     val fmKeys = java.lang.StringBuilder()
@@ -929,7 +993,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "set_debug" -> {
-                    // 【B-2】接收调试模式切换命令，立即生效
+                    // 调试模式的唯一手动开关：写 prefs 后立即生效（logToFile 是否上报每行都读该值），
+                    // 但 auth_result / sync_room_materials 携带的 debug 字段仍会在下一次同步时覆盖它。
                     val debug = cmd.optBoolean("debug", false)
                     prefs.edit().putBoolean("debug_mode", debug).apply()
                     Log.d(TAG, "set_debug: debug=$debug")
@@ -941,7 +1006,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 同步预设素材文件夹
+    /**
+     * 只把 folders（[{id,name}]）清洗后写进 SharedPreferences 的 preset_folders 键，
+     * 不建目录、不下任何素材文件 —— 名字里的"同步"是"同步一份文件夹清单"，容易误解。
+     * ⚠️ 整条 preset_sync 链路都是停用的：服务端从未发送 action:'preset_sync'，前端没有入口，
+     *    写进去的 preset_folders 键也没有任何地方读它。真正在跑的素材下发是 sync_room_materials。
+     */
     private fun syncPresetFolders(folders: org.json.JSONArray) {
         mqttHandler.post {
             binding.statusText?.text = "同步预设素材(${folders.length()}个文件夹)..."
@@ -992,20 +1062,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 同步房间素材到本地文件夹
-
     // 【A-06】 素材同步
     // @tag: syncRoomMaterials 素材同步 房间同步
     // @tag: syncFolderWithIds 文件夹同步 下载同步
     // @tag: deleteMaterialFile 删除素材 文件删除
     /**
-     * 同步房间所有素材（Scene A + B）
-     * @param roomId       房间 ID
-     * @param folderMappingsFallback 旧版服务端 folder_mappings 字段兜底（新服务端读 scenes）
-     * @param scenes       完整 scenes JSON（包含 A/B 两套配置）
+     * 房间素材全量对账主流程（一轮 = 一次 HTTP + A/B 两幕逐目录 diff）：
+     * 1) 先把 current_room_id / scenes_json 落到 prefs（scenes 为空会写成空串，等于清掉旧缓存）；
+     *    current_room_id 只写不读，留作排查用。
+     * 2) fetchRoomMaterials 拉 /api/room-materials-v2/{roomId} 的 A01/B01 全量清单；
+     *    返回 null（请求失败）时直接中止本轮，绝不进"清空"分支。
+     * 3) syncSceneFolders("A"/"B") 按 scenes.A/B.folder_mappings 对账；映射真相只在 scenes 里，
+     *    folderMappingsFallback 仅给旧服务端兜底，B 幕缺失时按空映射处理。
+     * 4) 回主线程 applySceneConfigs：优先用本次载荷的 scenes，没有才回落 prefs 缓存。
+     * @param roomId       房间 ID（决定清单接口）
+     * @param scenes       完整 scenes JSON（含 A/B 两套 windows + folder_mappings）
      */
-    // 同步房间素材主流程：一次 HTTP 拉取 A+B 全量清单，A/B 两幕对账后统一应用场景配置。
-    // 素材映射唯一真相是 scenes.A/B.folder_mappings；folderMappingsFallback 仅兼容旧版服务端字段
     private fun syncRoomMaterialsAllScenes(roomId: String, folderMappingsFallback: org.json.JSONObject, scenes: org.json.JSONObject?) {
         mqttHandler.post {
             binding.statusText?.text = "同步房间素材中..."
@@ -1106,6 +1178,12 @@ class MainActivity : AppCompatActivity() {
      * @param materialIds 要同步的素材 ID 数组
      * @param cloudList  预获取的云端素材列表（可避免重复请求）
      * 流程：比对本地与云端素材，下载缺失/变化的，删除多余的
+     * 判定顺序（这决定了"为什么改了文件设备却不更新"）：
+     *   1. 本地存在该文件 && 云端 md5 非空 && 本地 md5 相等 → 跳过，连请求都不发
+     *   2. 其余情况一律进 downloadWithETag：它先看按文件名存的 ETag，
+     *      命中 304 就直接 return false —— 也就是"云端 md5 变了但 ETag 没变"会被静默吃掉，
+     *      本地保持旧文件、下一轮同步再重复报不一致。云端就地替换素材字节时必须让 ETag 一起变。
+     *   3. 云端 md5 为空（老记录/预设引用）时只靠 ETag 去重，这是有意为之的兜底路径
      */
     private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?) {
         try {
@@ -1166,6 +1244,12 @@ class MainActivity : AppCompatActivity() {
                 if (!shouldExist.contains(file.name)) {
                     Log.d(TAG, "删除不在清单中的文件: " + file.name)
                     logToFile("删除: " + file.name)
+                    // 与 deleteMaterialFile/deleteFolderFiles 同一套约定：删本地文件必须一起清 ETag/LM 缓存，
+                    // 否则该素材日后重新加回房间时，downloadWithETag 会拿旧 ETag 换到 304 而永远不重下。
+                    prefs.edit()
+                        .remove(PREF_ETAG_PREFIX + file.name)
+                        .remove(PREF_LM_PREFIX + file.name)
+                        .apply()
                     file.delete()
                 }
             }
@@ -1176,7 +1260,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 删除指定文件夹下的指定素材文件
+    /**
+     * 删除单个本地素材（由 MQTT action:'delete_material' 触发）。
+     * 定位方式是 <素材根>/<folderId 解析出的目录>/<filename>，materialId 只进日志不参与查找；
+     * ETag/LM 缓存键用的是文件名，所以删文件前必须先 remove 这两个键（见下面的约定）。
+     */
     private fun deleteMaterialFile(folderId: String, filename: String, materialId: String) {
         try {
             // 支持场景前缀（"A01" → scenea/01），与服务端 delete_material 下发格式对齐
@@ -1244,9 +1332,13 @@ class MainActivity : AppCompatActivity() {
 
     // 【A-10】 权限 & 系统 UI
     /**
-     * 检查并申请存储权限
-     * Android 6-10: 动态申请 READ/WRITE_EXTERNAL_STORAGE
-     * Android 11+: 申请 MANAGE_EXTERNAL_STORAGE
+     * 存储权限申请（现状：形同空转，且仍会弹系统页面）。
+     * ⚠️ 素材/日志全写在 filesDir 内部存储，本来就不需要权限；而 AndroidManifest 里也从未声明
+     *    WRITE_EXTERNAL_STORAGE / MANAGE_EXTERNAL_STORAGE（只有 READ_EXTERNAL_STORAGE 和 READ_MEDIA_VIDEO）。
+     *    于是：6–10 分支申请的 WRITE_EXTERNAL_STORAGE 未声明 → checkSelfPermission 永远不等于 GRANTED，
+     *    每次启动都会调一次 requestPermissions（系统对未声明权限直接拒绝，不显示弹窗）；
+     *    11+ 分支则真会把系统"所有文件访问"设置页拉起来（ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION
+     *    不要求声明过权限）。要清理就整段删掉，但需先确认没有依赖外部路径的旧逻辑。
      */
     private fun checkStoragePermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -1298,12 +1390,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 【A-01】 生命周期回调 & 单播放器（onCreate 在文件靠前处）
+    // player 是"单播放器"残留链路：只有未授权时的欢迎视频（showUnauthorizedAlert → playWelcomeVideo）
+    // 和 config 命令的 loop 开关会碰它；窗口播放全部走 windowPlayers，两套播放器互不影响。
+
+    /** 停掉单播放器并释放；不清 statusText 以外的状态，也不动窗口播放器 */
     private fun stopPlayback() {
         Log.d(TAG, "stopPlayback called")
         releasePlayer()
         binding.statusText?.text = "播放已停止"
     }
 
+    /** 释放单播放器并从 playerView 上摘下来（可重复调用） */
     private fun releasePlayer() {
         Log.d(TAG, "releasePlayer called, current player: $player")
         player?.release()
@@ -1311,6 +1409,11 @@ class MainActivity : AppCompatActivity() {
         binding.playerView.player = null
     }
 
+    /**
+     * 回前台：重新隐藏系统 UI + 恢复单播放器播放 + 续装挂起的 OTA 包。
+     * pendingInstallApk 是 installApk 跳"安装未知应用"授权页前存下的：授权回来立即继续安装；
+     * 没授权就置空放弃、不再挂起（遗留问题 #42：MIUI 授权页秒退时会走到这里，续装直接丢失）。
+     */
     override fun onResume() {
         super.onResume()
         hideSystemUI()
@@ -1327,11 +1430,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 退后台只暂停单播放器：窗口播放器（windowPlayers）不暂停，
+     * 所以弹出的系统页面消失后画面是连续的，但也意味着被切走时窗口仍在解码占资源。
+     */
     override fun onPause() {
         super.onPause()
         player?.pause()
     }
 
+    /** 真销毁时才走：释放全部窗口 + 单播放器，停状态上报定时器，断开 MQTT，关闭下载线程池 */
     override fun onDestroy() {
         super.onDestroy()
         releaseAllWindows()
@@ -1345,11 +1453,13 @@ class MainActivity : AppCompatActivity() {
         downloadExecutor.shutdown()
     }
 
+    /** 终端模式：吃掉返回键，不允许退出 */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         // 禁用返回键 - 终端模式不允许退出
     }
 
+    /** 用户按 Home / 手势离开时，用启动 Intent 把自己重新拉回前台（kiosk 防退出） */
     override fun onUserLeaveHint() {
         val intent = packageManager.getLaunchIntentForPackage(packageName)
         intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -1357,8 +1467,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 创建20个素材文件夹 (01-20)
-     * 与后台文件夹对应
+     * 预建素材目录：根下 01..30，外加 scenea/01..30 与 sceneb/01..30（三套各 30 个，
+     *   不是旧注释写的"20 个 (01-20)"；scene 目录名统一小写）
+     * 三种形态各自对应一条解析路径：无前缀 "01" → 根目录、"A01" → scenea/01、"B01" → sceneb/01
+     * 只是 mkdirs 占位，好让播放器直接按 A01→scenea/01 找目录时不撞空路径；
+     * 素材真正的增删由 syncFolderWithIds 负责，两者对目录的处理是幂等的。
      */
     private fun createMaterialFolders() {
         try {
@@ -1395,15 +1508,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 检查更新 - 延迟5秒后执行
-     */
-    // 素材同步 v2: 4线程并行 + ETag条件请求 + 64KB buffer
-    /**
      * 带 ETag/Last-Modified 条件请求的文件下载
-     * 先发 HEAD 查文件是否有变化，有变化再下载
-     * 缓存 ETag 和 Last-Modified 到 SharedPreferences
-     * 使用 64KB buffer
-     * 返回 true 表示实际下载了文件，false 表示跳过（未变化）
+     * @param filename 缓存键用的文件名（etag_/lm_ 前缀 + 它）；调用方传的正是 destFile.name
+     * @return true = 实际写了文件；false = 服务端说没变，本地原样保留
+     *
+     * 一次调用最多发 3 个 HEAD + 1 个条件 GET（历史叠加出来的，看着冗余但都能短路返回）：
+     *   ① 下面 else-if 里的 HEAD：文件在且本地有缓存 ETag 时先探一次；
+     *   ② try 块开头那个 HEAD：与 ① 条件、请求头完全相同，属于重复劳动（文件没变时 ① 已经 return 了，
+     *      所以它只在"① 判定 ETag 变了"之后再确认一遍 —— 等于白发一个请求）；
+     *   ③ connection 的 HEAD：带上了 If-Modified-Since；
+     *   ④ conn2 才是真正的 GET（没设 requestMethod，默认 GET），从它取新 ETag/Last-Modified 落缓存。
+     * 想瘦身就删掉 ②，行为不变；③④ 合并成"直接条件 GET"也能省一个往返，但要先确认 nginx 对
+     * If-None-Match 的 304 空响应体处理没问题。
+     *
+     * 注意：md5 不一致但 ETag 没变时，这里会返回 false 而不下载 —— 语义见 syncFolderWithIds 的判定顺序。
      */
     private fun downloadWithETag(urlStr: String, destFile: File, filename: String): Boolean {
         val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
@@ -1423,6 +1541,9 @@ class MainActivity : AppCompatActivity() {
                 val code = checkConn.responseCode
                 checkConn.disconnect()
                 if (code == 304) {
+                    // ⚠️ 下面这个 !destFile.exists() 分支进不来：外层 if 已经把"文件不存在或为空"
+                    //    直接送去强下载了，能走到这儿说明文件确实存在。原始问题（素材被删后 ETag 仍缓存
+                    //    导致 304 跳过）已经由外层那个判断修掉，这里留的是当时的补丁痕迹。
                     // BUG FIX: 文件不存在时，即使ETag未变也必须重新下载
                     // 场景：素材曾被添加→下载→从房间移除（文件被删）→重新添加
                     // 此时本地文件不存在但SharedPreferences中ETag仍缓存着旧值
@@ -1537,9 +1658,19 @@ class MainActivity : AppCompatActivity() {
     }
     
 
+    // 【A-09】 OTA 自更新
+    // ==================== OTA 自更新 ====================
+    // 两条入口，最后都汇到 downloadAndInstall()：
+    //   1) 设备自查：checkForUpdate()，启动/每次连上 MQTT/重连时各调度一次，拉 /api/version/latest
+    //   2) 云端推送：handleCommand 的 action:'update'，命令体自带完整 url + version + version_code + md5
+    // downloadAndInstall 的门禁顺序：
+    //   isTrustedApkUrl（IP 精确匹配）→ 下载 → 体积 >1MB → md5（云端给了才校）→ 签名证书指纹 → 用户确认 → installApk
+    // 安装不是静默的：走 FileProvider + 系统安装器，缺"安装未知应用"权限时先跳授权页，回来由 onResume 续装。
+
     /**
-     * 验证APK下载URL是否可信
-     * 精确匹配IP，防止URL绕过攻击
+     * 校验 APK 下载地址是否来自可信服务器。
+     * 只认硬编码公网 IP，主机名全等才算可信（只看 URI.host，路径/端口不参与判定）；
+     * 换成域名或内网部署时，这里要和服务端 APK_DOWNLOAD_BASE 一起改。
      */
     private fun isTrustedApkUrl(url: String): Boolean {
         return try {
@@ -1553,7 +1684,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 验证filepath是否安全（防止路径穿越）
+     * filepath 安全性校验（防路径穿越）：只允许相对路径 + 字母数字 _ . / -，禁 ".." 和 http(s) 前缀。
+     *
+     * ⚠️ 已知 BUG（未在本次注释任务内改动）：第一条规则拒绝以 "/" 开头，
+     *    但 /api/version/latest 返回的 filepath 就是 "/apk/xxx.apk"（服务端拼的就是绝对路径形式），
+     *    所以 checkForUpdate 这条自查路径每次都走到"拒绝不安全的filepath"直接 return，
+     *    后面的 `$APK_URL$filepath` 拼接和下载永远执行不到。
+     *    线上 OTA 之所以还能用，靠的是云端推送 action:'update'（命令里带完整 URL，不经过本函数）。
+     *    修法二选一：这里放行 "/apk/" 前缀，或服务端把 filepath 去掉开头的 "/"。
      */
     private fun isValidFilepath(filepath: String): Boolean {
         // 不允许绝对路径
@@ -1568,8 +1706,9 @@ class MainActivity : AppCompatActivity() {
 
 
     /**
-     * 验证APK签名
-     * 检查APK是否由可信证书签名
+     * 校验下载到的 APK 是否由预期证书签名：用 getPackageArchiveInfo(GET_SIGNATURES) 取第一张签名证书 DER，算 SHA-256 指纹，
+     * 与文件顶部的 EXPECTED_CERT_FINGERPRINT 比对（那是 CI 固定 keystore 的证书指纹，见 @tag: sha256）。
+     * 注意这是"签名证书指纹"，不是素材文件的 md5，两者别混。
      */
     private fun verifyApkSignature(apkFile: File): Boolean {
         return try {
@@ -1592,8 +1731,8 @@ class MainActivity : AppCompatActivity() {
             val digest = md.digest(cert)
             val fingerprint = digest.joinToString("") { "%02x".format(it) }
             
-            // P2 fix: 必须配置实际证书指纹才可启用生产 OTA
-            // 未配置指纹时跳过验证，方便测试
+            // 测试后门：指纹仍是占位串时直接放行，方便本地未签名/换签名调试。
+            // 顶部常量已是真实指纹，该条件现在恒不成立（要临时跳过校验就把常量改回占位串）。
             if (EXPECTED_CERT_FINGERPRINT == "YOUR_CERT_FINGERPRINT_HERE") {
                 Log.w(TAG, "APK签名验证未配置，跳过（请在 MainActivity.kt 中配置 EXPECTED_CERT_FINGERPRINT）")
                 return true
@@ -1612,6 +1751,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 设备侧自查更新：延时 5s 后 GET /api/version/latest，服务端 version_code 比本机大才继续。
+     * ⚠️ 但该路径目前被 isValidFilepath 的"禁止 / 开头"规则挡死（服务端返回的就是 "/apk/x.apk"），
+     *    实际生效的只有云端推送 action:'update'；详见 isValidFilepath 的注释。
+     * 调用点有三处（启动、MQTT 连接成功、重连），每次都是新起一个 Handler 延时任务，彼此不去重。
+     */
     private fun checkForUpdate() {
         Handler(Looper.getMainLooper()).postDelayed({
             try {
@@ -1651,7 +1796,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 下载并安装APK
+     * 下载并（经用户确认后）安装 APK。apkUrl 必须是完整地址，不是相对路径。
+     * 顺序：isTrustedApkUrl → 下到 cacheDir/xvj-update-<version>.apk（先删同名旧包）→
+     *       体积 <1MB 视为下载失败 → 有 expectedMd5 才比对（不等则删包退出）→
+     *       verifyApkSignature 比对证书指纹 → 弹不可取消的确认框 → installApk。
+     * md5 为空时（老云端命令没带）就少一道校验，只剩签名指纹兜底。
+     * Toast/对话框都 post 到 mqttHandler（主线程），下载本身在新起的 Thread 里。
      */
     private fun downloadAndInstall(apkUrl: String, version: String, expectedMd5: String? = null) {
         // 安全校验：验证URL来源（精确匹配IP，防止绕过）
@@ -1824,9 +1974,13 @@ class MainActivity : AppCompatActivity() {
 
     // 【A-07】 窗口配置 & 渲染
     /**
-     * 应用场景配置（MQTT同步后或启动时调用）
-     * scenes: 完整 scenes JSON（包含 A 和 B 两套）
-     * 场景A无窗口时，自动创建全屏窗口1播放文件夹01
+     * 全量重建窗口：release 掉全部旧播放器/视图，按 mergeSceneWindows 拿到的 A+B 窗口合集
+     * 依 zIndex 升序逐个 createWindowView + playFolderInWindow。
+     * @param scenes 完整 scenes JSON（A、B 两套都在里面，不是"当前那一幕"）
+     *
+     * 兜底：两幕一个窗口都没有时，才建 DEFAULT_WINDOW_ID 那个 1920x1080 全屏 SCENE_A 窗口
+     *      （不指定 folderId，于是播 A 幕第一个有素材的文件夹）。
+     * 必须在主线程调用（含 addView/removeView），所有调用点都已 post 到 mqttHandler。
      */
     private fun applySceneConfigs(scenes: JSONObject?) {
         logToFile("开始应用场景配置", "INFO", "WINDOW", "CONFIG")
@@ -1967,7 +2121,8 @@ class MainActivity : AppCompatActivity() {
         c.optString("type", "SCENE_A").uppercase() + "|" + c.optString("folderId", "") +
             "|" + c.optString("color", "") + "|" + c.optInt("inputIndex", 0)
 
-    /** 物理文件夹统一带场景前缀：映射键可能是 "01"（纯编号）或 "A01"，但落盘/播放目录只认 scenea/01 形态 */
+    /** 物理文件夹统一带场景前缀：映射键可能是 "01"（纯编号）也可能是 "A01"，这里补齐成 "A01"。
+     *  真正的落盘目录由 playFolderInWindow / syncFolderWithIds 再翻成 scenea/01（无前缀的 "01" 才用根目录 01/） */
     private fun prefixedPhysicalFolder(key: String, sceneKey: String): String =
         if (key.startsWith(sceneKey)) key else sceneKey + key
 
@@ -2291,17 +2446,12 @@ class MainActivity : AppCompatActivity() {
         logToFile("窗口 $winId 开始播放 $folderId (${videos.size}个视频)", "INFO", "PLAYBACK", "START")
     }
 
-    /** 停止指定窗口的播放 */
-    private fun stopWindow(winId: String) {
-        windowPlayers[winId]?.let {
-            it.stop()
-            it.clearMediaItems()
-            Log.d(TAG, "停止窗口 $winId")
-        }
-    }
-
     // 【A-08】 场景切换
-    /** 切换到 A 或 B 场景并重新渲染 */
+    /**
+     * 切换到 A/B 幕：只做"按缓存重渲染"。
+     * ⚠️ 当前无人调用——窗口显示哪一幕由各自的 content.type 决定（applySceneConfigs 把 A+B 的 windows
+     *    合并渲染），currentSceneId 只是 RS485 预留的状态位，改它不影响画面。
+     */
     fun switchScene(sceneId: String) {
         currentSceneId = sceneId.uppercase()
         val cached = prefs.getString("scenes_json", null)
@@ -2315,7 +2465,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 释放所有窗口资源（onDestroy 时调用）*/
+    /**
+     * 释放所有窗口：播放器 release + 视图从 flSurface 摘掉。
+     * 调用点只有两个 —— onDestroy，以及 playWelcomeVideo 切欢迎视频前（避免旧窗口盖住它）。
+     * 注意不清 windowContentSigs：那由下一次 applySceneConfigs 自己清。
+     */
     private fun releaseAllWindows() {
         windowPlayers.values.forEach { it.release() }
         windowPlayers.clear()
@@ -2323,6 +2477,4 @@ class MainActivity : AppCompatActivity() {
         windowViews.clear()
         Log.d(TAG, "释放所有窗口资源")
     }
-
-    // ========== 多窗口系统实现 ==========
 }
