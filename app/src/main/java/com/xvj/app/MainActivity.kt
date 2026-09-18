@@ -872,7 +872,7 @@ class MainActivity : AppCompatActivity() {
                         } else {
                             prefs.edit().putBoolean("last_authorized", false).apply()
                             binding.statusText?.text = "设备未授权"
-                            // 切换到欢迎视频（不停止当前播放）
+                            // 切欢迎视频（playWelcomeVideo 会连旧窗口一起清掉）
                             showUnauthorizedAlert(message)
                         }
                     }
@@ -898,7 +898,7 @@ class MainActivity : AppCompatActivity() {
      * 显示未授权提示并播放欢迎视频
      */
     private fun showUnauthorizedAlert(message: String) {
-        // 直接切换到欢迎视频（不停止当前播放）
+        // 交给 playWelcomeVideo：它内部先 releasePlayer + releaseAllWindows，旧窗口当场就清掉了
         playWelcomeVideo()
         Log.w(TAG, "UNAUTHORIZED: $message")
     }
