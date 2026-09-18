@@ -30,7 +30,10 @@
         android:textSize="14sp"
         android:visibility="visible" />
 
-    <!-- Sync Progress Bar -->
+    <!-- 素材下载进度条：只在房间调试模式（prefs.debug_mode）下由 updateSyncProgress 置 VISIBLE，
+         非调试模式常态播放不给观众看到进度。轨道压成半透明灰，只让绿色填充显眼。
+         注意：窗口容器是运行期 addView 到本 FrameLayout 的，会盖住这里靠后的视图，
+         所以上屏时必须 bringToFront()（见 MainActivity.updateSyncProgress）。 -->
     <ProgressBar
         android:id="@+id/syncProgressBar"
         style="@android:style/Widget.ProgressBar.Horizontal"
@@ -40,6 +43,7 @@
         android:max="100"
         android:progress="0"
         android:progressTint="#4CAF50"
+        android:progressBackgroundTint="#33FFFFFF"
         android:visibility="gone" />
 
 </FrameLayout>

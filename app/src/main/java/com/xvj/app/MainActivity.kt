@@ -9,7 +9,7 @@
  * 【A-02】MQTT 连接（connectMQTT / onMqttConnected / reconnectMQTT）
  * 【A-03】设备注册 & 授权（registerDevice / sendStatus / handleAuthResponse）
  * 【A-04】MQTT 消息处理 & 分发（handleCommand → when(action)）
- * 【A-06】素材同步（syncRoomMaterialsAllScenes / fetchRoomMaterials / syncSceneFolders / syncFolderWithIds / downloadWithETag / deleteMaterialFile）
+ * 【A-06】素材同步（syncRoomMaterialsAllScenes / fetchRoomMaterials / syncSceneFolders / syncFolderWithIds / runDownloadPlan / downloadWithETag / deleteMaterialFile）
  * 【A-07】窗口配置 & 渲染（applySceneConfigs / applyLiveWindowUpdate / createWindowView / playFolderInWindow）
  * 【A-08】场景切换（switchScene / releaseAllWindows）
  * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk / retryPendingInstall）
@@ -22,7 +22,8 @@
  *   1. MQTT 连接（持久连接，复用于所有通信）
  *   2. 设备注册 → 服务端审核 authorized=1 → 回 xvj/auth/response（带 scenes + debug）
  *   3. sync_room_materials 命令 → /api/room-materials-v2/{roomId} 拉全量清单
- *      → 按 Scene A/B 逐文件夹对账（缺的下、多的删）
+ *      → 按 Scene A/B 逐文件夹对账（多的删、缺的/变的进下载计划）
+ *      → runDownloadPlan 串行下载整批计划，按云端下发的字节数刷底部进度条（仅调试模式可见）
  *   4. 播放循环：applySceneConfigs 按 scenes 配置渲染窗口
  * 
  * 房间调试模式（debug_mode）：
@@ -30,6 +31,8 @@
  *     以及 set_debug 指令；HTTP 侧从不设置它（旧注释里的 /api/room-materials 已废弃）
  *   - SharedPreferences 持久化，重启后由 loadConfig() 读回
  *   - true 时 logToFile() 通过 xvj/device/{id}/log 上报到 device_logs 表
+ *   - true 时下载进度上屏（底部 syncProgressBar + 左下角 statusText 的「同步素材 3/12 · 45% · xx.mp4」）；
+ *     关掉就只写日志 —— 设备接投影/大屏，观众看得到画面，常态不放进度条
  * 
  * 素材文件校验契约（改同步前必读）：
  *   - 云端 materials.md5 存的是 **faststart 重封装之后** 的字节摘要（服务端上传时就地重写文件），
@@ -39,6 +42,9 @@
  *     而它内部按 **文件名** 取 If-None-Match —— 若服务端 ETag 没变而 md5 变了，
  *     那个条件 GET 会拿回 304 直接 return false，本地仍是旧文件，下一轮再报不一致（表现为"永远同步不完"）
  *   - 因此服务端就地替换素材文件时必须让 ETag/Last-Modified 一起变（nginx 自动重算，正常没问题）
+ *   - ETag/Last-Modified 只在文件**流写完并且实到字节 == 云端 size** 之后才写回 prefs：中途断线不会
+ *     留下"半截文件 + 已生效 ETag"这种永远修不好的组合。半截文件也不做 Range 续传——素材是同名就地
+ *     替换的（faststart 重封装），旧前缀拼新字节必坏，下一轮一律从 0 重下
  * 
  * 重要约定：
  *   - 设备身份 = deviceId：首启用 fingerprint 播种后写进 SharedPreferences 就不再变，
@@ -738,6 +744,13 @@ class MainActivity : AppCompatActivity() {
                                     Log.d(TAG, "授权后更新订阅: $newCommandTopic")
                                 }
                             }
+                            // debug 字段服务端 auth_result 一直在带（sendAuthResponse 取房间 config.debug），
+                            // 但本机以前只在 sync_room_materials / set_debug 里读 → 首次授权那一场同步里 prefs
+                            // 还是上次遗留值，进度条和日志上报会慢一整轮。这里提前落一次，让同场同步按房间真值显示。
+                            // 只在载荷确实带该字段时才覆盖（老服务端不带 → 保留本机现值）。
+                            if (resp.has("debug")) {
+                                prefs.edit().putBoolean("debug_mode", resp.optBoolean("debug", false)).apply()
+                            }
                             // 触发素材同步（映射真相在 scenes 里，folderMappings 仅作旧服务端兜底）
                             if (folderMappings != null || scenes != null) {
                                 Log.d(TAG, "授权成功: room_id=$roomId")
@@ -1063,15 +1076,32 @@ class MainActivity : AppCompatActivity() {
     // @tag: syncRoomMaterials 素材同步 房间同步
     // @tag: syncFolderWithIds 文件夹同步 下载同步
     // @tag: deleteMaterialFile 删除素材 文件删除
+    // @tag: runDownloadPlan 下载进度条 进度
+    /**
+     * 一轮同步里"确定要下载"的单个文件。
+     * 把"比对"和"下载"分成两段（计划 → 执行），是因为边比对边下载时分母未知，进度条只能按文件数粗算；
+     * 先凑齐 A/B 两幕的整批任务，才能按云端下发的字节数算出真实百分比。
+     * @param size 云端 room-materials-v2 现算的磁盘字节数；取不到时为 0，执行阶段按已知任务的中位数折算
+     */
+    private data class SyncTask(
+        val folderId: String,
+        val destFile: File,
+        val url: String,
+        val filename: String,
+        val size: Long
+    )
+
     /**
      * 房间素材全量对账主流程（一轮 = 一次 HTTP + A/B 两幕逐目录 diff）：
      * 1) 先把 scenes 落到 prefs（scenes 为空会写成空串，等于清掉旧缓存）；
      *    房间 id 本机不再缓存（原 current_room_id 只写不读，已删）。
      * 2) fetchRoomMaterials 拉 /api/room-materials-v2/{roomId} 的 A01/B01 全量清单；
      *    返回 null（请求失败）时直接中止本轮，绝不进"清空"分支。
-     * 3) syncSceneFolders("A"/"B") 按 scenes.A/B.folder_mappings 对账；映射真相只在 scenes 里，
+     * 3) syncSceneFolders("A"/"B") 按 scenes.A/B.folder_mappings 对账：映射有变的下、多的删，
+     *    只**收集**待下载任务不真下载；映射真相只在 scenes 里，
      *    folderMappingsFallback 仅给旧服务端兜底，B 幕缺失时按空映射处理。
-     * 4) 回主线程 applySceneConfigs：优先用本次载荷的 scenes，没有才回落 prefs 缓存。
+     * 4) runDownloadPlan 按字节进度逐个下载（调试模式下底部进度条可见），串行、单线程。
+     * 5) 回主线程 applySceneConfigs：优先用本次载荷的 scenes，没有才回落 prefs 缓存。
      * @param roomId       房间 ID（决定清单接口）
      * @param scenes       完整 scenes JSON（含 A/B 两套 windows + folder_mappings）
      */
@@ -1091,12 +1121,19 @@ class MainActivity : AppCompatActivity() {
                 val fmB = scenes?.optJSONObject("B")?.optJSONObject("folder_mappings") ?: org.json.JSONObject()
 
                 // 拉取失败返回 null：保持本地现状中止本轮，绝不进入清空分支
-                val allMaterials = fetchRoomMaterials(roomId) ?: return@submit
+                val allMaterials = fetchRoomMaterials(roomId)
+                if (allMaterials == null) {
+                    hideSyncProgress()   // fetchRoomMaterials 内部已把 statusText 改成失败文案，这里只收条
+                    return@submit
+                }
 
-                syncSceneFolders("A", fmA, allMaterials)
-                syncSceneFolders("B", fmB, allMaterials)
+                val plan = ArrayList<SyncTask>()
+                plan.addAll(syncSceneFolders("A", fmA, allMaterials))
+                plan.addAll(syncSceneFolders("B", fmB, allMaterials))
+                runDownloadPlan(plan)
 
                 mqttHandler.post {
+                    binding.syncProgressBar?.visibility = View.GONE
                     binding.statusText?.text = "素材同步完成"
                     val scenesToApply = scenes ?: prefs.getString("scenes_json", null)?.let {
                         try { org.json.JSONObject(it) } catch (e: Exception) { null }
@@ -1114,9 +1151,89 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "Room materials sync error: " + e.message)
                 logToFile("房间素材同步异常: ${e.message}", "ERROR", "SYNC", "ERROR")
                 mqttHandler.post {
+                    binding.syncProgressBar?.visibility = View.GONE
                     binding.statusText?.text = "素材同步失败"
                 }
             }
+        }
+    }
+
+    /**
+     * 执行下载计划：串行下载 + 按字节刷新进度（进度只在 debug_mode 下上屏，见 updateSyncProgress）。
+     *
+     * 分母口径：云端每条素材带 size（服务端 statSync 现算）。size 全为 0（老服务端 / 文件已删）时
+     * 回落到"按文件数"计——每个任务按 1 字节算，进度仍是单调的。部分有 size 时，0 大小的任务
+     * 按已知任务的中位数折算（不用平均数：一个 2GB 素材会把平均数撑爆、让其余小文件瞬间跑完）。
+     *
+     * 计划阶段（syncFolderWithIds）已经把 md5 一致的、304 命中的都尽量剔掉了，剩下的是真要下载的；
+     * 但 downloadWithETag 仍可能返回 false（文件名 ETag 未变 → 304，见 syncFolderWithIds 的判定顺序），
+     * 此时按"整只文件大小"计入已完成字节，否则进度条会卡在最后几个文件上下不来。
+     */
+    private fun runDownloadPlan(tasks: List<SyncTask>) {
+        if (tasks.isEmpty()) {
+            // 本地已齐：不显示进度条，并把上一轮可能留下的 100% 细条收掉
+            hideSyncProgress()
+            logToFile("素材对账完成: 无需下载（映射内素材本地已齐）")
+            return
+        }
+
+        val known = tasks.map { it.size }.filter { it > 0L }.sorted()
+        val fallback = if (known.isEmpty()) 1L else known[known.size / 2]
+        val weights = tasks.map { if (it.size > 0L) it.size else fallback }
+        val total = weights.fold(0L) { a, b -> a + b }
+
+        // 起头显一次：0% 也要让现场看到"开始同步了"（中位数折算完才知道总字节数）
+        updateSyncProgress(0L, total, tasks.size, 0, "准备中")
+
+        var done = 0L
+        for (idx in tasks.indices) {
+            val t = tasks[idx]
+            val w = weights[idx]
+            logToFile("下载: ${t.folderId}/${t.filename} (${w / 1024}KB)")
+            val progressCb: (Long) -> Unit = { downloadedBytes ->
+                updateSyncProgress(done + downloadedBytes, total, tasks.size, idx, t.filename)
+            }
+            downloadWithETag(t.url, t.destFile, t.filename, t.size, progressCb)
+            done += w
+            updateSyncProgress(done, total, tasks.size, idx, t.filename)
+        }
+    }
+
+    /**
+     * 进度条显隐/文案的唯一出口。
+     *
+     * 可见范围 = 仅房间调试模式（prefs.debug_mode）：设备接投影/大屏时观众看得到画面，
+     * 常态播放页不该冒出进度条；非调试模式只留 logToFile，不上屏。
+     *
+     * 线程：只在 downloadExecutor 线程被调用（开环 0%、256KB 字节回调、每个文件收尾各一次），
+     * 百分比在调用线程算好后连文案一起 post 给 mqttHandler —— 不留任何共享可变状态，
+     * 理论上两轮同步并发时最坏只是显示上互相覆盖一下，不会算错或崩。
+     *
+     * bringToFront 是必需的：窗口容器是 applySceneConfigs 之后 addView 到同一个根 FrameLayout 的，
+     * 会盖住 XML 里靠后的 statusText / syncProgressBar。
+     */
+    private fun updateSyncProgress(doneBytes: Long, totalBytes: Long, totalFiles: Int, taskIndex: Int, filename: String) {
+        if (!prefs.getBoolean("debug_mode", false)) return
+        val done = doneBytes.coerceAtMost(totalBytes)
+        val percent = if (totalBytes <= 0L) 100 else ((done * 100) / totalBytes).toInt().coerceIn(0, 100)
+        val text = "同步素材 ${taskIndex + 1}/$totalFiles · $percent% · $filename"
+        mqttHandler.post {
+            binding.syncProgressBar?.let { bar ->
+                bar.visibility = View.VISIBLE
+                bar.progress = percent
+                bar.bringToFront()
+            }
+            binding.statusText?.let { tv ->
+                tv.text = text
+                tv.bringToFront()
+            }
+        }
+    }
+
+    /** 收掉进度条：只改 syncProgressBar，不动 statusText（失败文案由调用方自己写） */
+    private fun hideSyncProgress() {
+        mqttHandler.post {
+            binding.syncProgressBar?.visibility = View.GONE
         }
     }
 
@@ -1153,41 +1270,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 对账单幕 30 个文件夹：映射有素材 → 按云端清单下载/删除；未映射或空 → 清空本地目录
+     * 对账单幕 30 个文件夹：映射有素材 → 比对出待下载任务、删除多余；未映射或空 → 清空本地目录
+     * @return 本幕所有文件夹凑出的下载计划（不在此处下载，交给 runDownloadPlan 统一跑进度）
      */
-    private fun syncSceneFolders(scenePrefix: String, folderMappings: org.json.JSONObject, allMaterials: MutableMap<String, org.json.JSONArray>) {
+    private fun syncSceneFolders(scenePrefix: String, folderMappings: org.json.JSONObject, allMaterials: MutableMap<String, org.json.JSONArray>): List<SyncTask> {
+        val tasks = ArrayList<SyncTask>()
         for (i in 1..30) {
             val folderNum = String.format("%02d", i)
             val prefixedKey = scenePrefix + folderNum  // "A01", "B02"
             // 键格式兼容：统一带前缀（"A01"）；纯编号（"01"）为旧数据兜底
             val materialIds = folderMappings.optJSONArray(prefixedKey) ?: folderMappings.optJSONArray(folderNum)
             if (materialIds != null && materialIds.length() > 0) {
-                syncFolderWithIds(prefixedKey, materialIds, allMaterials[prefixedKey])
+                tasks.addAll(syncFolderWithIds(prefixedKey, materialIds, allMaterials[prefixedKey]))
             } else {
                 deleteFolderFiles(prefixedKey)
             }
         }
+        return tasks
     }
 
     /**
-     * 按 material IDs 精确同步单个文件夹
+     * 按 material IDs 精确比对单个文件夹 —— **只做计划，不下载**
      * @param folderId   文件夹 ID（支持 scene-prefixed 格式，如 "A01"）
      * @param materialIds 要同步的素材 ID 数组
      * @param cloudList  预获取的云端素材列表（可避免重复请求）
-     * 流程：比对本地与云端素材，下载缺失/变化的，删除多余的
+     * @return 该文件夹需要下载的任务（由调用方攒齐后交给 runDownloadPlan，进度条才知道总字节数）
+     * 流程：比对本地与云端素材，缺的/变的进计划，多的删掉
      * 判定顺序（这决定了"为什么改了文件设备却不更新"）：
      *   1. 本地存在该文件 && 云端 md5 非空 && 本地 md5 相等 → 跳过，连请求都不发
-     *   2. 其余情况一律进 downloadWithETag：它先看按文件名存的 ETag，
+     *   2. 其余情况一律进计划，由 downloadWithETag 先看按文件名存的 ETag，
      *      命中 304 就直接 return false —— 也就是"云端 md5 变了但 ETag 没变"会被静默吃掉，
      *      本地保持旧文件、下一轮同步再重复报不一致。云端就地替换素材字节时必须让 ETag 一起变。
      *   3. 云端 md5 为空（老记录/预设引用）时只靠 ETag 去重，这是有意为之的兜底路径
      */
-    private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?) {
+    private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?): List<SyncTask> {
+        val tasks = ArrayList<SyncTask>()
         try {
             if (cloudList == null || cloudList.length() == 0) {
                 Log.d(TAG, "文件夹 " + folderId + " 无云端素材")
                 deleteFolderFiles(folderId)
-                return
+                return tasks
             }
 
             val idsSet = mutableSetOf<String>()
@@ -1230,10 +1352,9 @@ class MainActivity : AppCompatActivity() {
                             continue
                         }
                     }
-                    Log.d(TAG, "下载: " + filename)
-                    logToFile("下载: " + filename)
-                    // ETag 条件请求下载：md5 为空的素材（如预设素材）靠 ETag 避免每轮重下
-                    downloadWithETag(downloadUrl, localFile, filename)
+                    Log.d(TAG, "计划下载: " + filename)
+                    // size 由云端 statSync 现算（老服务端没这个字段时 optLong 给 0，执行阶段按中位数折算）
+                    tasks.add(SyncTask(folderId, localFile, downloadUrl, filename, item.optLong("size", 0L)))
                 }
             }
 
@@ -1250,11 +1371,12 @@ class MainActivity : AppCompatActivity() {
                     file.delete()
                 }
             }
-            Log.d(TAG, "文件夹 " + folderId + " 同步完成")
+            Log.d(TAG, "文件夹 " + folderId + " 对账完成: " + tasks.size + " 个待下载")
         } catch (e: Exception) {
             Log.e(TAG, "syncFolderWithIds " + folderId + " 失败: " + e.message)
             logToFile("同步文件夹" + folderId + " 失败: " + e.message)
         }
+        return tasks
     }
 
     /**
@@ -1469,16 +1591,31 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 带 ETag/Last-Modified 条件请求的文件下载
-     * @param filename 缓存键用的文件名（etag_/lm_ 前缀 + 它）；调用方传的正是 destFile.name
+     * @param filename     缓存键用的文件名（etag_/lm_ 前缀 + 它）；调用方传的正是 destFile.name
+     * @param expectedSize 云端下发的完整字节数，只用来收尾自检；0 = 未知（老服务端/取不到）
+     * @param onProgress   本次写入的字节数回调，每 ≥256KB 一次；null = 不回报
      * @return true = 实际写了文件；false = 服务端说没变，本地原样保留
      *
-     * 一次调用只发 1 个条件 GET：304 就原样保留本地文件返回 false，2xx 才落盘并把新的
-     * ETag/Last-Modified 写回缓存。历史版本在这里叠了最多 3 个 HEAD + 1 个 GET，
-     * 而每个 HEAD 的判定（带 If-None-Match，304 则跳过）都与最后那个条件 GET 完全重复，已合并。
+     * 一次调用只发 1 个条件 GET：304 就原样保留本地文件返回 false，2xx 才落盘。历史版本在这里叠了
+     * 最多 3 个 HEAD + 1 个 GET，而每个 HEAD 的判定（带 If-None-Match，304 则跳过）都与最后那个条件
+     * GET 完全重复，已合并。
+     *
+     * 两条和进度条直接相关的规矩：
+     *   - ETag/Last-Modified 在**流写完之后**才写回 prefs，且实到字节与云端 size 不符时不写。
+     *     早先版本收到响应头就写，于是"下到一半断线"会留下【半截文件 + 已生效的 ETag】，
+     *     下一轮条件 GET 拿回 304，那个坏文件永远修不好（进度条也会每次都一秒跳完、素材却播不出来）。
+     *   - 不做 Range 断点续传：同名素材在云端是"就地替换"的（faststart 重封装就是同名改字节），
+     *     续传会把新字节拼在旧前缀后面变成坏文件。宁可下一轮从 0 重下。
      *
      * 注意：md5 不一致但 ETag 没变时，这里会返回 false 而不下载 —— 语义见 syncFolderWithIds 的判定顺序。
      */
-    private fun downloadWithETag(urlStr: String, destFile: File, filename: String): Boolean {
+    private fun downloadWithETag(
+        urlStr: String,
+        destFile: File,
+        filename: String,
+        expectedSize: Long = 0L,
+        onProgress: ((Long) -> Unit)? = null
+    ): Boolean {
         val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
         val cachedLm = prefs.getString(PREF_LM_PREFIX + filename, null)
         // 本地文件不在/为空 ⇒ 缓存的 ETag 一律不作数（带了会被 nginx 判成 304，旧文件永远下不回来）
@@ -1504,19 +1641,38 @@ class MainActivity : AppCompatActivity() {
 
             val newEtag = conn.getHeaderField("ETag")
             val newLm = conn.getHeaderField("Last-Modified")
-            if (newEtag != null) prefs.edit().putString(PREF_ETAG_PREFIX + filename, newEtag).apply()
-            if (newLm != null) prefs.edit().putString(PREF_LM_PREFIX + filename, newLm).apply()
 
+            var written = 0L
             conn.inputStream.use { input ->
                 FileOutputStream(destFile).use { output ->
                     val buffer = ByteArray(65536)
                     var bytesRead: Int
+                    var lastReport = 0L
                     while (input.read(buffer).also { bytesRead = it } != -1) {
                         output.write(buffer, 0, bytesRead)
+                        val cb = onProgress
+                        if (cb != null) {
+                            written += bytesRead
+                            // 256KB 一节流：5MB 级素材有足够刷新点，又不会把主线程刷爆
+                            if (written - lastReport >= 262144L) {
+                                lastReport = written
+                                cb(written)
+                            }
+                        }
                     }
                 }
             }
             conn.disconnect()
+
+            if (expectedSize > 0L && destFile.length() != expectedSize) {
+                // 只告警、不存 ETag、不清理：下一轮因拿不到新 ETag 会重新完整下载
+                logToFile("下载字节数与云端 size 不符: $filename 实到${destFile.length()} 期望$expectedSize",
+                    "WARN", "SYNC", "DOWNLOAD")
+            } else {
+                // 写完了、字节数也对得上，才认这个 ETag/Last-Modified（见上面"两条规矩"）
+                if (newEtag != null) prefs.edit().putString(PREF_ETAG_PREFIX + filename, newEtag).apply()
+                if (newLm != null) prefs.edit().putString(PREF_LM_PREFIX + filename, newLm).apply()
+            }
             Log.d(TAG, "下载完成: $filename")
             logToFile("下载完成: $filename (${destFile.length() / 1024}KB)", "INFO", "SYNC", "DOWNLOAD")
             true
