@@ -9,8 +9,10 @@
  * 【A-02】MQTT 连接（connectMQTT / onMqttConnected / reconnectMQTT）
  * 【A-03】设备注册 & 授权（registerDevice / sendStatus / handleAuthResponse）
  * 【A-04】MQTT 消息处理 & 分发（handleCommand → when(action)）
- * 【A-06】素材同步（syncRoomMaterialsAllScenes / fetchRoomMaterials / syncSceneFolders / syncFolderWithIds / runDownloadPlan / downloadWithETag / deleteMaterialFile）
- * 【A-07】窗口配置 & 渲染（applySceneConfigs / applyLiveWindowUpdate / createWindowView / playFolderInWindow）
+ * 【A-06】素材同步（requestRoomMaterialSync / runRoomSyncLoop / doRoomMaterialSync / fetchRoomMaterials /
+ *         syncSceneFolders / syncFolderWithIds / runDownloadPlan / downloadWithETag / cachedMd5 /
+ *         clearMaterialCache / deleteMaterialFile）
+ * 【A-07】窗口配置 & 渲染（applySceneConfigs / scenesFingerprint / applyLiveWindowUpdate / createWindowView / playFolderInWindow）
  * 【A-08】场景切换（switchScene / releaseAllWindows）
  * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk / retryPendingInstall）
  * 【A-10】系统 UI（hideSystemUI）
@@ -19,12 +21,20 @@
  * ─────────────────────────────────────────────────
  * 
  * 核心流程：
- *   1. MQTT 连接（持久连接，复用于所有通信）
- *   2. 设备注册 → 服务端审核 authorized=1 → 回 xvj/auth/response（带 scenes + debug）
- *   3. sync_room_materials 命令 → /api/room-materials-v2/{roomId} 拉全量清单
+ *   1. MQTT 连接（持久连接，复用于所有通信；command/auth 两个订阅都订 QoS 1）
+ *   2. 设备注册 → 服务端审核 authorized=1 → 回 xvj/auth/response（带 scenes + debug + rev）
+ *   3. sync_room_materials 命令 → requestRoomMaterialSync 按房间去重后进对账：
+ *      /api/room-materials-v2/{roomId} 拉全量清单
  *      → 按 Scene A/B 逐文件夹对账（多的删、缺的/变的进下载计划）
  *      → runDownloadPlan 串行下载整批计划，按云端下发的字节数刷底部进度条（仅调试模式可见）
- *   4. 播放循环：applySceneConfigs 按 scenes 配置渲染窗口
+ *   4. 播放循环：applySceneConfigs 按 scenes 配置渲染窗口（结构与屏上一致则直接跳过，见幂等闸门）
+ *
+ * 配置版本对账契约（rev，改同步前必读）：
+ *   - rev = 服务端对房间 scenes 算的 12 位 sha1 指纹，随 auth_result / sync_room_materials / update_windows 下发；
+ *     本机只在"这份配置真的落地"之后才记进 appliedRev（prefs 存一份，冷启动第一次心跳就能报）
+ *   - 心跳 xvj/device/{id}/status 带 rev + syncing；服务端 reconcileDeviceRev 拿它和房间真值比，
+ *     落后就补发同步（同一设备 3 分钟最多一次，syncing=true 时跳过）—— 丢消息、离线改配置全靠这条兜底
+ *   - 本机不自己算 rev（算不出服务端那套序列化口径），只负责"落地了哪一版就回传哪一版"
  * 
  * 房间调试模式（debug_mode）：
  *   - 写入只经 setDebugMode()，三个来源：auth_result 与 sync_room_materials 的 debug 字段、
@@ -165,6 +175,25 @@ class MainActivity : AppCompatActivity() {
     // 正在处理的 OTA 版本号：同一版本的下载/确认框只允许一条流程，避免启动+连接+重连三路触发刷屏
     private var otaBusyVersion: String? = null
 
+    // ========== 素材同步在飞去重 & 配置版本对账 ==========
+    /** 一条同步请求：载荷 + 服务端配置指纹。见 requestRoomMaterialSync */
+    private data class SyncRequest(
+        val roomId: String,
+        val folderMappingsFallback: org.json.JSONObject,
+        val scenes: org.json.JSONObject?,
+        val rev: String
+    )
+    /** 正在跑对账的房间；同房间新的一轮只记进 syncPending，不并发下载同一批文件 */
+    private val syncInFlight = mutableSetOf<String>()
+    /** 在飞期间收到的后指令：每个房间只留最后一条（服务端只会朝一个目标收敛，中间的都没意义） */
+    private val syncPending = mutableMapOf<String, SyncRequest>()
+    /** syncInFlight / syncPending 的锁；MQTT 回调线程写、下载线程读写 */
+    private val syncLock = Any()
+    /** 本机已应用的 scenes 结构指纹：同指纹不再全量重建（重建会打断正在播的视频） */
+    private var appliedScenesFp: String? = null
+    /** 本机已应用的房间配置 rev（心跳回传，服务端拿它和房间真值比对，落后就补发同步）；重启后仍以 prefs 为准 */
+    private var appliedRev: String = ""
+
     companion object {
         private const val TAG = "XVJPlayer"
         /** 窗口容器内亮度遮罩视图的 tag 标识（实时更新时定位/增删遮罩） */
@@ -175,6 +204,8 @@ class MainActivity : AppCompatActivity() {
         // ETag/Last-Modified 缓存的 SharedPreferences key 前缀
         private const val PREF_ETAG_PREFIX = "etag_"
         private const val PREF_LM_PREFIX = "lm_"
+        // 素材 md5 缓存前缀：值为 "<文件字节数>:<mtime>:<md5>"，尺寸或改动时间变了即失效
+        private const val PREF_MD5_PREFIX = "md5_"
     }
 
     // 【A-11】 工具方法
@@ -240,9 +271,10 @@ class MainActivity : AppCompatActivity() {
     // 【A-01】 生命周期 & 初始化
     // ==================== 生命周期 & 初始化 ====================
     // onCreate 一次性装配：权限/横屏/常亮/全屏 → 崩溃兜底 handler → 建素材目录 → 读版本号 →
-    //   生成指纹 → loadConfig（deviceId/mqttServer 等本机配置）→ connectMQTT → checkForUpdate。
-    // 窗口画面不由 onCreate 直接起，只由云端触发：auth_result 带 scenes 时立即 applySceneConfigs，
-    // 或 sync_room_materials 同步完成后用载荷里的 scenes（没有就回落到 prefs 的 scenes_json 缓存）。
+    //   生成指纹 → loadConfig（deviceId/mqttServer/debug_mode/applied_rev）→ restoreCachedScenes →
+    //   connectMQTT → checkForUpdate。
+    // 画面起点有两级：冷启动先按上次授权态留下的 scenes_json 直接开播（不等网络，见 restoreCachedScenes），
+    //   云端 auth_result / sync_room_materials 到了再按真值校正 —— 配置没变时幂等闸门会挡掉重建，不会重头播。
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -314,6 +346,9 @@ class MainActivity : AppCompatActivity() {
 
         // 加载本机配置（deviceId 等），不含窗口/scenes —— 窗口要等云端指令
         loadConfig()
+
+        // 上次是授权态就先按缓存开播，不等 MQTT 往返（见 restoreCachedScenes）
+        restoreCachedScenes()
 
         // 连接MQTT（注册→授权回执里带 scenes 时才第一次 applySceneConfigs）
         connectMQTT()
@@ -506,6 +541,9 @@ class MainActivity : AppCompatActivity() {
         // clientId 必须严格等于 deviceId：broker ACL 用 pattern xvj/device/%c/# 做设备间隔离
         mqttClientId = deviceId
 
+        // 回读上次已应用的配置版本：心跳一上来就能报 rev，服务端据此判断房间真值有没有比本机新
+        appliedRev = prefs.getString("applied_rev", "") ?: ""
+
         Log.d(TAG, "Device ID: $deviceId")
 
         // 按 prefs 里的 debug_mode 刷一次运维层（启动即决定左下角文字/进度条是否可见）
@@ -513,8 +551,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 冷启动离线恢复：上一次是授权态就把 scenes_json 直接摆上屏，
+     * 不让大屏在"连 MQTT → 注册 → 授权回执"这一两秒（断网时更久）里黑着。
+     * 与随后到的 auth_result 不冲突：applySceneConfigs 按结构指纹幂等，配置没变不会二次重建、视频不重头播。
+     * ⚠️ 授权真值只在云端：本机若已被废止或改绑，回执落地时会切欢迎视频 / 按新配置重建，最多错这几秒。
+     */
+    private fun restoreCachedScenes() {
+        if (!prefs.getBoolean("last_authorized", false)) return
+        val cached = prefs.getString("scenes_json", null) ?: return
+        try {
+            applySceneConfigs(org.json.JSONObject(cached))
+            binding.statusText?.text = "离线恢复上次画面"
+            logToFile("冷启动按缓存恢复窗口（待云端确认）", "INFO", "WINDOW", "CONFIG")
+        } catch (e: Exception) {
+            Log.e(TAG, "冷启动恢复缓存失败: ${e.message}")
+            logToFile("冷启动恢复缓存失败: ${e.message}", "ERROR", "WINDOW", "ERROR")
+        }
+    }
+
+    /**
      * debug_mode 的唯一写入口：落 prefs + 立刻刷新运维层显隐。
      * 三个来源都走这里：auth_result 与 sync_room_materials 载荷的 debug 字段、set_debug 指令。
+     * ⚠️ 调用方必须先判"载荷里到底有没有 debug 字段"再进来（optBoolean 把没带当成 false，
+     *    而 update_windows 这类载荷本来就不带）—— 判护在各自的调用点，见 handleCommand。
      */
     private fun setDebugMode(debug: Boolean) {
         prefs.edit().putBoolean("debug_mode", debug).apply()
@@ -548,9 +607,10 @@ class MainActivity : AppCompatActivity() {
      * - 注册设备并请求授权状态同步
      * - 连接成功后触发 checkForUpdate
      * - 支持指数退避重连（5s → 最大300s）
-     * 注：command/auth 两个订阅都是 QoS 0，服务端即便按 QoS 1 发布，链路仍降级为 0（不重发）。
-     *     会话是 isCleanSession=false，所以断线期间服务端以 QoS 1 发的指令会由 broker 排队、重连后补投；
-     *     但服务端部分 publish（如 xvj/auth/response 的多数分支）没带 qos 选项，那是 QoS 0，错过就没有。
+     * 注：两个订阅都订 QoS 1 —— 订阅端的 QoS 才是链路上限，服务端即使按 QoS 1 发布，
+     *     只要这里写 0 就仍会降级成"发一次不等确认、断了不补投"。配合 isCleanSession=false，
+     *     断线期间服务端以 QoS 1 发的指令由 broker 排队、重连后按序补投（画面最终停在最后一条，
+     *     中间态重放一遍也不改变结果：update_windows 幂等、素材同步按房间去重后只对账一次）。
      */
     private fun connectMQTT() {
         downloadExecutor.submit {
@@ -609,8 +669,8 @@ class MainActivity : AppCompatActivity() {
                     Log.d(TAG, "MQTT Connected! Subscribed to: $commandTopic")
                     logToFile("MQTT Connected OK!")
                     onMqttConnected()  // P4 fix: 重置退避计数器
-                    mqttClient?.subscribe(commandTopic, 0)
-                    mqttClient?.subscribe(AUTH_TOPIC, 0)
+                    mqttClient?.subscribe(commandTopic, 1)
+                    mqttClient?.subscribe(AUTH_TOPIC, 1)
                     registerDevice()
                     mqttHandler.post {
                         binding.statusText?.text = "云端已连接"
@@ -669,7 +729,11 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 发送设备状态到MQTT
-     * 主题 xvj/device/{id}/status，载荷只有 status/version/version_code/timestamp；
+     * 主题 xvj/device/{id}/status，载荷 status/version/version_code/timestamp + rev/syncing：
+     *   rev     = 本机已应用的房间配置指纹（appliedRev，从没应用过带 rev 的载荷时不带这个字段）；
+     *             服务端【S-06】reconcileDeviceRev 拿它和房间真值比对，落后就补发一次同步 ——
+     *             这是 QoS 丢消息 / 设备离线期间改配置的唯一兜底收敛路径。
+     *   syncing = 此刻是否有素材对账在飞；为 true 时服务端跳过对账，免得下载中途被再插一刀。
      * 服务端把 status 落到 devices.status、整段原文存 devices.status_data（该列没有读侧），
      * 并因带了 version/version_code 而 UPSERT device_versions —— 后台"版本管理"页看的正是这张表。
      * 未授权设备同样在上报，服务端不区分；心跳本身 30s 一次，不写 operation_logs。
@@ -679,10 +743,13 @@ class MainActivity : AppCompatActivity() {
         try {
             val deviceId = prefs.getString("device_id", null) ?: return
             val statusTopic = "xvj/device/$deviceId/status"
+            val syncing = synchronized(syncLock) { syncInFlight.isNotEmpty() }
             val payload = JSONObject().apply {
                 put("status", status)
                 put("version", VERSION_NAME)
                 put("version_code", VERSION_CODE)
+                put("syncing", syncing)
+                if (appliedRev.isNotEmpty()) put("rev", appliedRev)
                 put("timestamp", System.currentTimeMillis())
             }
             mqttClient?.publish(statusTopic, payload.toString().toByteArray(), 1, false)
@@ -691,6 +758,17 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Failed to send status: ${e.message}")
             logToFile("发送状态失败: ${e.message}")
         }
+    }
+
+    /**
+     * 记一笔"本机已应用到配置版本 rev"：内存里给心跳用，prefs 里留一份给重启后的第一次心跳。
+     * 只在对应配置真的应用完才调（服务端按此判断要不要补发同步，报早了会把差异吞掉）。
+     */
+    private fun markAppliedRev(rev: String) {
+        if (rev.isEmpty() || rev == appliedRev) return
+        appliedRev = rev
+        prefs.edit().putString("applied_rev", rev).apply()
+        logToFile("配置版本已应用: rev=$rev", "INFO", "SYNC", "CONFIG")
     }
 
     /** 起 30s 心跳：先撤掉旧的 Runnable 再挂新的，所以重复调用不会叠加定时器 */
@@ -722,7 +800,8 @@ class MainActivity : AppCompatActivity() {
      * ⚠️ AUTH_TOPIC 是全设备共享广播，所以开头那道 device_id 校验是唯一的隔离手段：
      *    targetId 非空且既不是本机 deviceId 也不是指纹 → 直接忽略；deauthorize 缺 targetId 也忽略。
      *    targetId 为空串的 auth_result 例外放行（老服务端不回带 id）。
-     * 每次注册后服务端都会回一份，本机不靠 prefs 里的 authorized/room_id 自行恢复画面（那两个键只写不读）。
+     * 每次注册后服务端都会回一份。冷启动的画面不等这份回执 —— 上次是授权态时 onCreate 会先用
+     * scenes_json 缓存开播（restoreCachedScenes），这里只负责按真值校正；last_authorized 就是那道闸门。
      */
     private fun handleAuthResponse(payload: String) {
         try {
@@ -747,19 +826,20 @@ class MainActivity : AppCompatActivity() {
                     val folderMappings = resp.optJSONObject("folder_mappings")
                     // 提取 scenes 配置（包含 A/B 两套窗口配置和各自 folder_mappings）
                     val scenes = resp.optJSONObject("scenes")
+                    val rev = resp.optString("rev", "")
 
                     mqttHandler.post {
                         if (authorized) {
+                            prefs.edit().putBoolean("last_authorized", true).apply()
                             binding.statusText?.text = "已授权至房间 $roomId"
                             // 停止欢迎视频等旧播放器
                             releasePlayer()
-                            // 授权状态本机不落 prefs（历史上写过 authorized/room_id 两个键，全程无人读，
-                            // 已删）：真值只在云端 devices 表，本机靠 scenes_json 缓存 + 每次 auth_result 覆盖。
-                            // 保存 scenes 配置（包含 A/B 的 folder_mappings）
+                            // 授权真值只在云端 devices 表；本机只留两样：scenes_json 缓存（冷启动恢复画面用）
+                            // 和 last_authorized（能不能用这份缓存），每次 auth_result 覆盖。
                             if (scenes != null) {
                                 prefs.edit().putString("scenes_json", scenes.toString()).apply()
                                 Log.d(TAG, "授权成功，已保存 scenes: ${scenes.names()}")
-                                // 立即应用窗口配置（离线期间云端可能已改过布局）
+                                // 立即应用窗口配置（离线期间云端可能已改过布局）；rev 要等素材对账跑完才记账
                                 applySceneConfigs(scenes)
                                 // 死分支，保留仅作前向兼容：服务端 sendAuthResponse 只是把 topic 里的
                                 // deviceId 原样回显，不会改派新 uuid；而上面的 targetId 校验已经保证
@@ -771,7 +851,7 @@ class MainActivity : AppCompatActivity() {
                                     prefs.edit().putString("device_id", deviceId).apply()
                                     mqttClientId = deviceId
                                     val newCommandTopic = "xvj/device/$deviceId/command"
-                                    mqttClient?.subscribe(newCommandTopic, 0)
+                                    mqttClient?.subscribe(newCommandTopic, 1)
                                     Log.d(TAG, "授权后更新订阅: $newCommandTopic")
                                 }
                             }
@@ -782,13 +862,15 @@ class MainActivity : AppCompatActivity() {
                             if (resp.has("debug")) {
                                 setDebugMode(resp.optBoolean("debug", false))
                             }
-                            // 触发素材同步（映射真相在 scenes 里，folderMappings 仅作旧服务端兜底）
+                            // 触发素材同步（映射真相在 scenes 里，folderMappings 仅作旧服务端兜底）；
+                            // rev 随请求走，对账真的跑完才记进 appliedRev 给心跳对账用
                             if (folderMappings != null || scenes != null) {
                                 Log.d(TAG, "授权成功: room_id=$roomId")
                                 logToFile("开始根据房间配置同步素材...")
-                                syncRoomMaterialsAllScenes(roomId, folderMappings ?: org.json.JSONObject(), scenes)
+                                requestRoomMaterialSync(roomId, folderMappings ?: org.json.JSONObject(), scenes, rev)
                             }
                         } else {
+                            prefs.edit().putBoolean("last_authorized", false).apply()
                             binding.statusText?.text = "设备未授权"
                             // 切换到欢迎视频（不停止当前播放）
                             showUnauthorizedAlert(message)
@@ -799,6 +881,8 @@ class MainActivity : AppCompatActivity() {
                     // 被远程废掉
                     logToFile("本机被废止: $targetId ${resp.optString("message", "")}", "ERROR", "AUTH")
                     mqttHandler.post {
+                        // 撤掉冷启动缓存的放行标志：下次开机不再拿这份已失效的画面抢先播
+                        prefs.edit().putBoolean("last_authorized", false).apply()
                         binding.statusText?.text = "已废止"
                         showUnauthorizedAlert("设备已被远程废止，请联系管理员")
                     }
@@ -937,18 +1021,22 @@ class MainActivity : AppCompatActivity() {
                     // 接收房间素材同步，下载到本地文件夹
                     val roomId = cmd.optString("room_id", "")
                     val folderMappings = cmd.optJSONObject("folder_mappings")
-                    // debug 字段以命令为准：每次都覆盖（服务端从房间配置里带过来）
-                    val debug = cmd.optBoolean("debug", false)
-                    setDebugMode(debug)
+                    // debug 只在命令确实带这个字段时才覆盖：服务端只在 sync_room_materials / auth_result /
+                    // set_debug 三种载荷里带它（update_windows 就不带），用 optBoolean 会把"没带"当成 false，
+                    // 手工推的指令漏了字段就会把设备调试模式误关掉
+                    val hasDebug = cmd.has("debug")
+                    val debug = hasDebug && cmd.optBoolean("debug", false)
+                    if (hasDebug) setDebugMode(debug)
                     val fmKeys = java.lang.StringBuilder()
                     folderMappings?.keys()?.let { val k = it; while (k.hasNext()) { fmKeys.append(k.next()).append(",") } }
                     logToFile("sync_room_materials: roomId=$roomId, folderMappings=" + fmKeys.toString() + ", debug=$debug")
 
-                    // 解析并持久化 scenes（A/B 两套窗口配置）
+                    // 先把窗口配置摆上屏（不等素材下载完，改布局时现场要立刻看到），再进去重后的对账。
+                    // 对账结束时还会 apply 一次，但那次带 force：真下载了东西才重建，否则按结构指纹跳过，
+                    // 所以一条同步命令不再等于两轮全量重建。scenes_json 的落盘统一在同步轮里做。
                     val scenes = cmd.optJSONObject("scenes")
                     if (scenes != null) {
-                        prefs.edit().putString("scenes_json", scenes.toString()).apply()
-                        Log.d(TAG, "已保存 scenes 到本地: ${scenes.names()}")
+                        Log.d(TAG, "已收到 scenes: ${scenes.names()}")
                         // applySceneConfigs 含 addView/removeView 等 UI 操作，必须在主线程执行
                         mqttHandler.post { applySceneConfigs(scenes) }
                     } else {
@@ -971,7 +1059,8 @@ class MainActivity : AppCompatActivity() {
                         val k = folderMappings?.keys()
                         k?.let { while (it.hasNext()) { foldersStr.append(it.next()).append(",") } }
                         logToFile("准备同步素材: roomId=$roomId, folders=" + foldersStr)
-                        syncRoomMaterialsAllScenes(roomId, folderMappings ?: org.json.JSONObject(), scenes)
+                        requestRoomMaterialSync(roomId, folderMappings ?: org.json.JSONObject(), scenes,
+                            cmd.optString("rev", ""))
                     } else {
                         logToFile("folderMappings 与 scenes 均为 null，跳过素材同步")
                     }
@@ -983,7 +1072,13 @@ class MainActivity : AppCompatActivity() {
                     val scenes = cmd.optJSONObject("scenes")
                     if (scenes != null) {
                         prefs.edit().putString("scenes_json", scenes.toString()).apply()
-                        mqttHandler.post { applyLiveWindowUpdate(scenes) }
+                        val rev = cmd.optString("rev", "")
+                        mqttHandler.post {
+                            applyLiveWindowUpdate(scenes)
+                            // 服务端只在"素材映射没变、只有窗口变了"时走这条通道，
+                            // 所以几何应用完就等于配置已落地，rev 可以直接记账
+                            markAppliedRev(rev)
+                        }
                     } else {
                         logToFile("update_windows: scenes 为空，忽略", "WARN", "WINDOW", "CONFIG")
                     }
@@ -1104,7 +1199,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 【A-06】 素材同步
-    // @tag: syncRoomMaterials 素材同步 房间同步
+    // @tag: requestRoomMaterialSync 素材同步 房间同步 对账 去重
     // @tag: syncFolderWithIds 文件夹同步 下载同步
     // @tag: deleteMaterialFile 删除素材 文件删除
     // @tag: runDownloadPlan 下载进度条 进度
@@ -1123,65 +1218,108 @@ class MainActivity : AppCompatActivity() {
     )
 
     /**
-     * 房间素材全量对账主流程（一轮 = 一次 HTTP + A/B 两幕逐目录 diff）：
-     * 1) 先把 scenes 落到 prefs（scenes 为空会写成空串，等于清掉旧缓存）；
+     * 素材同步的唯一入口，按房间做在飞去重：
+     * 该房间已有一轮对账在跑时，这次请求只被记成"最后待补跑的那一份"（同房间互相覆盖，中间态没有意义），
+     * 当前轮跑完立刻补一轮。并发的两轮会抢同一批文件、进度条来回刷屏，而且后一轮拿的清单更新，
+     * 先一轮的下载纯属浪费。服务端对 {id, fingerprint} 去重双发、心跳对账补发，都会打在这里。
+     * @param rev 服务端这次的配置指纹（roomSceneDigest），对账跑完才记进 appliedRev 供心跳回传
+     */
+    private fun requestRoomMaterialSync(
+        roomId: String,
+        folderMappingsFallback: org.json.JSONObject,
+        scenes: org.json.JSONObject?,
+        rev: String
+    ) {
+        val req = SyncRequest(roomId, folderMappingsFallback, scenes, rev)
+        var start = false
+        synchronized(syncLock) {
+            start = syncInFlight.add(roomId)   // add 返回 false == 这个房间已经有一轮在飞
+            if (!start) syncPending[roomId] = req
+        }
+        if (!start) {
+            logToFile("房间 $roomId 同步已在飞，本次指令并入待补跑 (rev=$rev)", "INFO", "SYNC", "SKIP")
+            return
+        }
+        mqttHandler.post { binding.statusText?.text = "同步房间素材中..." }
+        downloadExecutor.submit { runRoomSyncLoop(req) }
+    }
+
+    /** 工作线程：跑一轮 → 看有没有并进来的后指令 → 有就再跑一轮，直到追平（同一时刻每房间只有一个循环在飞） */
+    private fun runRoomSyncLoop(first: SyncRequest) {
+        var round = first
+        while (true) {
+            doRoomMaterialSync(round)
+            var next: SyncRequest? = null
+            synchronized(syncLock) {
+                val n = syncPending.remove(round.roomId)
+                // rev 已经应用过了 ⇒ 这条是重复触发，不必再跑；rev 为空的（手工指令/老服务端）无从判断，照常跑。
+                // appliedRev 由主线程写、这里读，最坏是多补一轮，不会漏。
+                if (n != null && (n.rev.isEmpty() || n.rev != appliedRev)) next = n
+                if (next == null) syncInFlight.remove(round.roomId)
+            }
+            val n = next ?: return
+            logToFile("对账期间又收到同步指令 (rev=${n.rev})，立即补跑一轮", "INFO", "SYNC", "SKIP")
+            round = n
+        }
+    }
+
+    /**
+     * 一轮房间素材对账（一次 HTTP + A/B 两幕逐目录 diff）：
+     * 1) 载荷带 scenes 才落 prefs 缓存（null 是"这次没带"，不是"房间没配置"，写成空串会清掉冷启动缓存）；
      *    房间 id 本机不再缓存（原 current_room_id 只写不读，已删）。
      * 2) fetchRoomMaterials 拉 /api/room-materials-v2/{roomId} 的 A01/B01 全量清单；
-     *    返回 null（请求失败）时直接中止本轮，绝不进"清空"分支。
+     *    返回 null（请求失败）时直接中止本轮，绝不进"清空"分支，rev 也不记账（让心跳对账再补一次）。
      * 3) syncSceneFolders("A"/"B") 按 scenes.A/B.folder_mappings 对账：映射有变的下、多的删，
      *    只**收集**待下载任务不真下载；映射真相只在 scenes 里，
      *    folderMappingsFallback 仅给旧服务端兜底，B 幕缺失时按空映射处理。
      * 4) runDownloadPlan 按字节进度逐个下载（调试模式下底部进度条可见），串行、单线程。
-     * 5) 回主线程 applySceneConfigs：优先用本次载荷的 scenes，没有才回落 prefs 缓存。
-     * @param roomId       房间 ID（决定清单接口）
-     * @param scenes       完整 scenes JSON（含 A/B 两套 windows + folder_mappings）
+     * 5) 回主线程 applySceneConfigs：优先用本次载荷的 scenes，没有才回落 prefs 缓存；
+     *    真下载过东西才 force 重建，纯对账交给结构指纹判重，同配置不会打断正在播的视频。
      */
-    private fun syncRoomMaterialsAllScenes(roomId: String, folderMappingsFallback: org.json.JSONObject, scenes: org.json.JSONObject?) {
-        mqttHandler.post {
-            binding.statusText?.text = "同步房间素材中..."
-        }
-
-        downloadExecutor.submit {
-            try {
-                // 只缓存 scenes：房间归属的真值在云端 devices.room_id，本机不留 current_room_id（无人读）
-                prefs.edit()
-                    .putString("scenes_json", scenes?.toString() ?: "")
-                    .apply()
-
-                val fmA = scenes?.optJSONObject("A")?.optJSONObject("folder_mappings") ?: folderMappingsFallback
-                val fmB = scenes?.optJSONObject("B")?.optJSONObject("folder_mappings") ?: org.json.JSONObject()
-
-                // 拉取失败返回 null：保持本地现状中止本轮，绝不进入清空分支
-                val allMaterials = fetchRoomMaterials(roomId)
-                if (allMaterials == null) {
-                    hideSyncProgress()   // fetchRoomMaterials 内部已把 statusText 改成失败文案，这里只收条
-                    return@submit
-                }
-
-                val plan = ArrayList<SyncTask>()
-                plan.addAll(syncSceneFolders("A", fmA, allMaterials))
-                plan.addAll(syncSceneFolders("B", fmB, allMaterials))
-                runDownloadPlan(plan)
-                hideSyncProgress("素材同步完成")
-
-                mqttHandler.post {
-                    val scenesToApply = scenes ?: prefs.getString("scenes_json", null)?.let {
-                        try { org.json.JSONObject(it) } catch (e: Exception) { null }
-                    }
-                    if (scenesToApply != null) {
-                        try {
-                            applySceneConfigs(scenesToApply)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
-                        }
-                    }
-                }
-                logToFile("房间素材同步完成: " + roomId)
-            } catch (e: Exception) {
-                Log.e(TAG, "Room materials sync error: " + e.message)
-                logToFile("房间素材同步异常: ${e.message}", "ERROR", "SYNC", "ERROR")
-                hideSyncProgress("素材同步失败")
+    private fun doRoomMaterialSync(req: SyncRequest) {
+        val roomId = req.roomId
+        val scenes = req.scenes
+        try {
+            if (scenes != null) {
+                prefs.edit().putString("scenes_json", scenes.toString()).apply()
             }
+
+            val fmA = scenes?.optJSONObject("A")?.optJSONObject("folder_mappings") ?: req.folderMappingsFallback
+            val fmB = scenes?.optJSONObject("B")?.optJSONObject("folder_mappings") ?: org.json.JSONObject()
+
+            // 拉取失败返回 null：保持本地现状中止本轮，绝不进入清空分支
+            val allMaterials = fetchRoomMaterials(roomId)
+            if (allMaterials == null) {
+                hideSyncProgress()   // fetchRoomMaterials 内部已把 statusText 改成失败文案，这里只收条
+                return
+            }
+
+            val plan = ArrayList<SyncTask>()
+            plan.addAll(syncSceneFolders("A", fmA, allMaterials))
+            plan.addAll(syncSceneFolders("B", fmB, allMaterials))
+            runDownloadPlan(plan)
+            hideSyncProgress("素材同步完成")
+
+            val downloaded = plan.isNotEmpty()
+            mqttHandler.post {
+                val scenesToApply = scenes ?: prefs.getString("scenes_json", null)?.let {
+                    try { org.json.JSONObject(it) } catch (e: Exception) { null }
+                }
+                if (scenesToApply != null) {
+                    try {
+                        applySceneConfigs(scenesToApply, force = downloaded)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
+                    }
+                }
+                // 走到这里配置才真的落地了：素材齐、窗口已按新配置重建，可以给心跳对账报这个 rev
+                markAppliedRev(req.rev)
+            }
+            logToFile("房间素材同步完成: " + roomId)
+        } catch (e: Exception) {
+            Log.e(TAG, "Room materials sync error: " + e.message)
+            logToFile("房间素材同步异常: ${e.message}", "ERROR", "SYNC", "ERROR")
+            hideSyncProgress("素材同步失败")
         }
     }
 
@@ -1380,7 +1518,7 @@ class MainActivity : AppCompatActivity() {
 
                     val md5 = item.optString("md5", "")
                     if (localFile.exists() && md5.isNotEmpty()) {
-                        val localMd5 = calculateMd5(localFile)
+                        val localMd5 = cachedMd5(localFile)
                         if (localMd5 == md5) {
                             Log.d(TAG, "文件已存在且MD5一致: " + filename)
                             continue
@@ -1396,12 +1534,9 @@ class MainActivity : AppCompatActivity() {
                 if (!shouldExist.contains(file.name)) {
                     Log.d(TAG, "删除不在清单中的文件: " + file.name)
                     logToFile("删除: " + file.name)
-                    // 与 deleteMaterialFile/deleteFolderFiles 同一套约定：删本地文件必须一起清 ETag/LM 缓存，
+                    // 与 deleteMaterialFile/deleteFolderFiles 同一套约定：删本地文件必须一起清缓存，
                     // 否则该素材日后重新加回房间时，downloadWithETag 会拿旧 ETag 换到 304 而永远不重下。
-                    prefs.edit()
-                        .remove(PREF_ETAG_PREFIX + file.name)
-                        .remove(PREF_LM_PREFIX + file.name)
-                        .apply()
+                    clearMaterialCache(file.name)
                     file.delete()
                 }
             }
@@ -1433,11 +1568,8 @@ class MainActivity : AppCompatActivity() {
             }
             val file = File(localFolder, filename)
             if (file.exists()) {
-                // 清除 ETag/Last-Modified 缓存，避免删后重加时 APK 因 304 跳过下载
-                prefs.edit()
-                    .remove(PREF_ETAG_PREFIX + filename)
-                    .remove(PREF_LM_PREFIX + filename)
-                    .apply()
+                // 清除 ETag/Last-Modified/md5 缓存，避免删后重加时 APK 因 304 跳过下载
+                clearMaterialCache(filename)
                 val deleted = file.delete()
                 Log.d(TAG, "deleteMaterialFile deleted=$deleted folder=$folderId file=$filename")
                 logToFile("删除素材文件: folder=$folderId file=$filename deleted=$deleted")
@@ -1471,11 +1603,8 @@ class MainActivity : AppCompatActivity() {
             for (file in files) {
                 Log.d(TAG, "清空文件夹" + folderId + "，删除: " + file.name)
                 logToFile("清空删除: " + file.name)
-                // 清除缓存的 ETag，避免删文件后重加时 APK 因 304 跳过下载
-                prefs.edit()
-                    .remove(PREF_ETAG_PREFIX + file.name)
-                    .remove(PREF_LM_PREFIX + file.name)
-                    .apply()
+                // 清除缓存的 ETag/Last-Modified/md5，避免删文件后重加时 APK 因 304 跳过下载
+                clearMaterialCache(file.name)
                 file.delete()
             }
         } catch (e: Exception) {
@@ -1736,6 +1865,33 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "MD5计算失败: ${e.message}")
             ""
         }
+    }
+
+    /**
+     * 带缓存的素材 md5：一轮对账要把本地每个文件整只读一遍算摘要，几十 GB 的素材目录就是几十 GB 磁盘读，
+     * 而服务端每 30s/每次改动都可能推一轮同步 —— 绝大多数轮次里文件根本没动过。
+     * 缓存键值本身带 "<字节数>:<mtime>:" 前缀，文件被替换（下载完成、重新落盘）后前缀对不上自动失效，
+     * 所以只需要在**删除**文件时跟着 remove（与 ETag/LM 同一套约定，避免同名文件复活后串味）。
+     * 只在下载线程调用，无并发；prefs 自身线程安全。
+     */
+    private fun cachedMd5(file: File): String {
+        val stamp = file.length().toString() + ":" + file.lastModified().toString()
+        val key = PREF_MD5_PREFIX + file.name
+        prefs.getString(key, null)?.let { saved ->
+            if (saved.startsWith("$stamp:")) return saved.substring(stamp.length + 1)
+        }
+        val md5 = calculateMd5(file)
+        if (md5.isNotEmpty()) prefs.edit().putString(key, "$stamp:$md5").apply()
+        return md5
+    }
+
+    /** 素材文件从本机消失时清掉它的三项缓存（ETag / Last-Modified / md5），三处删除点共用 */
+    private fun clearMaterialCache(filename: String) {
+        prefs.edit()
+            .remove(PREF_ETAG_PREFIX + filename)
+            .remove(PREF_LM_PREFIX + filename)
+            .remove(PREF_MD5_PREFIX + filename)
+            .apply()
     }
     
 
@@ -2104,16 +2260,26 @@ class MainActivity : AppCompatActivity() {
      * 全量重建窗口：release 掉全部旧播放器/视图，按 mergeSceneWindows 拿到的 A+B 窗口合集
      * 依 zIndex 升序逐个 createWindowView + playFolderInWindow。
      * @param scenes 完整 scenes JSON（A、B 两套都在里面，不是"当前那一幕"）
+     * @param force  true = 结构指纹相同也照建（素材刚下载完，播放器得重新挑文件）；
+     *               false（默认）= 与上次应用的是同一份配置就直接返回，不打断正在播的视频。
      *
      * 兜底：两幕一个窗口都没有时，才建 DEFAULT_WINDOW_ID 那个 1920x1080 全屏 SCENE_A 窗口
      *      （不指定 folderId，于是播 A 幕第一个有素材的文件夹）。
      * 必须在主线程调用（含 addView/removeView），所有调用点都已 post 到 mqttHandler。
      */
-    private fun applySceneConfigs(scenes: JSONObject?) {
+    private fun applySceneConfigs(scenes: JSONObject?, force: Boolean = false) {
         logToFile("开始应用场景配置", "INFO", "WINDOW", "CONFIG")
         if (scenes == null) {
             Log.w(TAG, "applySceneConfigs: scenes 为空")
             logToFile("scenes 为空，跳过窗口配置", "WARN", "WINDOW", "CONFIG")
+            return
+        }
+        // 幂等闸门：同一条链路常常 apply 两次（指令进来一次、素材对账收尾一次），
+        // 冷启动缓存 + auth_result 也是同一份配置。指纹没变就别把视频从头播一遍。
+        // 记在末尾：中途抛异常时不算"已应用"，下一份相同载荷还会重试。
+        val fp = scenesFingerprint(scenes)
+        if (!force && fp == appliedScenesFp) {
+            logToFile("scenes 与屏上一致（指纹 $fp），跳过全量重建", "INFO", "WINDOW", "SKIP")
             return
         }
 
@@ -2215,6 +2381,24 @@ class MainActivity : AppCompatActivity() {
                 playFolderInWindow(winId, folderId, folderPath)
             }
         }
+        appliedScenesFp = fp
+    }
+
+    /**
+     * scenes 的结构指纹：递归按 key 排序后取 SHA-256 前 16 位，忽略 "_" 前缀的运行时临时标记
+     * （mergeSceneWindows 会往窗口对象上打 _masterB）。
+     * 排序键是为了让同一份配置不管来自素材同步载荷、窗口载荷还是 prefs 缓存反序列化都算出同一个值；
+     * 宁可保守（无关字段变了也重建）也不能漏（该重建不重建 = 画面停在旧配置上，修都修不好）。
+     */
+    private fun scenesFingerprint(scenes: JSONObject): String =
+        sha256(canonicalJson(scenes)).substring(0, 16)
+
+    /** JSON 规范化成稳定字符串：对象键按字典序、下划线开头的运行时字段剔掉 */
+    private fun canonicalJson(v: Any?): String = when (v) {
+        is JSONObject -> v.keys().asSequence().filter { !it.startsWith("_") }.sorted()
+            .joinToString(",", "{", "}") { "\"" + it + "\":" + canonicalJson(v.opt(it)) }
+        is JSONArray -> (0 until v.length()).joinToString(",", "[", "]") { canonicalJson(v.opt(it)) }
+        else -> v.toString()   // 数字/字符串/true/false/JSONObject.NULL，toString 即可区分
     }
 
     /** 按 zIndex 升序排列 JSONArray */
@@ -2338,6 +2522,8 @@ class MainActivity : AppCompatActivity() {
             val cv = c.getChildAt(0)
             if (cv != null) c.post { applyWindowTransform(cv, w) }
         }
+        // 屏上现在就是这份配置了：指纹跟着走，否则下一轮素材对账收尾会白重建一次、视频重头播
+        appliedScenesFp = scenesFingerprint(scenes)
         Log.d(TAG, "applyLiveWindowUpdate: 轻量应用 ${desiredSorted.size} 个窗口")
     }
 
@@ -2514,10 +2700,24 @@ class MainActivity : AppCompatActivity() {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
             setVideoTextureView(textureView)
+            // 首帧耗时 = 窗口创建 → 第一次 STATE_READY。现场那句"要点一下才出来"要的就是这个数：
+            // 高分辨率素材的解码器起流水线 + 读满缓冲池全在这段，以前它是完全没数据的黑盒。
+            // 只报第一次 READY（playlist 循环切歌不重复刷）；播放器随窗口重建，计数天然归零。
+            val tCreated = android.os.SystemClock.elapsedRealtime()
+            var readyLogged = false
             addListener(object : Player.Listener {
                 override fun onPlayerError(error: PlaybackException) {
                     // 播放器级错误（文件损坏/编码不支持/源丢失）此前只进 logcat，后台完全黑盒
                     logToFile("窗口 $winId 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "PLAYBACK", "ERROR")
+                }
+                override fun onEvents(p: Player, events: Player.Events) {
+                    if (readyLogged || p.playbackState != Player.STATE_READY) return
+                    readyLogged = true
+                    val costMs = android.os.SystemClock.elapsedRealtime() - tCreated
+                    val vs = (p as? ExoPlayer)?.videoSize
+                    logToFile("窗口 $winId 首帧就绪: 用时 ${costMs}ms" +
+                        (if (vs != null) "，输入 ${vs.width}x${vs.height} ${vs.frameRate.toInt()}fps" else "") +
+                        "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "READY")
                 }
             })
         }
@@ -2594,7 +2794,8 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 释放所有窗口：播放器 release + 视图从 flSurface 摘掉。
-     * 调用点只有两个 —— onDestroy，以及 playWelcomeVideo 切欢迎视频前（避免旧窗口盖住它）。
+     * 调用点三处 —— onDestroy、playWelcomeVideo 切欢迎视频前（避免旧窗口盖住它）、
+     * 以及 action:'stop'（停播 = 画面真的黑下去，不只是停播放器）。
      * 注意不清 windowContentSigs：那由下一次 applySceneConfigs 自己清。
      */
     private fun releaseAllWindows() {
@@ -2602,6 +2803,9 @@ class MainActivity : AppCompatActivity() {
         windowPlayers.clear()
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
+        // 屏上已经没有窗口了，"已应用配置"的指纹必须一起作废：
+        // 否则下次拿同一份 scenes 来 apply 会被幂等闸门挡掉，画面停在欢迎视频上不去
+        appliedScenesFp = null
         Log.d(TAG, "释放所有窗口资源")
     }
 }
