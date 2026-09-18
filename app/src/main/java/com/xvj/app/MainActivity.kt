@@ -12,8 +12,8 @@
  * 【A-06】素材同步（syncRoomMaterialsAllScenes / fetchRoomMaterials / syncSceneFolders / syncFolderWithIds / downloadWithETag / deleteMaterialFile）
  * 【A-07】窗口配置 & 渲染（applySceneConfigs / applyLiveWindowUpdate / createWindowView / playFolderInWindow）
  * 【A-08】场景切换（switchScene / releaseAllWindows）
- * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk）
- * 【A-10】权限 & 系统 UI（checkStoragePermission / hideSystemUI）
+ * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk / retryPendingInstall）
+ * 【A-10】系统 UI（hideSystemUI）
  * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint / calculateMd5）
  * （A-05 已随"单播放器点播"旧链路一起删除，编号保留空位）
  * ─────────────────────────────────────────────────
@@ -37,7 +37,7 @@
  *     不要把 md5 理解成"用户原始上传文件的 md5"，拿本地素材目录去比对会永远对不上
  *   - 一轮同步里 md5 判定先于 ETag：md5 不同才进 downloadWithETag，
  *     而它内部按 **文件名** 取 If-None-Match —— 若服务端 ETag 没变而 md5 变了，
- *     HEAD 会拿回 304 直接 return false，本地仍是旧文件，下一轮再报不一致（表现为"永远同步不完"）
+ *     那个条件 GET 会拿回 304 直接 return false，本地仍是旧文件，下一轮再报不一致（表现为"永远同步不完"）
  *   - 因此服务端就地替换素材文件时必须让 ETag/Last-Modified 一起变（nginx 自动重算，正常没问题）
  * 
  * 重要约定：
@@ -56,7 +56,6 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -153,6 +152,12 @@ class MainActivity : AppCompatActivity() {
     // 待安装的 APK：无"安装未知应用"权限时暂存，授权回来自动续装
     private var pendingInstallApk: File? = null
 
+    // 续装权限复查用的延时队列（见 retryPendingInstall）， onDestroy 时清空
+    private val installRetryHandler = Handler(Looper.getMainLooper())
+
+    // 正在处理的 OTA 版本号：同一版本的下载/确认框只允许一条流程，避免启动+连接+重连三路触发刷屏
+    private var otaBusyVersion: String? = null
+
     companion object {
         private const val TAG = "XVJPlayer"
         /** 窗口容器内亮度遮罩视图的 tag 标识（实时更新时定位/增删遮罩） */
@@ -233,9 +238,6 @@ class MainActivity : AppCompatActivity() {
     // 或 sync_room_materials 同步完成后用载荷里的 scenes（没有就回落到 prefs 的 scenes_json 缓存）。
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // 检查并申请存储权限
-        checkStoragePermission()
 
         // 强制横屏
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -714,11 +716,8 @@ class MainActivity : AppCompatActivity() {
                             binding.statusText?.text = "已授权至房间 $roomId"
                             // 停止欢迎视频等旧播放器
                             releasePlayer()
-                            // 保存授权状态和房间信息
-                            prefs.edit()
-                                .putBoolean("authorized", true)
-                                .putString("room_id", roomId)
-                                .apply()
+                            // 授权状态本机不落 prefs（历史上写过 authorized/room_id 两个键，全程无人读，
+                            // 已删）：真值只在云端 devices 表，本机靠 scenes_json 缓存 + 每次 auth_result 覆盖。
                             // 保存 scenes 配置（包含 A/B 的 folder_mappings）
                             if (scenes != null) {
                                 prefs.edit().putString("scenes_json", scenes.toString()).apply()
@@ -757,10 +756,6 @@ class MainActivity : AppCompatActivity() {
                     logToFile("本机被废止: $targetId ${resp.optString("message", "")}", "ERROR", "AUTH")
                     mqttHandler.post {
                         binding.statusText?.text = "已废止"
-                        prefs.edit()
-                            .putBoolean("authorized", false)
-                            .remove("room_id")
-                            .apply()
                         showUnauthorizedAlert("设备已被远程废止，请联系管理员")
                     }
                 }
@@ -868,11 +863,13 @@ class MainActivity : AppCompatActivity() {
 
             when (action) {
                 "stop" -> {
-                    // ⚠️ 只停"单播放器 player"（欢迎视频那条链），窗口播放器 windowPlayers 不受影响，
-                    //    所以多窗口模式下发 stop 画面其实不会停 —— 待补 releaseAllWindows。
-                    //    服务端有两处发送方：废止设备（另有一条 deauthorize 广播会切欢迎视频，顺带清了窗口，
-                    //    所以那条路是通的）和 DELETE /api/rooms/:id 删房间（这条真的停不下来）。
+                    // 停单播放器（欢迎视频那条链）+ 释放全部窗口播放器，画面真正黑下去。
+                    // 发送方有两处：废止设备（另有 deauthorize 广播会切欢迎视频）、
+                    // DELETE /api/rooms/:id 删房间（补上 releaseAllWindows 后才真的停得住）。
+                    // 不清 windowContentSigs：下次 applySceneConfigs 自己清，
+                    // 而 applyLiveWindowUpdate 发现 flSurface 已无子视图会判定为结构变化并全量重建。
                     stopPlayback()
+                    releaseAllWindows()
                 }
                 "config" -> {
                     // 更新配置
@@ -1068,8 +1065,8 @@ class MainActivity : AppCompatActivity() {
     // @tag: deleteMaterialFile 删除素材 文件删除
     /**
      * 房间素材全量对账主流程（一轮 = 一次 HTTP + A/B 两幕逐目录 diff）：
-     * 1) 先把 current_room_id / scenes_json 落到 prefs（scenes 为空会写成空串，等于清掉旧缓存）；
-     *    current_room_id 只写不读，留作排查用。
+     * 1) 先把 scenes 落到 prefs（scenes 为空会写成空串，等于清掉旧缓存）；
+     *    房间 id 本机不再缓存（原 current_room_id 只写不读，已删）。
      * 2) fetchRoomMaterials 拉 /api/room-materials-v2/{roomId} 的 A01/B01 全量清单；
      *    返回 null（请求失败）时直接中止本轮，绝不进"清空"分支。
      * 3) syncSceneFolders("A"/"B") 按 scenes.A/B.folder_mappings 对账；映射真相只在 scenes 里，
@@ -1085,8 +1082,8 @@ class MainActivity : AppCompatActivity() {
 
         downloadExecutor.submit {
             try {
+                // 只缓存 scenes：房间归属的真值在云端 devices.room_id，本机不留 current_room_id（无人读）
                 prefs.edit()
-                    .putString("current_room_id", roomId)
                     .putString("scenes_json", scenes?.toString() ?: "")
                     .apply()
 
@@ -1330,44 +1327,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 【A-10】 权限 & 系统 UI
-    /**
-     * 存储权限申请（现状：形同空转，且仍会弹系统页面）。
-     * ⚠️ 素材/日志全写在 filesDir 内部存储，本来就不需要权限；而 AndroidManifest 里也从未声明
-     *    WRITE_EXTERNAL_STORAGE / MANAGE_EXTERNAL_STORAGE（只有 READ_EXTERNAL_STORAGE 和 READ_MEDIA_VIDEO）。
-     *    于是：6–10 分支申请的 WRITE_EXTERNAL_STORAGE 未声明 → checkSelfPermission 永远不等于 GRANTED，
-     *    每次启动都会调一次 requestPermissions（系统对未声明权限直接拒绝，不显示弹窗）；
-     *    11+ 分支则真会把系统"所有文件访问"设置页拉起来（ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION
-     *    不要求声明过权限）。要清理就整段删掉，但需先确认没有依赖外部路径的旧逻辑。
-     */
-    private fun checkStoragePermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Android 11+ 需要 MANAGE_EXTERNAL_STORAGE
-            if (!Environment.isExternalStorageManager()) {
-                try {
-                    val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                    intent.data = android.net.Uri.parse("package:$packageName")
-                    startActivity(intent)
-                } catch (e: Exception) {
-                    val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                    startActivity(intent)
-                }
-            }
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            // Android 6-10 需要动态申请
-            val permissions = arrayOf(
-                android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
-                android.Manifest.permission.READ_EXTERNAL_STORAGE
-            )
-            val needRequest = permissions.any {
-                checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
-            }
-            if (needRequest) {
-                requestPermissions(permissions, 100)
-            }
-        }
-    }
-
+    // 【A-10】 系统 UI
+    // 曾有过一个 checkStoragePermission()：manifest 从未声明 WRITE/MANAGE_EXTERNAL_STORAGE，
+    // 而素材/日志全写在 filesDir 内部存储（本就不需要权限），它既不申请到任何东西又会在
+    // Android 11+ 拉起系统"所有文件访问"设置页 —— 已整段删除，全链路无外部存储路径依赖。
     /**
      * 隐藏系统 UI，实现全屏沉浸式播放
      * 设置 IMMERSIVE_STICKY 标志，隐藏导航栏和状态栏
@@ -1418,15 +1381,10 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         hideSystemUI()
         player?.play()
-        // 从"安装未知应用"授权页返回：已授权则续装挂起的 APK
-        val pending = pendingInstallApk
-        if (pending != null) {
-            pendingInstallApk = null
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
-                installApk(pending)
-            } else {
-                logToFile("用户未授予安装权限，放弃续装")
-            }
+        // 从"安装未知应用"授权页返回：复查权限后续装挂起的 APK（见 retryPendingInstall）
+        if (pendingInstallApk != null) {
+            installRetryHandler.removeCallbacksAndMessages(null)
+            retryPendingInstall(0)
         }
     }
 
@@ -1442,6 +1400,8 @@ class MainActivity : AppCompatActivity() {
     /** 真销毁时才走：释放全部窗口 + 单播放器，停状态上报定时器，断开 MQTT，关闭下载线程池 */
     override fun onDestroy() {
         super.onDestroy()
+        // 撤销挂起的续装轮询（retryPendingInstall），Activity 没了再复查只会崩
+        installRetryHandler.removeCallbacksAndMessages(null)
         releaseAllWindows()
         releasePlayer()
         // 停止定时器并发送离线状态
@@ -1512,113 +1472,42 @@ class MainActivity : AppCompatActivity() {
      * @param filename 缓存键用的文件名（etag_/lm_ 前缀 + 它）；调用方传的正是 destFile.name
      * @return true = 实际写了文件；false = 服务端说没变，本地原样保留
      *
-     * 一次调用最多发 3 个 HEAD + 1 个条件 GET（历史叠加出来的，看着冗余但都能短路返回）：
-     *   ① 下面 else-if 里的 HEAD：文件在且本地有缓存 ETag 时先探一次；
-     *   ② try 块开头那个 HEAD：与 ① 条件、请求头完全相同，属于重复劳动（文件没变时 ① 已经 return 了，
-     *      所以它只在"① 判定 ETag 变了"之后再确认一遍 —— 等于白发一个请求）；
-     *   ③ connection 的 HEAD：带上了 If-Modified-Since；
-     *   ④ conn2 才是真正的 GET（没设 requestMethod，默认 GET），从它取新 ETag/Last-Modified 落缓存。
-     * 想瘦身就删掉 ②，行为不变；③④ 合并成"直接条件 GET"也能省一个往返，但要先确认 nginx 对
-     * If-None-Match 的 304 空响应体处理没问题。
+     * 一次调用只发 1 个条件 GET：304 就原样保留本地文件返回 false，2xx 才落盘并把新的
+     * ETag/Last-Modified 写回缓存。历史版本在这里叠了最多 3 个 HEAD + 1 个 GET，
+     * 而每个 HEAD 的判定（带 If-None-Match，304 则跳过）都与最后那个条件 GET 完全重复，已合并。
      *
      * 注意：md5 不一致但 ETag 没变时，这里会返回 false 而不下载 —— 语义见 syncFolderWithIds 的判定顺序。
      */
     private fun downloadWithETag(urlStr: String, destFile: File, filename: String): Boolean {
         val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
-
-        // 文件不存在或为空：直接下载，不走任何缓存逻辑
-        if (!destFile.exists() || destFile.length() == 0L) {
-            Log.d(TAG, "本地文件不存在或为空，强制下载: ${destFile.name}")
-        } else if (cachedEtag != null) {
-            // 文件存在且有缓存ETag：用HEAD请求验证服务器ETag是否有变化
-            try {
-                val url = java.net.URL(urlStr)
-                val checkConn = url.openConnection() as java.net.HttpURLConnection
-                checkConn.requestMethod = "HEAD"
-                checkConn.connectTimeout = 8000
-                checkConn.readTimeout = 8000
-                checkConn.setRequestProperty("If-None-Match", cachedEtag)
-                val code = checkConn.responseCode
-                checkConn.disconnect()
-                if (code == 304) {
-                    // ⚠️ 下面这个 !destFile.exists() 分支进不来：外层 if 已经把"文件不存在或为空"
-                    //    直接送去强下载了，能走到这儿说明文件确实存在。原始问题（素材被删后 ETag 仍缓存
-                    //    导致 304 跳过）已经由外层那个判断修掉，这里留的是当时的补丁痕迹。
-                    // BUG FIX: 文件不存在时，即使ETag未变也必须重新下载
-                    // 场景：素材曾被添加→下载→从房间移除（文件被删）→重新添加
-                    // 此时本地文件不存在但SharedPreferences中ETag仍缓存着旧值
-                    // 服务器返回304（文件未变），必须强制重下而非跳过
-                    if (!destFile.exists()) {
-                        Log.d(TAG, "文件被删，ETag未变但强制重下: ${destFile.name}")
-                    } else {
-                        Log.d(TAG, "本地文件完整且ETag未变，跳过: ${destFile.name}")
-                        return false
-                    }
-                }
-                Log.d(TAG, "本地文件存在但ETag变化，重新下载: ${destFile.name}")
-            } catch (e: Exception) {
-                Log.w(TAG, "ETag验证失败，继续下载: ${e.message}")
-            }
-        }
+        val cachedLm = prefs.getString(PREF_LM_PREFIX + filename, null)
+        // 本地文件不在/为空 ⇒ 缓存的 ETag 一律不作数（带了会被 nginx 判成 304，旧文件永远下不回来）
+        val force = !destFile.exists() || destFile.length() == 0L
+        if (force) Log.d(TAG, "本地文件不存在或为空，强制下载: ${destFile.name}")
 
         return try {
-            // 文件完整性兜底：本地文件存在时，用HEAD请求验证ETag是否变化
-            if (destFile.exists() && destFile.length() > 0 && cachedEtag != null) {
-                try {
-                    val url = java.net.URL(urlStr)
-                    val checkConn = url.openConnection() as java.net.HttpURLConnection
-                    checkConn.requestMethod = "HEAD"
-                    checkConn.connectTimeout = 8000
-                    checkConn.readTimeout = 8000
-                    checkConn.setRequestProperty("If-None-Match", cachedEtag)
-                    val code = checkConn.responseCode
-                    checkConn.disconnect()
-                    if (code == 304) {
-                        Log.d(TAG, "本地文件完整且ETag未变，跳过: $filename")
-                        return false
-                    }
-                    Log.d(TAG, "本地文件存在但ETag变化，重新下载: $filename")
-                } catch (e: Exception) {
-                    Log.w(TAG, "ETag验证失败，继续下载: ${e.message}")
-                }
-            }
             val url = java.net.URL(urlStr)
-            val connection = url.openConnection() as java.net.HttpURLConnection
-            connection.connectTimeout = 15000
-            connection.readTimeout = 15000
-            connection.requestMethod = "HEAD"
-
-            val cachedLm = prefs.getString(PREF_LM_PREFIX + filename, null)
-            if (cachedEtag != null) connection.setRequestProperty("If-None-Match", cachedEtag)
-            if (cachedLm != null) connection.setRequestProperty("If-Modified-Since", cachedLm)
-
-            val responseCode = connection.responseCode
-            connection.disconnect()
-
-            if (responseCode == 304) {
-                Log.d(TAG, "文件未变化跳过: $filename")
-                return false
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 30000
+            conn.readTimeout = 30000
+            if (!force) {
+                if (cachedEtag != null) conn.setRequestProperty("If-None-Match", cachedEtag)
+                if (cachedLm != null) conn.setRequestProperty("If-Modified-Since", cachedLm)
             }
 
-            val conn2 = url.openConnection() as java.net.HttpURLConnection
-            conn2.connectTimeout = 30000
-            conn2.readTimeout = 30000
-            if (cachedEtag != null) conn2.setRequestProperty("If-None-Match", cachedEtag)
-            if (cachedLm != null) conn2.setRequestProperty("If-Modified-Since", cachedLm)
-
-            val realCode = conn2.responseCode
+            val realCode = conn.responseCode
             if (realCode == 304) {
                 Log.d(TAG, "文件未变化跳过: $filename")
-                conn2.disconnect()
+                conn.disconnect()
                 return false
             }
 
-            val newEtag = conn2.getHeaderField("ETag")
-            val newLm = conn2.getHeaderField("Last-Modified")
+            val newEtag = conn.getHeaderField("ETag")
+            val newLm = conn.getHeaderField("Last-Modified")
             if (newEtag != null) prefs.edit().putString(PREF_ETAG_PREFIX + filename, newEtag).apply()
             if (newLm != null) prefs.edit().putString(PREF_LM_PREFIX + filename, newLm).apply()
 
-            conn2.inputStream.use { input ->
+            conn.inputStream.use { input ->
                 FileOutputStream(destFile).use { output ->
                     val buffer = ByteArray(65536)
                     var bytesRead: Int
@@ -1627,7 +1516,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
-            conn2.disconnect()
+            conn.disconnect()
             Log.d(TAG, "下载完成: $filename")
             logToFile("下载完成: $filename (${destFile.length() / 1024}KB)", "INFO", "SYNC", "DOWNLOAD")
             true
@@ -1684,23 +1573,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * filepath 安全性校验（防路径穿越）：只允许相对路径 + 字母数字 _ . / -，禁 ".." 和 http(s) 前缀。
+     * filepath 安全性校验（防路径穿越）：只允许 .apk 落地路径 + 字母数字 _ . / -，禁 ".." 和 http(s) 前缀。
      *
-     * ⚠️ 已知 BUG（未在本次注释任务内改动）：第一条规则拒绝以 "/" 开头，
-     *    但 /api/version/latest 返回的 filepath 就是 "/apk/xxx.apk"（服务端拼的就是绝对路径形式），
-     *    所以 checkForUpdate 这条自查路径每次都走到"拒绝不安全的filepath"直接 return，
-     *    后面的 `$APK_URL$filepath` 拼接和下载永远执行不到。
-     *    线上 OTA 之所以还能用，靠的是云端推送 action:'update'（命令里带完整 URL，不经过本函数）。
-     *    修法二选一：这里放行 "/apk/" 前缀，或服务端把 filepath 去掉开头的 "/"。
+     * 服务端 /api/version/latest 返回的 filepath 就是 "/apk/xxx.apk" 这种根路径形式，
+     * 所以单个前导 "/" 必须放行（曾经的旧规则一律拒绝，导致 checkForUpdate 自查路径恒不可达、
+     * 线上 OTA 只剩云端推送 action:'update' 一条腿）。
+     * 仍然拒绝 "//host/path"：那是协议相对 URL，拼进 "$APK_URL$filepath" 后 host 会被换掉，
+     * 绕过 isTrustedApkUrl 的精确 IP 判定。
      */
     private fun isValidFilepath(filepath: String): Boolean {
-        // 不允许绝对路径
-        if (filepath.startsWith("/")) return false
+        // 拒绝协议相对路径（可把请求指向任意主机）
+        if (filepath.startsWith("//")) return false
         // 不允许http/https协议
         if (filepath.startsWith("http://") || filepath.startsWith("https://")) return false
         // 不允许路径穿越
         if (filepath.contains("..")) return false
-        // 必须是相对路径且只包含安全字符
+        // 只允许安全字符（前导 "/" 已在字符集里）
         return filepath.matches(Regex("^[a-zA-Z0-9_./-]+$"))
     }
 
@@ -1753,9 +1641,9 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 设备侧自查更新：延时 5s 后 GET /api/version/latest，服务端 version_code 比本机大才继续。
-     * ⚠️ 但该路径目前被 isValidFilepath 的"禁止 / 开头"规则挡死（服务端返回的就是 "/apk/x.apk"），
-     *    实际生效的只有云端推送 action:'update'；详见 isValidFilepath 的注释。
-     * 调用点有三处（启动、MQTT 连接成功、重连），每次都是新起一个 Handler 延时任务，彼此不去重。
+     * 调用点有三处（启动、MQTT 连接成功、重连），彼此不去重，所以同版本由 downloadAndInstall
+     * 里的 otaBusyVersion 挡住重复下载/重复弹窗。
+     * 注意本地判定用 VERSION_CODE（onCreate 从 packageInfo 读），不要写死。
      */
     private fun checkForUpdate() {
         Handler(Looper.getMainLooper()).postDelayed({
@@ -1774,12 +1662,13 @@ class MainActivity : AppCompatActivity() {
                             if (serverCode > VERSION_CODE) {
                                 val serverVersion = json.optString("version", "")
                                 val filepath = json.getString("filepath")
-                                // 验证filepath安全性（防止路径穿越和绝对路径绕过）
+                                // 验证filepath安全性（防止路径穿越和协议相对URL绕过）
                                 if (!isValidFilepath(filepath)) {
                                     Log.w(TAG, "OTA: 拒绝不安全的filepath: $filepath")
                                     return@Thread
                                 }
-                                val apkUrl = "$APK_URL$filepath"
+                                // 服务端给的是 "/apk/x.apk"，这里归一保证恰好一个斜杠
+                                val apkUrl = APK_URL.trimEnd('/') + "/" + filepath.trimStart('/')
                                 val md5 = json.optString("md5", null)
                                 logToFile("发现新版本: $serverVersion, MD5: $md5, 正在下载...")
                                 downloadAndInstall(apkUrl, serverVersion, md5)
@@ -1797,11 +1686,12 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 下载并（经用户确认后）安装 APK。apkUrl 必须是完整地址，不是相对路径。
-     * 顺序：isTrustedApkUrl → 下到 cacheDir/xvj-update-<version>.apk（先删同名旧包）→
+     * 顺序：isTrustedApkUrl → 下到 cacheDir/xvj-update-<version>.apk（已下好则直接复用不重下）→
      *       体积 <1MB 视为下载失败 → 有 expectedMd5 才比对（不等则删包退出）→
      *       verifyApkSignature 比对证书指纹 → 弹不可取消的确认框 → installApk。
      * md5 为空时（老云端命令没带）就少一道校验，只剩签名指纹兜底。
      * Toast/对话框都 post 到 mqttHandler（主线程），下载本身在新起的 Thread 里。
+     * otaBusyVersion：同一条流程只允许一个（启动/连接/重连/推送可能并发触发同一版本）。
      */
     private fun downloadAndInstall(apkUrl: String, version: String, expectedMd5: String? = null) {
         // 安全校验：验证URL来源（精确匹配IP，防止绕过）
@@ -1813,42 +1703,56 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        val busy = otaBusyVersion
+        if (busy != null) {
+            logToFile("OTA: 已有更新流程在处理(版本 $busy)，忽略本次对 $version 的触发")
+            return
+        }
+        otaBusyVersion = version
+
         // 异步下载APK
         Thread {
             try {
-                logToFile("开始下载APK: $apkUrl")
-                mqttHandler.post {
-                    try {
-                        android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_SHORT).show()
-                    } catch(e: Exception) {}
-                }
-
-                val url = java.net.URL(apkUrl)
-                val connection = url.openConnection()
-                connection.connectTimeout = 30000
-                connection.readTimeout = 30000
                 val apkFile = File(cacheDir, "xvj-update-$version.apk")
+                // 复用上次已下好的包：MIUI 授权页秒退会让整次 14MB 下载白跑（见 retryPendingInstall），
+                // 二次触发时不必重下。破损/伪造的包由下游体积+md5+签名三道闸拦下并删包，下次自然重下。
+                if (apkFile.exists() && apkFile.length() > 1_000_000) {
+                    logToFile("OTA: 复用已下载的 ${apkFile.name} (${apkFile.length()} bytes)，跳过下载")
+                } else {
+                    logToFile("开始下载APK: $apkUrl")
+                    mqttHandler.post {
+                        try {
+                            android.widget.Toast.makeText(this, "正在下载更新: $version", android.widget.Toast.LENGTH_SHORT).show()
+                        } catch(e: Exception) {}
+                    }
 
-                // 如果已存在，先删除（避免残留问题）
-                if (apkFile.exists()) {
-                    apkFile.delete()
-                }
+                    val url = java.net.URL(apkUrl)
+                    val connection = url.openConnection()
+                    connection.connectTimeout = 30000
+                    connection.readTimeout = 30000
 
-                connection.getInputStream().use { input ->
-                    java.io.FileOutputStream(apkFile).use { output ->
-                        val buffer = ByteArray(8192)
-                        var bytesRead: Int
-                        while (input.read(buffer).also { bytesRead = it } != -1) {
-                            output.write(buffer, 0, bytesRead)
+                    // 如果已存在（哪怕是半截文件），先删除避免残留
+                    if (apkFile.exists()) {
+                        apkFile.delete()
+                    }
+
+                    connection.getInputStream().use { input ->
+                        java.io.FileOutputStream(apkFile).use { output ->
+                            val buffer = ByteArray(8192)
+                            var bytesRead: Int
+                            while (input.read(buffer).also { bytesRead = it } != -1) {
+                                output.write(buffer, 0, bytesRead)
+                            }
                         }
                     }
                 }
 
-                logToFile("APK下载完成: ${apkFile.absolutePath}, 大小: ${apkFile.length()} bytes")
+                logToFile("APK就绪: ${apkFile.absolutePath}, 大小: ${apkFile.length()} bytes")
 
                 // 验证APK文件有效性（真实APK通常>1MB）
                 if (apkFile.length() < 1_000_000) {
                     logToFile("APK文件过小，可能下载失败")
+                    otaBusyVersion = null
                     mqttHandler.post {
                         android.widget.Toast.makeText(this, "更新下载失败：文件异常", android.widget.Toast.LENGTH_LONG).show()
                     }
@@ -1869,6 +1773,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (actualHash != expectedMd5) {
                         logToFile("APK MD5校验失败！期望: $expectedMd5, 实际: $actualHash")
+                        otaBusyVersion = null
                         mqttHandler.post {
                             android.widget.Toast.makeText(this, "更新校验失败，请重新尝试", android.widget.Toast.LENGTH_LONG).show()
                         }
@@ -1881,6 +1786,7 @@ class MainActivity : AppCompatActivity() {
                 // 验证APK签名（安全防护）
                 if (!verifyApkSignature(apkFile)) {
                     logToFile("APK签名验证失败！")
+                    otaBusyVersion = null
                     mqttHandler.post {
                         android.widget.Toast.makeText(this, "更新验证失败：APK签名无效", android.widget.Toast.LENGTH_LONG).show()
                     }
@@ -1901,9 +1807,12 @@ class MainActivity : AppCompatActivity() {
                             }
                             .setNegativeButton("取消", null)
                             .setCancelable(false)
+                            // 确定/取消都会走到这里：解锁后，下一次触发（重连或云端再推）才能重试
+                            .setOnDismissListener { otaBusyVersion = null }
                             .show()
                     } catch(e: Exception) {
                         Log.e(TAG, "Show install dialog error: ${e.message}")
+                        otaBusyVersion = null
                         // 回退到Toast
                         android.widget.Toast.makeText(this, "更新已下载，请手动安装", android.widget.Toast.LENGTH_LONG).show()
                     }
@@ -1911,6 +1820,7 @@ class MainActivity : AppCompatActivity() {
 
             } catch (e: Exception) {
                 logToFile("下载APK失败: ${e.message}")
+                otaBusyVersion = null
                 mqttHandler.post {
                     try {
                         android.widget.Toast.makeText(this, "更新下载失败: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
@@ -1948,6 +1858,31 @@ class MainActivity : AppCompatActivity() {
             return
         }
         performInstall(file)
+    }
+
+    /**
+     * 从"安装未知应用"授权页回来后复查权限，允许就立即续装。
+     * MIUI/HyperOS 的授权页会在权限真正生效前就回调 onResume（实测 47ms 即返回），
+     * 一次判负就清空 pendingInstallApk 等于白丢已下好的包，所以每 1.5s 复查一次、最多约 30s。
+     * 调用方（onResume）先 removeCallbacksAndMessages 再起链，保证同时只有一条轮询。
+     */
+    private fun retryPendingInstall(attempt: Int) {
+        val pending = pendingInstallApk ?: return
+        if (isFinishing || isDestroyed) {
+            pendingInstallApk = null
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
+            pendingInstallApk = null
+            installApk(pending)
+            return
+        }
+        if (attempt >= 20) {
+            pendingInstallApk = null
+            logToFile("等待安装权限超时(约30s)，放弃续装；已下载的包保留在缓存目录，下次触发会复用")
+            return
+        }
+        installRetryHandler.postDelayed({ retryPendingInstall(attempt + 1) }, 1500)
     }
 
     /** 发起系统安装器（FileProvider URI） */
