@@ -13,7 +13,7 @@
  *         syncSceneFolders / syncFolderWithIds / runDownloadPlan / downloadWithETag / cachedMd5 /
  *         clearMaterialCache / deleteMaterialFile）
  * 【A-07】窗口配置 & 渲染（applySceneConfigs / scenesFingerprint / applyLiveWindowUpdate / createWindowView / playFolderInWindow）
- * 【A-08】场景切换（switchScene / releaseAllWindows）
+ * 【A-08】窗口释放（releaseAllWindows）
  * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk / retryPendingInstall）
  * 【A-10】系统 UI（hideSystemUI）
  * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint / calculateMd5）
@@ -62,7 +62,7 @@
  *     服务端不会改派 uuid（handleAuthResponse 里那段"换 uuid 重订阅"是死分支，见该函数注释）
  *   - 素材落盘在 getFilesDir() 下：无前缀键 "01" → filesDir/01，带幕前缀 "A01" → filesDir/scenea/01、
  *     "B01" → filesDir/sceneb/01（不是旧注释说的 filesDir/videos/xxx，那是单播放器时代的布局）
- *     卸载即清；downloadDir=filesDir/videos 只剩 onCreate 里一次 mkdirs，已是遗留空目录
+ *     卸载即清；filesDir/videos 是旧单播放器布局的遗留目录，已无代码引用
  *   - 所有网络请求在下载线程执行，UI 更新 post 到 mqttHandler
  */
 
@@ -131,9 +131,8 @@ class MainActivity : AppCompatActivity() {
     private var deviceId: String = ""
 
     // ========== 多窗口系统 ==========
-    // TODO: RS485/DMX512 external signal integration — currentSceneId currently has no active update path
-    /** 当前场景 ID："A" 或 "B"。渲染/状态上报都不读它，只有 switchScene 会写（而 switchScene 无人调用） */
-    private var currentSceneId = "A"
+    // RS485/DMX512 外部信号触发切幕是后续功能：目前既没有"当前幕"状态位，也没有 switchScene ——
+    // A/B 两幕的窗口本来就是合并渲染的，每个窗口播什么由自己的 content 决定。
     /** windowId -> ExoPlayer 实例（每个窗口独立播放器）*/
     private val windowPlayers = mutableMapOf<String, ExoPlayer>()
     /** windowId -> View 实例（窗口视图）*/
@@ -152,10 +151,6 @@ class MainActivity : AppCompatActivity() {
     // 池给到 4 只是为了让 auth 触发的同步和手动 sync 不互相排队，文件夹内部仍是逐个串行下载。
     private val downloadExecutor = Executors.newFixedThreadPool(4)
     private var statusTimerRunnable: Runnable? = null
-
-    // 遗留：单播放器时代素材放在 filesDir/videos/ 下。现在同步/播放一律用 videoFolderPath（= filesDir 根），
-    // 这里只剩 onCreate 里一次 mkdirs，跑起来是个空的遗留目录，别再往它写东西。
-    private val downloadDir by lazy { File(filesDir, "videos") }
 
     // 设备指纹信息
     private var deviceFingerprint: String = ""
@@ -319,11 +314,6 @@ class MainActivity : AppCompatActivity() {
 
         logToFile("=== XVJ App Starting ===")
         logToFile("Video folder: $videoFolderPath")
-
-        // 确保下载目录存在
-        if (!downloadDir.exists()) {
-            downloadDir.mkdirs()
-        }
 
         // 预建素材目录（根 + scenea + sceneb 各 01..30，详见 createMaterialFolders）
         createMaterialFolders()
@@ -974,7 +964,6 @@ class MainActivity : AppCompatActivity() {
      * 实际支持的 action（与服务端发送方一一对应）：
      *   stop                停掉全部播放
      *   config              改 mqtt_server / loop（只影响单播放器 player，不影响窗口播放器）
-     *   preset_sync         预设素材同步（folders 数组）→ syncPresetFolders
      *   sync_room_materials 房间素材全量对账（服务端【S-07】/授权链路发出）
      *   update_windows      轻量窗口重排，不下素材（编辑器 live 实时预览）
      *   delete_material     删单个本地素材文件
@@ -1008,13 +997,6 @@ class MainActivity : AppCompatActivity() {
                     if (cmd.has("loop")) {
                         loopPlay = cmd.getBoolean("loop")
                         player?.repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
-                    }
-                }
-                "preset_sync" -> {
-                    // 接收预设素材同步
-                    val folders = cmd.optJSONArray("folders")
-                    if (folders != null) {
-                        syncPresetFolders(folders)
                     }
                 }
                 "sync_room_materials" -> {
@@ -1136,65 +1118,16 @@ class MainActivity : AppCompatActivity() {
                     Log.d(TAG, "set_debug: debug=$debug")
                     logToFile("调试模式变更: debug=$debug")
                 }
+                else -> {
+                    // 白名单外的 action（服务端 DEVICE_ACTIONS 已拦一道，这里只是漏网兜底）：
+                    // 不留一行的话，现场"发了命令没反应"只能靠猜
+                    Log.w(TAG, "Unknown command action: $action")
+                    logToFile("未知命令 action=$action，已忽略", "WARN", "MQTT", "COMMAND")
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Command parse error: ${e.message}")
-        }
-    }
-
-    /**
-     * 只把 folders（[{id,name}]）清洗后写进 SharedPreferences 的 preset_folders 键，
-     * 不建目录、不下任何素材文件 —— 名字里的"同步"是"同步一份文件夹清单"，容易误解。
-     * ⚠️ 整条 preset_sync 链路都是停用的：服务端从未发送 action:'preset_sync'，前端没有入口，
-     *    写进去的 preset_folders 键也没有任何地方读它。真正在跑的素材下发是 sync_room_materials。
-     */
-    private fun syncPresetFolders(folders: org.json.JSONArray) {
-        mqttHandler.post {
-            binding.statusText?.text = "同步预设素材(${folders.length()}个文件夹)..."
-        }
-
-        downloadExecutor.submit {
-            try {
-                val folderList = mutableListOf<Pair<String, String>>() // folderId to folderName
-
-                for (i in 0 until folders.length()) {
-                    try {
-                        val item = folders.get(i)
-                        if (item is org.json.JSONObject) {
-                            val id = item.optString("id", "").take(20)
-                            val name = item.optString("name", "").take(100)
-                            // 过滤特殊字符
-                            val safeId = id.replace(Regex("[^a-zA-Z0-9_-]"), "")
-                            val safeName = name.replace(Regex("[^\\w\\s-]"), "")
-                            if (safeId.isNotEmpty()) {
-                                folderList.add(Pair(safeId, safeName))
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Skipping invalid folder at index $i: ${e.message}")
-                    }
-                }
-
-                // 保存文件夹配置到本地
-                val prefsEditor = prefs.edit()
-                val folderJson = org.json.JSONObject()
-                folderList.forEach { (id, name) ->
-                    folderJson.put(id, name)
-                }
-                prefsEditor.putString("preset_folders", folderJson.toString())
-                prefsEditor.commit() // 同步写入，确保保存成功
-
-                Log.d(TAG, "Preset folders saved: $folderList")
-
-                mqttHandler.post {
-                    binding.statusText?.text = "预设素材同步完成"
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Preset sync error: ${e.message}")
-                mqttHandler.post {
-                    binding.statusText?.text = "预设素材同步失败"
-                }
-            }
+            logToFile("命令处理异常: ${e.message}", "ERROR", "MQTT", "COMMAND")
         }
     }
 
@@ -2293,7 +2226,7 @@ class MainActivity : AppCompatActivity() {
         windowContentSigs.clear()
 
         // 收集所有场景的窗口，A 和 B 的 windows 合并后统一渲染
-        // 每个窗口播什么由自身 content.type/folderId 决定，与 currentSceneId（RS485 预留）无关
+        // 每个窗口播什么由自身 content.type/folderId 决定，不需要"当前幕"概念（见文件头的 RS485 切幕预留说明）
         val allWindows = mergeSceneWindows(scenes)
 
         // 若所有场景均无窗口，为 Scene A 创建默认全屏窗口
@@ -2773,25 +2706,7 @@ class MainActivity : AppCompatActivity() {
         logToFile("窗口 $winId 开始播放 $folderId (${videos.size}个视频)", "INFO", "PLAYBACK", "START")
     }
 
-    // 【A-08】 场景切换
-    /**
-     * 切换到 A/B 幕：只做"按缓存重渲染"。
-     * ⚠️ 当前无人调用——窗口显示哪一幕由各自的 content.type 决定（applySceneConfigs 把 A+B 的 windows
-     *    合并渲染），currentSceneId 只是 RS485 预留的状态位，改它不影响画面。
-     */
-    fun switchScene(sceneId: String) {
-        currentSceneId = sceneId.uppercase()
-        val cached = prefs.getString("scenes_json", null)
-        if (cached != null) {
-            try {
-                applySceneConfigs(JSONObject(cached))
-                Log.d(TAG, "切换到场景 $sceneId")
-            } catch (e: Exception) {
-                Log.e(TAG, "切换场景失败", e)
-            }
-        }
-    }
-
+    // 【A-08】 窗口释放
     /**
      * 释放所有窗口：播放器 release + 视图从 flSurface 摘掉。
      * 调用点三处 —— onDestroy、playWelcomeVideo 切欢迎视频前（避免旧窗口盖住它）、
