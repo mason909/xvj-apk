@@ -2547,18 +2547,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val dm = resources.displayMetrics
-        val sx = dm.widthPixels.toFloat() / 1920f
-        val sy = dm.heightPixels.toFloat() / 1080f
-
         for (w in desiredSorted) {
             val winId = w.optString("id")
             val c = windowViews[winId] as? FrameLayout ?: continue
 
-            val x = Math.round(w.optInt("x", 0) * sx)
-            val y = Math.round(w.optInt("y", 0) * sy)
-            val wd = Math.round(w.optInt("width", 1920).coerceAtLeast(64) * sx)
-            val ht = Math.round(w.optInt("height", 1080).coerceAtLeast(64) * sy)
+            val (x, y, wd, ht) = windowGeom(w)
             val p = c.layoutParams as? FrameLayout.LayoutParams ?: continue
             if (p.leftMargin != x || p.topMargin != y || p.width != wd || p.height != ht) {
                 p.leftMargin = x
@@ -2617,15 +2610,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 分辨率适配：云端编辑器画布固定为 1920x1080，窗口坐标/尺寸按设备真实分辨率轴向等比换算，
-        // 保证在 4K、竖屏盒子等非 1080p 设备上布局与设计稿占屏比例一致
-        val dm = resources.displayMetrics
-        val scaleX = dm.widthPixels.toFloat() / 1920f
-        val scaleY = dm.heightPixels.toFloat() / 1080f
-        val x = Math.round(w.optInt("x", 0) * scaleX)
-        val y = Math.round(w.optInt("y", 0) * scaleY)
-        val width = Math.round(w.optInt("width", 1920).coerceAtLeast(64) * scaleX)
-        val height = Math.round(w.optInt("height", 1080).coerceAtLeast(64) * scaleY)
+        // 分辨率适配 + 几何夹取见 windowGeom（画布固定 1920x1080，按设备真实分辨率轴向换算）
+        val (x, y, width, height) = windowGeom(w)
 
         val content = w.optJSONObject("content") ?: JSONObject()
         val type = content.optString("type", "SCENE_A").uppercase()
@@ -2744,6 +2730,24 @@ class MainActivity : AppCompatActivity() {
             }
         }
         return null
+    }
+
+    /**
+     * 窗口几何 [x, y, width, height]（设备 px）：编辑器画布固定 1920x1080，坐标与尺寸按真实分辨率轴向换算，
+     * 保证 4K 盒子等非 1080p 设备上占屏比例与设计稿一致。
+     * 上下限不是为了好看，是为了兜住手写 config 的极端值：width=999999 会真去申请一百万像素的
+     * TextureView，平板上是会 OOM 的。全量创建与 update_windows 轻量路径共用本函数，两边不会再夹出两套口径。
+     */
+    private fun windowGeom(w: JSONObject): IntArray {
+        val dm = resources.displayMetrics
+        val sx = dm.widthPixels.toFloat() / 1920f
+        val sy = dm.heightPixels.toFloat() / 1080f
+        return intArrayOf(
+            Math.round(w.optInt("x", 0).coerceIn(-1920, 3840) * sx),
+            Math.round(w.optInt("y", 0).coerceIn(-1080, 2160) * sy),
+            Math.round(w.optInt("width", 1920).coerceIn(64, 3840) * sx),
+            Math.round(w.optInt("height", 1080).coerceIn(64, 2160) * sy)
+        )
     }
 
     /** 归一化取景区 [x, y, w, h]：缺省/非法一律回退全画面，宽高下限 5% 且不会越出画面（避免零除） */
