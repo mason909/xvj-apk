@@ -1131,10 +1131,9 @@ class MainActivity : AppCompatActivity() {
                 plan.addAll(syncSceneFolders("A", fmA, allMaterials))
                 plan.addAll(syncSceneFolders("B", fmB, allMaterials))
                 runDownloadPlan(plan)
+                hideSyncProgress("素材同步完成")
 
                 mqttHandler.post {
-                    binding.syncProgressBar?.visibility = View.GONE
-                    binding.statusText?.text = "素材同步完成"
                     val scenesToApply = scenes ?: prefs.getString("scenes_json", null)?.let {
                         try { org.json.JSONObject(it) } catch (e: Exception) { null }
                     }
@@ -1150,10 +1149,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "Room materials sync error: " + e.message)
                 logToFile("房间素材同步异常: ${e.message}", "ERROR", "SYNC", "ERROR")
-                mqttHandler.post {
-                    binding.syncProgressBar?.visibility = View.GONE
-                    binding.statusText?.text = "素材同步失败"
-                }
+                hideSyncProgress("素材同步失败")
             }
         }
     }
@@ -1189,7 +1185,7 @@ class MainActivity : AppCompatActivity() {
         for (idx in tasks.indices) {
             val t = tasks[idx]
             val w = weights[idx]
-            logToFile("下载: ${t.folderId}/${t.filename} (${w / 1024}KB)")
+            logToFile("准备下载: ${t.folderId}/${t.filename} (${w / 1024}KB)")
             val progressCb: (Long) -> Unit = { downloadedBytes ->
                 updateSyncProgress(done + downloadedBytes, total, tasks.size, idx, t.filename)
             }
@@ -1230,10 +1226,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 收掉进度条：只改 syncProgressBar，不动 statusText（失败文案由调用方自己写） */
-    private fun hideSyncProgress() {
+    /**
+     * 收掉进度条（可选同时改写左下角状态文字）。
+     * syncProgressBar 的显与隐分别只有 updateSyncProgress / 本函数两个出口，别处不要再直接碰它。
+     * 不带 status 时只收条不动文字（失败文案已由 fetchRoomMaterials 等处自己写好）。
+     */
+    private fun hideSyncProgress(status: String? = null) {
         mqttHandler.post {
             binding.syncProgressBar?.visibility = View.GONE
+            if (status != null) binding.statusText?.text = status
         }
     }
 
@@ -1635,6 +1636,8 @@ class MainActivity : AppCompatActivity() {
             val realCode = conn.responseCode
             if (realCode == 304) {
                 Log.d(TAG, "文件未变化跳过: $filename")
+                // 上报一条：否则现场只看得到"准备下载"却没有"下载完成"，无法区分是被跳过还是下坏了
+                logToFile("跳过下载(ETag未变): $filename", "INFO", "SYNC", "SKIP")
                 conn.disconnect()
                 return false
             }
