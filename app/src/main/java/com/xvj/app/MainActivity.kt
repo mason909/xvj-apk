@@ -5,7 +5,7 @@
  *
  * 【代码索引】搜索 "【A-XX】" 快速定位
  * ─────────────────────────────────────────────────
- * 【A-01】生命周期 & 初始化（onCreate / loadConfig / onResume / onPause / onDestroy）
+ * 【A-01】生命周期 & 初始化（onCreate / loadConfig / setDebugMode / applyDebugUi / onResume / onPause / onDestroy）
  * 【A-02】MQTT 连接（connectMQTT / onMqttConnected / reconnectMQTT）
  * 【A-03】设备注册 & 授权（registerDevice / sendStatus / handleAuthResponse）
  * 【A-04】MQTT 消息处理 & 分发（handleCommand → when(action)）
@@ -27,12 +27,13 @@
  *   4. 播放循环：applySceneConfigs 按 scenes 配置渲染窗口
  * 
  * 房间调试模式（debug_mode）：
- *   - 来源只有两处 MQTT 载荷：auth_result 与 sync_room_materials 的 debug 字段，
- *     以及 set_debug 指令；HTTP 侧从不设置它（旧注释里的 /api/room-materials 已废弃）
- *   - SharedPreferences 持久化，重启后由 loadConfig() 读回
+ *   - 写入只经 setDebugMode()，三个来源：auth_result 与 sync_room_materials 的 debug 字段、
+ *     set_debug 指令；HTTP 侧从不设置它（旧注释里的 /api/room-materials 已废弃）
+ *   - SharedPreferences 持久化，重启后由 loadConfig() 读回并 applyDebugUi() 刷一次
  *   - true 时 logToFile() 通过 xvj/device/{id}/log 上报到 device_logs 表
- *   - true 时下载进度上屏（底部 syncProgressBar + 左下角 statusText 的「同步素材 3/12 · 45% · xx.mp4」）；
- *     关掉就只写日志 —— 设备接投影/大屏，观众看得到画面，常态不放进度条
+ *   - true 时整层"运维 UI"可见（applyDebugUi）：左下角 statusText 的状态文字 + 底部 syncProgressBar
+ *     下载进度条。关掉后大屏上只剩播放内容，那十几处 statusText 赋值不必各自判 debug——
+ *     隐藏容器即可，文字照常更新；现场要排查就开调试
  * 
  * 素材文件校验契约（改同步前必读）：
  *   - 云端 materials.md5 存的是 **faststart 重封装之后** 的字节摘要（服务端上传时就地重写文件），
@@ -506,6 +507,35 @@ class MainActivity : AppCompatActivity() {
         mqttClientId = deviceId
 
         Log.d(TAG, "Device ID: $deviceId")
+
+        // 按 prefs 里的 debug_mode 刷一次运维层（启动即决定左下角文字/进度条是否可见）
+        applyDebugUi()
+    }
+
+    /**
+     * debug_mode 的唯一写入口：落 prefs + 立刻刷新运维层显隐。
+     * 三个来源都走这里：auth_result 与 sync_room_materials 载荷的 debug 字段、set_debug 指令。
+     */
+    private fun setDebugMode(debug: Boolean) {
+        prefs.edit().putBoolean("debug_mode", debug).apply()
+        applyDebugUi()
+    }
+
+    /**
+     * 按 debug_mode 收放"运维层"= 左下角状态文字（statusText）+ 底部同步进度条（syncProgressBar）。
+     * 设备接投影/大屏，观众看得到画面：调试模式关掉时整层 GONE，
+     * 因此全文那十几处 statusText.text 赋值不必各自判 debug（隐藏容器就够了，文字照常更新）。
+     * 任意线程可调（内部 post 到主线程）。
+     */
+    private fun applyDebugUi() {
+        val debug = prefs.getBoolean("debug_mode", false)
+        mqttHandler.post {
+            binding.statusText?.let {
+                it.visibility = if (debug) View.VISIBLE else View.GONE
+                if (debug) it.bringToFront()
+            }
+            if (!debug) binding.syncProgressBar?.visibility = View.GONE
+        }
     }
 
     // 【A-02】 MQTT 连接
@@ -749,7 +779,7 @@ class MainActivity : AppCompatActivity() {
                             // 还是上次遗留值，进度条和日志上报会慢一整轮。这里提前落一次，让同场同步按房间真值显示。
                             // 只在载荷确实带该字段时才覆盖（老服务端不带 → 保留本机现值）。
                             if (resp.has("debug")) {
-                                prefs.edit().putBoolean("debug_mode", resp.optBoolean("debug", false)).apply()
+                                setDebugMode(resp.optBoolean("debug", false))
                             }
                             // 触发素材同步（映射真相在 scenes 里，folderMappings 仅作旧服务端兜底）
                             if (folderMappings != null || scenes != null) {
@@ -906,9 +936,9 @@ class MainActivity : AppCompatActivity() {
                     // 接收房间素材同步，下载到本地文件夹
                     val roomId = cmd.optString("room_id", "")
                     val folderMappings = cmd.optJSONObject("folder_mappings")
-                    // debug 字段以命令为准：每次都覆盖 prefs（服务端从房间配置里带过来）
+                    // debug 字段以命令为准：每次都覆盖（服务端从房间配置里带过来）
                     val debug = cmd.optBoolean("debug", false)
-                    prefs.edit().putBoolean("debug_mode", debug).apply()
+                    setDebugMode(debug)
                     val fmKeys = java.lang.StringBuilder()
                     folderMappings?.keys()?.let { val k = it; while (k.hasNext()) { fmKeys.append(k.next()).append(",") } }
                     logToFile("sync_room_materials: roomId=$roomId, folderMappings=" + fmKeys.toString() + ", debug=$debug")
@@ -1003,10 +1033,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "set_debug" -> {
-                    // 调试模式的唯一手动开关：写 prefs 后立即生效（logToFile 是否上报每行都读该值），
-                    // 但 auth_result / sync_room_materials 携带的 debug 字段仍会在下一次同步时覆盖它。
+                    // 手动开关，和 auth_result / sync_room_materials 的 debug 字段同走 setDebugMode。
+                    // 它是临时值：下一次载荷会按房间配置覆盖（房间 config.debug 才是真相）。
                     val debug = cmd.optBoolean("debug", false)
-                    prefs.edit().putBoolean("debug_mode", debug).apply()
+                    setDebugMode(debug)
                     Log.d(TAG, "set_debug: debug=$debug")
                     logToFile("调试模式变更: debug=$debug")
                 }
@@ -1196,10 +1226,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 进度条显隐/文案的唯一出口。
+     * 下载进度的上屏出口（显 + 百分比 + 文案）。
      *
      * 可见范围 = 仅房间调试模式（prefs.debug_mode）：设备接投影/大屏时观众看得到画面，
-     * 常态播放页不该冒出进度条；非调试模式只留 logToFile，不上屏。
+     * 常态播放页不该冒出进度条；非调试模式直接 return，只留 logToFile。
+     * 整层运维 UI 的显隐归 applyDebugUi() 管，这里这次判空只是让下载线程不必多绕一趟主线程。
      *
      * 线程：只在 downloadExecutor 线程被调用（开环 0%、256KB 字节回调、每个文件收尾各一次），
      * 百分比在调用线程算好后连文案一起 post 给 mqttHandler —— 不留任何共享可变状态，
