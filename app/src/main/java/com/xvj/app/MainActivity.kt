@@ -51,7 +51,7 @@
  *     不要把 md5 理解成"用户原始上传文件的 md5"，拿本地素材目录去比对会永远对不上
  *   - 一轮同步里 md5 判定先于 ETag：md5 不同才进 downloadWithETag，
  *     而它内部按 **文件名** 取 If-None-Match —— 若服务端 ETag 没变而 md5 变了，
- *     那个条件 GET 会拿回 304 直接 return false，本地仍是旧文件，下一轮再报不一致（表现为"永远同步不完"）
+ *     那个条件 GET 会拿回 304 直接 return UNCHANGED，本地仍是旧文件，下一轮再报不一致（表现为"永远同步不完"）
  *   - 因此服务端就地替换素材文件时必须让 ETag/Last-Modified 一起变（nginx 自动重算，正常没问题）
  *   - ETag/Last-Modified 只在文件**流写完并且实到字节 == 云端 size** 之后才写回 prefs：中途断线不会
  *     留下"半截文件 + 已生效 ETag"这种永远修不好的组合。半截文件也不做 Range 续传——素材是同名就地
@@ -672,6 +672,11 @@ class MainActivity : AppCompatActivity() {
                     logToFile("MQTT Connection Error: ${e.message}")
 
                     onMqttReconnectFailed()  // P4 fix: 连接失败也触发退避
+                    // ⚠️ 光抬高退避计数器是不够的，必须真的安排一次重试：以前只有 connectionLost
+                    // （连上之后断开）会 reconnectMQTT()，首次连接失败——最常见就是"平板先开机、
+                    // 路由器还没拨号"——一次都不会再试。设备从此永久离线，且因为不再发心跳，
+                    // 服务端的 rev 对账也拿不到任何补发机会，界面上只剩一个"离线"。
+                    reconnectMQTT()
                     mqttHandler.post {
                         binding.statusText?.text = "连接失败: ${e.message}"
                     }
@@ -679,6 +684,9 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "MQTT setup error: ${e.message}")
                 logToFile("MQTT setup error: ${e.message}")
+                // 同上：MqttClient 构造失败（服务器地址被配坏等）也得留一条重试的路
+                onMqttReconnectFailed()
+                reconnectMQTT()
             }
         }
     }
@@ -931,9 +939,20 @@ class MainActivity : AppCompatActivity() {
     private val mqttMaxReconnectDelaySeconds = 300
     private var mqttReconnectAttempts = 0
 
+    // 单飞闸门：connectionLost 与"首次连接失败"两条路都会排重连，没有这道闸门时
+    // 一次网络抖动就能排队好几个 postDelayed，之后每个又各自再排 —— 越重试越密。
+    @Volatile private var mqttReconnectScheduled = false
+
     private fun reconnectMQTT() {
+        if (mqttReconnectScheduled) {
+            Log.d(TAG, "重连已在排队（${mqttReconnectDelaySeconds}s 后），忽略重复调度")
+            return
+        }
+        mqttReconnectScheduled = true
         val delayMs = (mqttReconnectDelaySeconds * 1000).toLong()
         mqttHandler.postDelayed({
+            // 先放行闸门：本次尝试若再失败，失败分支需要能重新排下一次
+            mqttReconnectScheduled = false
             try { mqttClient?.close() } catch (e: Exception) {}
             connectMQTT()
             // P4 fix: checkForUpdate 移入 postDelayed 闭包内，等待重连窗口再执行
@@ -985,8 +1004,14 @@ class MainActivity : AppCompatActivity() {
                     // DELETE /api/rooms/:id 删房间（补上 releaseAllWindows 后才真的停得住）。
                     // 不清 windowContentSigs：下次 applySceneConfigs 自己清，
                     // 而 applyLiveWindowUpdate 发现 flSurface 已无子视图会判定为结构变化并全量重建。
-                    stopPlayback()
-                    releaseAllWindows()
+                    // ⚠️ 必须 post 到主线程：这两个函数会碰 PlayerView.setPlayer(null) 和
+                    // flSurface.removeView()，在 Paho 回调线程上直接调会抛 IllegalStateException，
+                    // 被 handleCommand 的 catch 吞成一条"消息处理异常"日志 —— 结果是云端下发的
+                    // stop（删房间/废止）什么都没停住，画面继续播。
+                    mqttHandler.post {
+                        stopPlayback()
+                        releaseAllWindows()
+                    }
                 }
                 "config" -> {
                     // 更新配置
@@ -996,7 +1021,10 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (cmd.has("loop")) {
                         loopPlay = cmd.getBoolean("loop")
-                        player?.repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
+                        // repeatMode 属于播放器状态，只能在创建 ExoPlayer 的主线程上改
+                        mqttHandler.post {
+                            player?.repeatMode = if (loopPlay) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
+                        }
                     }
                 }
                 "sync_room_materials" -> {
@@ -1151,6 +1179,19 @@ class MainActivity : AppCompatActivity() {
     )
 
     /**
+     * downloadWithETag 的一次落地结果。**必须三态**：以前只回 Boolean，"服务端说没变"和
+     * "下载失败"都是 false，调用方无法区分，于是"这一轮到底有没有真拿到东西"只能拿计划条数凑
+     * （见 runDownloadPlan 的注释）。
+     *  - WRITTEN   真的写完并落盘，字节数与云端 size 相符（或云端没给 size）
+     *  - UNCHANGED 条件请求回 304，本地文件原样可用
+     *  - FAILED    网络异常 / 写一半断流 / 实到字节与云端 size 不符（宁可当没拿到）
+     */
+    private enum class DownloadResult { WRITTEN, UNCHANGED, FAILED }
+
+    /** 一轮下载计划的执行汇总：written=真落地了几个，failed=没拿到几个 */
+    private data class PlanResult(val written: Int, val failed: Int)
+
+    /**
      * 素材同步的唯一入口，按房间做在飞去重：
      * 该房间已有一轮对账在跑时，这次请求只被记成"最后待补跑的那一份"（同房间互相覆盖，中间态没有意义），
      * 当前轮跑完立刻补一轮。并发的两轮会抢同一批文件、进度条来回刷屏，而且后一轮拿的清单更新，
@@ -1205,9 +1246,11 @@ class MainActivity : AppCompatActivity() {
      * 3) syncSceneFolders("A"/"B") 按 scenes.A/B.folder_mappings 对账：映射有变的下、多的删，
      *    只**收集**待下载任务不真下载；映射真相只在 scenes 里，
      *    folderMappingsFallback 仅给旧服务端兜底，B 幕缺失时按空映射处理。
-     * 4) runDownloadPlan 按字节进度逐个下载（调试模式下底部进度条可见），串行、单线程。
+     * 4) runDownloadPlan 按字节进度逐个下载（调试模式下底部进度条可见），串行、单线程，
+     *    回来的是 PlanResult(written, failed)——"下成了几个、没下成几个"，不是"排了几个任务"。
      * 5) 回主线程 applySceneConfigs：优先用本次载荷的 scenes，没有才回落 prefs 缓存；
-     *    真下载过东西才 force 重建，纯对账交给结构指纹判重，同配置不会打断正在播的视频。
+     *    written>0 才 force 重建，纯对账交给结构指纹判重，同配置不会打断正在播的视频。
+     * 6) rev 只在 failed==0（整轮真的落地）时才记账；有失败就留给心跳对账下一轮补发。
      */
     private fun doRoomMaterialSync(req: SyncRequest) {
         val roomId = req.roomId
@@ -1230,10 +1273,15 @@ class MainActivity : AppCompatActivity() {
             val plan = ArrayList<SyncTask>()
             plan.addAll(syncSceneFolders("A", fmA, allMaterials))
             plan.addAll(syncSceneFolders("B", fmB, allMaterials))
-            runDownloadPlan(plan)
-            hideSyncProgress("素材同步完成")
+            if (plan.isEmpty()) logToFile("素材对账完成: 无需下载（映射内素材本地已齐）")
+            val res = runDownloadPlan(plan)
+            val complete = res.failed == 0
+            hideSyncProgress(if (complete) "素材同步完成" else "素材同步未完成：${res.failed} 个未落地")
 
-            val downloaded = plan.isNotEmpty()
+            // force 只在真下载过东西时给：本地一个字节都没变（全部 304 / 计划为空）就没必要打断正在播的视频，
+            // 交给结构指纹判重跳过。以前这里写的是 plan.isNotEmpty()，"排了任务"被当成"下载成功"，
+            // 于是网络抖一下、十个文件全失败，也照样强制重建一轮窗口（画面白闪），还看不出出了问题。
+            val downloaded = res.written > 0
             mqttHandler.post {
                 val scenesToApply = scenes ?: prefs.getString("scenes_json", null)?.let {
                     try { org.json.JSONObject(it) } catch (e: Exception) { null }
@@ -1245,10 +1293,16 @@ class MainActivity : AppCompatActivity() {
                         Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
                     }
                 }
-                // 走到这里配置才真的落地了：素材齐、窗口已按新配置重建，可以给心跳对账报这个 rev
-                markAppliedRev(req.rev)
+                // rev 记账 = 向服务端承诺"本机已经追平这个配置指纹"，所以只在整轮真的落地后才报：
+                // 素材齐（无失败）、窗口已按新配置重建。有任何一个文件没下来就不报，
+                // 让心跳对账（服务端 REV_RECONCILE_MIN_INTERVAL 节流）在下一轮补发时重试。
+                // 以前的写法是无条件 markAppliedRev —— 下载全失败也报追平，服务端从此闭嘴，
+                // 现场表现就是"房间永远少几个素材，点同步也没反应"，只能改一次配置才会再试。
+                if (complete) markAppliedRev(req.rev)
+                else logToFile("本轮 ${res.failed} 个素材未落地，rev 不记账，等待对账补发 (rev=${req.rev})",
+                    "WARN", "SYNC", "REV")
             }
-            logToFile("房间素材同步完成: " + roomId)
+            logToFile("房间素材同步完成: " + roomId + (if (complete) "" else "（部分失败 ${res.failed}）"))
         } catch (e: Exception) {
             Log.e(TAG, "Room materials sync error: " + e.message)
             logToFile("房间素材同步异常: ${e.message}", "ERROR", "SYNC", "ERROR")
@@ -1258,22 +1312,20 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 执行下载计划：串行下载 + 按字节刷新进度（进度只在 debug_mode 下上屏，见 updateSyncProgress）。
+     * 返回 PlanResult，由调用方决定"这一轮的 rev 能不能记账"——只要有一个文件没落地，
+     * 这轮配置就不算应用完成（见 doRoomMaterialSync）。
      *
      * 分母口径：云端每条素材带 size（服务端 statSync 现算）。size 全为 0（老服务端 / 文件已删）时
      * 回落到"按文件数"计——每个任务按 1 字节算，进度仍是单调的。部分有 size 时，0 大小的任务
      * 按已知任务的中位数折算（不用平均数：一个 2GB 素材会把平均数撑爆、让其余小文件瞬间跑完）。
      *
      * 计划阶段（syncFolderWithIds）已经把 md5 一致的、304 命中的都尽量剔掉了，剩下的是真要下载的；
-     * 但 downloadWithETag 仍可能返回 false（文件名 ETag 未变 → 304，见 syncFolderWithIds 的判定顺序），
+     * 但 downloadWithETag 仍可能返回 UNCHANGED（文件名 ETag 未变 → 304，见 syncFolderWithIds 的判定顺序），
      * 此时按"整只文件大小"计入已完成字节，否则进度条会卡在最后几个文件上下不来。
+     * 失败的（FAILED）同样计入已完成：进度条是"跑到哪儿了"，不是"成没成"，成败由返回值交代。
      */
-    private fun runDownloadPlan(tasks: List<SyncTask>) {
-        if (tasks.isEmpty()) {
-            // 本地已齐：不显示进度条，并把上一轮可能留下的 100% 细条收掉
-            hideSyncProgress()
-            logToFile("素材对账完成: 无需下载（映射内素材本地已齐）")
-            return
-        }
+    private fun runDownloadPlan(tasks: List<SyncTask>): PlanResult {
+        if (tasks.isEmpty()) return PlanResult(0, 0)
 
         val known = tasks.map { it.size }.filter { it > 0L }.sorted()
         val fallback = if (known.isEmpty()) 1L else known[known.size / 2]
@@ -1284,6 +1336,8 @@ class MainActivity : AppCompatActivity() {
         updateSyncProgress(0L, total, tasks.size, 0, "准备中")
 
         var done = 0L
+        var written = 0
+        var failed = 0
         for (idx in tasks.indices) {
             val t = tasks[idx]
             val w = weights[idx]
@@ -1291,10 +1345,15 @@ class MainActivity : AppCompatActivity() {
             val progressCb: (Long) -> Unit = { downloadedBytes ->
                 updateSyncProgress(done + downloadedBytes, total, tasks.size, idx, t.filename)
             }
-            downloadWithETag(t.url, t.destFile, t.filename, t.size, progressCb)
+            when (downloadWithETag(t.url, t.destFile, t.filename, t.size, progressCb)) {
+                DownloadResult.WRITTEN -> written++
+                DownloadResult.FAILED -> failed++
+                DownloadResult.UNCHANGED -> { /* 本地已是最新，两个计数都不加 */ }
+            }
             done += w
             updateSyncProgress(done, total, tasks.size, idx, t.filename)
         }
+        return PlanResult(written, failed)
     }
 
     /**
@@ -1688,11 +1747,11 @@ class MainActivity : AppCompatActivity() {
     /**
      * 带 ETag/Last-Modified 条件请求的文件下载
      * @param filename     缓存键用的文件名（etag_/lm_ 前缀 + 它）；调用方传的正是 destFile.name
-     * @param expectedSize 云端下发的完整字节数，只用来收尾自检；0 = 未知（老服务端/取不到）
+     * @param expectedSize 云端下发的完整字节数，用来判定这次到底算不算落地；0 = 未知（老服务端/取不到）
      * @param onProgress   本次写入的字节数回调，每 ≥256KB 一次；null = 不回报
-     * @return true = 实际写了文件；false = 服务端说没变，本地原样保留
+     * @return DownloadResult：WRITTEN 真写完 / UNCHANGED 304 原样保留 / FAILED 没拿到（见枚举注释）
      *
-     * 一次调用只发 1 个条件 GET：304 就原样保留本地文件返回 false，2xx 才落盘。历史版本在这里叠了
+     * 一次调用只发 1 个条件 GET：304 就原样保留本地文件返回 UNCHANGED，2xx 才落盘。历史版本在这里叠了
      * 最多 3 个 HEAD + 1 个 GET，而每个 HEAD 的判定（带 If-None-Match，304 则跳过）都与最后那个条件
      * GET 完全重复，已合并。
      *
@@ -1703,7 +1762,7 @@ class MainActivity : AppCompatActivity() {
      *   - 不做 Range 断点续传：同名素材在云端是"就地替换"的（faststart 重封装就是同名改字节），
      *     续传会把新字节拼在旧前缀后面变成坏文件。宁可下一轮从 0 重下。
      *
-     * 注意：md5 不一致但 ETag 没变时，这里会返回 false 而不下载 —— 语义见 syncFolderWithIds 的判定顺序。
+     * 注意：md5 不一致但 ETag 没变时，这里会返回 UNCHANGED 而不下载 —— 语义见 syncFolderWithIds 的判定顺序。
      */
     private fun downloadWithETag(
         urlStr: String,
@@ -1711,7 +1770,7 @@ class MainActivity : AppCompatActivity() {
         filename: String,
         expectedSize: Long = 0L,
         onProgress: ((Long) -> Unit)? = null
-    ): Boolean {
+    ): DownloadResult {
         val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
         val cachedLm = prefs.getString(PREF_LM_PREFIX + filename, null)
         // 本地文件不在/为空 ⇒ 缓存的 ETag 一律不作数（带了会被 nginx 判成 304，旧文件永远下不回来）
@@ -1734,7 +1793,14 @@ class MainActivity : AppCompatActivity() {
                 // 上报一条：否则现场只看得到"准备下载"却没有"下载完成"，无法区分是被跳过还是下坏了
                 logToFile("跳过下载(ETag未变): $filename", "INFO", "SYNC", "SKIP")
                 conn.disconnect()
-                return false
+                return DownloadResult.UNCHANGED
+            }
+            // 非 2xx（404 素材被删、502 nginx 后端抖动…）明确判失败：以前靠 inputStream 抛异常兜住，
+            // 日志里只留一句 "HTTP 404 reading..." 之类的 JDK 文案，现场看不出是云端没这个文件
+            if (realCode !in 200..299) {
+                logToFile("下载失败: $filename HTTP $realCode $urlStr", "ERROR", "SYNC", "DOWNLOAD")
+                conn.disconnect()
+                return DownloadResult.FAILED
             }
 
             val newEtag = conn.getHeaderField("ETag")
@@ -1763,21 +1829,23 @@ class MainActivity : AppCompatActivity() {
             conn.disconnect()
 
             if (expectedSize > 0L && destFile.length() != expectedSize) {
-                // 只告警、不存 ETag、不清理：下一轮因拿不到新 ETag 会重新完整下载
+                // 不存 ETag，并且按失败上报：一只半截/尺寸对不上的文件不能算"配置已落地"。
+                // 只告警不判失败的时代，它会连着 rev 一起被记成成功——服务端据此认为设备已追平，
+                // 对账不再补发，现场就是一块永远修不好的坏素材。
                 logToFile("下载字节数与云端 size 不符: $filename 实到${destFile.length()} 期望$expectedSize",
                     "WARN", "SYNC", "DOWNLOAD")
-            } else {
-                // 写完了、字节数也对得上，才认这个 ETag/Last-Modified（见上面"两条规矩"）
-                if (newEtag != null) prefs.edit().putString(PREF_ETAG_PREFIX + filename, newEtag).apply()
-                if (newLm != null) prefs.edit().putString(PREF_LM_PREFIX + filename, newLm).apply()
+                return DownloadResult.FAILED
             }
+            // 写完了、字节数也对得上，才认这个 ETag/Last-Modified（见上面"两条规矩"）
+            if (newEtag != null) prefs.edit().putString(PREF_ETAG_PREFIX + filename, newEtag).apply()
+            if (newLm != null) prefs.edit().putString(PREF_LM_PREFIX + filename, newLm).apply()
             Log.d(TAG, "下载完成: $filename")
             logToFile("下载完成: $filename (${destFile.length() / 1024}KB)", "INFO", "SYNC", "DOWNLOAD")
-            true
+            DownloadResult.WRITTEN
         } catch (e: Exception) {
             Log.e(TAG, "下载失败 [${filename}]: ${e.message}")
             logToFile("下载失败 [$filename]: ${e.message}", "ERROR", "SYNC", "DOWNLOAD")
-            false
+            DownloadResult.FAILED
         }
     }
 
