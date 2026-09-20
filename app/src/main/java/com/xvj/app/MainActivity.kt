@@ -2864,8 +2864,11 @@ class MainActivity : AppCompatActivity() {
                     readyLogged = true
                     val costMs = android.os.SystemClock.elapsedRealtime() - tCreated
                     val vs = (p as? ExoPlayer)?.videoSize
+                    // 只报分辨率，不报帧率：本工程的 media3 1.2.1 里 VideoSize 还没有 frameRate
+                    // 字段（run294 编译就是这么断的）。要帧率得升 media3 或改走 currentTracks 的
+                    // Format.frameRate，为一条日志不值当，先看分辨率——4K/1080p 才是 CPU 的主要变量。
                     logToFile("窗口 $winId 首帧就绪: 用时 ${costMs}ms" +
-                        (if (vs != null) "，输入 ${vs.width}x${vs.height} ${vs.frameRate.toInt()}fps" else "") +
+                        (if (vs != null) "，输入 ${vs.width}x${vs.height}" else "") +
                         "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "READY")
                 }
             })
