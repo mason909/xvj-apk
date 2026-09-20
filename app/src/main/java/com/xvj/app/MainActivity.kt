@@ -25,7 +25,7 @@
  *   2. 设备注册 → 服务端审核 authorized=1 → 回 xvj/auth/response（带 scenes + debug + rev）
  *   3. sync_room_materials 命令 → requestRoomMaterialSync 按房间去重后进对账：
  *      /api/room-materials-v2/{roomId} 拉全量清单
- *      → 按 Scene A/B 逐文件夹对账（多的删、缺的/变的进下载计划）
+ *      → 按 Scene A/B 逐文件夹对账（多的删、缺的/变的进下载计划；本地文件在且没有可比对凭据时按字节数跳过，见【size 兜底】）
  *      → runDownloadPlan 串行下载整批计划，按云端下发的字节数刷底部进度条（仅调试模式可见）
  *   4. 播放循环：applySceneConfigs 按 scenes 配置渲染窗口（结构与屏上一致则直接跳过，见幂等闸门）
  *
@@ -1476,10 +1476,12 @@ class MainActivity : AppCompatActivity() {
      * 流程：比对本地与云端素材，缺的/变的进计划，多的删掉
      * 判定顺序（这决定了"为什么改了文件设备却不更新"）：
      *   1. 本地存在该文件 && 云端 md5 非空 && 本地 md5 相等 → 跳过，连请求都不发
-     *   2. 其余情况一律进计划，由 downloadWithETag 先看按<目录/文件名>存的 ETag，
-     *      命中 304 就直接 return false —— 也就是"云端 md5 变了但 ETag 没变"会被静默吃掉，
+     *   2. 本地存在 && 云端 md5 为空 && 本机没有该文件的 ETag/Last-Modified 缓存 && 字节数与云端 size 一致
+     *      → 跳过（【size 兜底】，见下面的行内注释）。装 APK 清了 prefs 时靠这条免掉整目录重下。
+     *   3. 其余情况一律进计划，由 downloadWithETag 先看按<目录/文件>存的 ETag，
+     *      命中 304 就直接 return UNCHANGED —— 也就是"云端 md5 变了但 ETag 没变"会被静默吃掉，
      *      本地保持旧文件、下一轮同步再重复报不一致。云端就地替换素材字节时必须让 ETag 一起变。
-     *   3. 云端 md5 为空（老记录/预设引用）时只靠 ETag 去重，这是有意为之的兜底路径
+     *   云端 md5 为空（老记录/预设引用）时平时只靠 ETag 去重；ETag 也没了才退到第 2 条的字节数判定。
      */
     private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?): List<SyncTask> {
         val tasks = ArrayList<SyncTask>()
@@ -1519,6 +1521,7 @@ class MainActivity : AppCompatActivity() {
             } ?: emptyList()
 
             val shouldExist = mutableSetOf<String>()
+            var sizeSkipped = 0   // 本轮按 size 兜底跳过的只数，>0 时目录级报一行（逐只报会刷屏）
 
             for (i in 0 until cloudList.length()) {
                 val item = cloudList.getJSONObject(i)
@@ -1537,16 +1540,31 @@ class MainActivity : AppCompatActivity() {
                     val downloadUrl = if (urlPath.startsWith("http")) urlPath else APK_URL + urlPath
 
                     val md5 = item.optString("md5", "")
-                    if (localFile.exists() && md5.isNotEmpty()) {
-                        val localMd5 = cachedMd5(localFile)
-                        if (localMd5 == md5) {
-                            Log.d(TAG, "文件已存在且MD5一致: " + filename)
+                    // 字节数由云端 statSync 现算（老服务端没这个字段时 optLong 给 0，执行阶段按中位数折算）
+                    val cloudSize = item.optLong("size", 0L)
+                    if (localFile.exists()) {
+                        if (md5.isNotEmpty()) {
+                            if (cachedMd5(localFile) == md5) {
+                                Log.d(TAG, "文件已存在且MD5一致: " + filename)
+                                continue
+                            }
+                        } else if (cloudSize > 0L && localFile.length() == cloudSize &&
+                            readHttpCache(PREF_ETAG_PREFIX, localFile) == null &&
+                            readHttpCache(PREF_LM_PREFIX, localFile) == null
+                        ) {
+                            // 【size 兜底】只在"云端给不出内容指纹 + 本机也没有可复核的 ETag/Last-Modified"时启用：
+                            // 装 APK 会把 prefs 一起清掉（168 装机实测），缓存空了就只能无条件 GET 全量重下；
+                            // 而预设素材行的 md5 至今是 NULL（cp2p 不继承源素材），房间清单里 md5 就是空串 ——
+                            // 于是"本地已有同一只文件"这件事没有任何可比对的凭据，只能整目录重下一遍。
+                            // 判定收紧到"无复核凭据"是必要的：常态下 nginx 的 ETag 能识破"就地替换同尺寸文件"，
+                            // 一旦让字节数就当通行证跳过，那种替换就再也发现不了了。
+                            sizeSkipped++
+                            Log.d(TAG, "无 md5 也无 ETag 缓存，按字节数一致跳过: " + filename)
                             continue
                         }
                     }
                     Log.d(TAG, "计划下载: " + filename)
-                    // size 由云端 statSync 现算（老服务端没这个字段时 optLong 给 0，执行阶段按中位数折算）
-                    tasks.add(SyncTask(folderId, localFile, downloadUrl, filename, item.optLong("size", 0L)))
+                    tasks.add(SyncTask(folderId, localFile, downloadUrl, filename, cloudSize))
                 }
             }
 
@@ -1561,6 +1579,10 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             Log.d(TAG, "文件夹 " + folderId + " 对账完成: " + tasks.size + " 个待下载")
+            if (sizeSkipped > 0) {
+                logToFile("$folderId 有 $sizeSkipped 只素材按字节数一致跳过下载（云端无 md5、本机无 ETag 缓存）",
+                    "INFO", "SYNC", "SKIP")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "syncFolderWithIds " + folderId + " 失败: " + e.message)
             logToFile("同步文件夹" + folderId + " 失败: " + e.message)
