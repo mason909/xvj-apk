@@ -50,8 +50,13 @@
  *     设备下载到的也正是这份字节，所以下载成功一次 md5 就对齐了；
  *     不要把 md5 理解成"用户原始上传文件的 md5"，拿本地素材目录去比对会永远对不上
  *   - 一轮同步里 md5 判定先于 ETag：md5 不同才进 downloadWithETag，
- *     而它内部按 **文件名** 取 If-None-Match —— 若服务端 ETag 没变而 md5 变了，
+ *     而它内部按 **相对素材根的路径** 取 If-None-Match（键口径见 materialCacheKey）—— 若服务端 ETag 没变而 md5 变了，
  *     那个条件 GET 会拿回 304 直接 return UNCHANGED，本地仍是旧文件，下一轮再报不一致（表现为"永远同步不完"）
+ *   - 三把缓存键（ETag / Last-Modified / md5）都是这条相对路径（"scenea/01/x.mp4"），不是裸文件名：
+ *     设备端认文件认的就是 <目录>/<文件名>，键不带目录时"同一素材 cp2p 到 01 和 02"这种常规操作
+ *     会让两个目录互刷同一份缓存，症状同上（每轮都重下、进度条永远跑不完）。
+ *     升级前的旧键（只有文件名）在 ETag/LM 上读时回落 + 写穿迁移，老设备不必整目录重下；
+ *     md5 不做回落 —— 它是纯本地判定，借错值会让人误以为"本地已是最新"而跳过下载
  *   - 因此服务端就地替换素材文件时必须让 ETag/Last-Modified 一起变（nginx 自动重算，正常没问题）
  *   - ETag/Last-Modified 只在文件**流写完并且实到字节 == 云端 size** 之后才写回 prefs：中途断线不会
  *     留下"半截文件 + 已生效 ETag"这种永远修不好的组合。半截文件也不做 Range 续传——素材是同名就地
@@ -198,10 +203,11 @@ class MainActivity : AppCompatActivity() {
         const val APK_URL = "http://47.102.106.237"
         // 订阅用的通配符主题在 connectMQTT() 里按 deviceId 拼具体路径，不再用常量
         private const val AUTH_TOPIC = "xvj/auth/response"
-        // ETag/Last-Modified 缓存的 SharedPreferences key 前缀
+        // 素材缓存的 SharedPreferences key 前缀。三个前缀后面的键一律是
+        // materialCacheKey(file) = 相对素材根的路径（"scenea/01/x.mp4"），不再是裸文件名，理由见那里。
+        // ETag/Last-Modified：条件请求用；md5：值为 "<文件字节数>:<mtime>:<md5>"，尺寸或改动时间变了即失效
         private const val PREF_ETAG_PREFIX = "etag_"
         private const val PREF_LM_PREFIX = "lm_"
-        // 素材 md5 缓存前缀：值为 "<文件字节数>:<mtime>:<md5>"，尺寸或改动时间变了即失效
         private const val PREF_MD5_PREFIX = "md5_"
     }
 
@@ -1328,7 +1334,7 @@ class MainActivity : AppCompatActivity() {
      * 按已知任务的中位数折算（不用平均数：一个 2GB 素材会把平均数撑爆、让其余小文件瞬间跑完）。
      *
      * 计划阶段（syncFolderWithIds）已经把 md5 一致的、304 命中的都尽量剔掉了，剩下的是真要下载的；
-     * 但 downloadWithETag 仍可能返回 UNCHANGED（文件名 ETag 未变 → 304，见 syncFolderWithIds 的判定顺序），
+     * 但 downloadWithETag 仍可能返回 UNCHANGED（这条路径的 ETag 未变 → 304，见 syncFolderWithIds 的判定顺序），
      * 此时按"整只文件大小"计入已完成字节，否则进度条会卡在最后几个文件上下不来。
      * 失败的（FAILED）同样计入已完成：进度条是"跑到哪儿了"，不是"成没成"，成败由返回值交代。
      */
@@ -1353,7 +1359,7 @@ class MainActivity : AppCompatActivity() {
             val progressCb: (Long) -> Unit = { downloadedBytes ->
                 updateSyncProgress(done + downloadedBytes, total, tasks.size, idx, t.filename)
             }
-            when (downloadWithETag(t.url, t.destFile, t.filename, t.size, progressCb)) {
+            when (downloadWithETag(t.url, t.destFile, t.size, progressCb)) {
                 DownloadResult.WRITTEN -> written++
                 DownloadResult.FAILED -> failed++
                 DownloadResult.UNCHANGED -> { /* 本地已是最新，两个计数都不加 */ }
@@ -1470,7 +1476,7 @@ class MainActivity : AppCompatActivity() {
      * 流程：比对本地与云端素材，缺的/变的进计划，多的删掉
      * 判定顺序（这决定了"为什么改了文件设备却不更新"）：
      *   1. 本地存在该文件 && 云端 md5 非空 && 本地 md5 相等 → 跳过，连请求都不发
-     *   2. 其余情况一律进计划，由 downloadWithETag 先看按文件名存的 ETag，
+     *   2. 其余情况一律进计划，由 downloadWithETag 先看按<目录/文件名>存的 ETag，
      *      命中 304 就直接 return false —— 也就是"云端 md5 变了但 ETag 没变"会被静默吃掉，
      *      本地保持旧文件、下一轮同步再重复报不一致。云端就地替换素材字节时必须让 ETag 一起变。
      *   3. 云端 md5 为空（老记录/预设引用）时只靠 ETag 去重，这是有意为之的兜底路径
@@ -1550,7 +1556,7 @@ class MainActivity : AppCompatActivity() {
                     logToFile("删除: " + file.name)
                     // 与 deleteMaterialFile/deleteFolderFiles 同一套约定：删本地文件必须一起清缓存，
                     // 否则该素材日后重新加回房间时，downloadWithETag 会拿旧 ETag 换到 304 而永远不重下。
-                    clearMaterialCache(file.name)
+                    clearMaterialCache(file)
                     file.delete()
                 }
             }
@@ -1604,7 +1610,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 删除单个本地素材（由 MQTT action:'delete_material' 触发）。
      * 定位方式是 <素材根>/<folderId 解析出的目录>/<filename>，materialId 只进日志不参与查找；
-     * ETag/LM 缓存键用的是文件名，所以删文件前必须先 remove 这两个键（见下面的约定）。
+     * 缓存键就是这条相对路径（见 materialCacheKey），所以删文件前必须先清缓存（见 clearMaterialCache）。
      */
     private fun deleteMaterialFile(folderId: String, filename: String, materialId: String) {
         try {
@@ -1626,7 +1632,7 @@ class MainActivity : AppCompatActivity() {
             }
             if (file.exists()) {
                 // 清除 ETag/Last-Modified/md5 缓存，避免删后重加时 APK 因 304 跳过下载
-                clearMaterialCache(filename)
+                clearMaterialCache(file)
                 val deleted = file.delete()
                 Log.d(TAG, "deleteMaterialFile deleted=$deleted folder=$folderId file=$filename")
                 logToFile("删除素材文件: folder=$folderId file=$filename deleted=$deleted")
@@ -1661,7 +1667,7 @@ class MainActivity : AppCompatActivity() {
                 Log.d(TAG, "清空文件夹" + folderId + "，删除: " + file.name)
                 logToFile("清空删除: " + file.name)
                 // 清除缓存的 ETag/Last-Modified/md5，避免删文件后重加时 APK 因 304 跳过下载
-                clearMaterialCache(file.name)
+                clearMaterialCache(file)
                 file.delete()
             }
         } catch (e: Exception) {
@@ -1814,7 +1820,8 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 带 ETag/Last-Modified 条件请求的文件下载
-     * @param filename     缓存键用的文件名（etag_/lm_ 前缀 + 它）；调用方传的正是 destFile.name
+     * @param destFile     落盘目标；日志用它的文件名，缓存键用它算相对路径（见 materialCacheKey）——
+     *                     以前缓存键是调用方传进来的裸文件名，跨目录同名会互刷缓存，故不再收这个参数
      * @param expectedSize 云端下发的完整字节数，用来判定这次到底算不算落地；0 = 未知（老服务端/取不到）
      * @param onProgress   本次写入的字节数回调，每 ≥256KB 一次；null = 不回报
      * @return DownloadResult：WRITTEN 真写完 / UNCHANGED 304 原样保留 / FAILED 没拿到（见枚举注释）
@@ -1835,12 +1842,12 @@ class MainActivity : AppCompatActivity() {
     private fun downloadWithETag(
         urlStr: String,
         destFile: File,
-        filename: String,
         expectedSize: Long = 0L,
         onProgress: ((Long) -> Unit)? = null
     ): DownloadResult {
-        val cachedEtag = prefs.getString(PREF_ETAG_PREFIX + filename, null)
-        val cachedLm = prefs.getString(PREF_LM_PREFIX + filename, null)
+        val filename = destFile.name
+        val cachedEtag = readHttpCache(PREF_ETAG_PREFIX, destFile)
+        val cachedLm = readHttpCache(PREF_LM_PREFIX, destFile)
         // 本地文件不在/为空 ⇒ 缓存的 ETag 一律不作数（带了会被 nginx 判成 304，旧文件永远下不回来）
         val force = !destFile.exists() || destFile.length() == 0L
         if (force) Log.d(TAG, "本地文件不存在或为空，强制下载: ${destFile.name}")
@@ -1859,7 +1866,8 @@ class MainActivity : AppCompatActivity() {
             if (realCode == 304) {
                 Log.d(TAG, "文件未变化跳过: $filename")
                 // 上报一条：否则现场只看得到"准备下载"却没有"下载完成"，无法区分是被跳过还是下坏了
-                logToFile("跳过下载(ETag未变): $filename", "INFO", "SYNC", "SKIP")
+                // 这里报相对路径而不是裸文件名：同名素材在不同目录时，只看文件名分不出是哪一目录被跳过
+                logToFile("跳过下载(ETag未变): ${materialCacheKey(destFile)}", "INFO", "SYNC", "SKIP")
                 conn.disconnect()
                 return DownloadResult.UNCHANGED
             }
@@ -1905,8 +1913,13 @@ class MainActivity : AppCompatActivity() {
                 return DownloadResult.FAILED
             }
             // 写完了、字节数也对得上，才认这个 ETag/Last-Modified（见上面"两条规矩"）
-            if (newEtag != null) prefs.edit().putString(PREF_ETAG_PREFIX + filename, newEtag).apply()
-            if (newLm != null) prefs.edit().putString(PREF_LM_PREFIX + filename, newLm).apply()
+            if (newEtag != null || newLm != null) {
+                val key = materialCacheKey(destFile)
+                val ed = prefs.edit()
+                if (newEtag != null) ed.putString(PREF_ETAG_PREFIX + key, newEtag)
+                if (newLm != null) ed.putString(PREF_LM_PREFIX + key, newLm)
+                ed.apply()
+            }
             Log.d(TAG, "下载完成: $filename")
             logToFile("下载完成: $filename (${destFile.length() / 1024}KB)", "INFO", "SYNC", "DOWNLOAD")
             DownloadResult.WRITTEN
@@ -1937,6 +1950,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 素材缓存键 = 相对素材根的路径（"scenea/01/x.mp4"、"01/x.mp4"），不再是裸文件名。
+     * 设备端认文件认的就是这个路径，而 ETag/Last-Modified/md5 三个键以前只有文件名：
+     * 同一素材 cp2p 到 01 和 02 是常规操作，两边于是互刷同一份缓存 —— 表现是每轮都重下、
+     * 进度条永远跑不完（现场最难查的那种"同步不完"）。键跟着路径走，各记各的。
+     * 万一不在素材根下（materialFileOf 已挡，理论不会发生）就退回文件名，至少不比以前差。
+     */
+    private fun materialCacheKey(file: File): String {
+        val root = File(videoFolderPath).absolutePath + File.separator
+        val abs = file.absolutePath
+        return if (abs.startsWith(root)) abs.substring(root.length) else file.name
+    }
+
+    /**
+     * 读 ETag / Last-Modified：先按新键（带目录）读，读不到再回落到升级前的旧键（只有文件名），
+     * 命中就把值搬到新键上 —— 装包升级时现场素材不必整个目录重下一遍。
+     * 旧键分不清自己属于哪个目录，跨目录同名的素材可能借到别人的 ETag；借错只多下一遍
+     * （nginx 按【本条 URL 指向的那个文件】比 ETag，对不上就 200 全量），不会下错内容。
+     * 旧键不主动删：删了另一个目录也白下一遍，留着让新键逐个把它取代掉。
+     */
+    private fun readHttpCache(prefix: String, file: File): String? {
+        val key = prefix + materialCacheKey(file)
+        prefs.getString(key, null)?.let { return it }
+        val legacy = prefs.getString(prefix + file.name, null) ?: return null
+        prefs.edit().putString(key, legacy).apply()
+        return legacy
+    }
+
+    /**
      * 带缓存的素材 md5：一轮对账要把本地每个文件整只读一遍算摘要，几十 GB 的素材目录就是几十 GB 磁盘读，
      * 而服务端每 30s/每次改动都可能推一轮同步 —— 绝大多数轮次里文件根本没动过。
      * 缓存键值本身带 "<字节数>:<mtime>:" 前缀，文件被替换（下载完成、重新落盘）后前缀对不上自动失效，
@@ -1945,7 +1986,10 @@ class MainActivity : AppCompatActivity() {
      */
     private fun cachedMd5(file: File): String {
         val stamp = file.length().toString() + ":" + file.lastModified().toString()
-        val key = PREF_MD5_PREFIX + file.name
+        // md5 不做旧键回落（与 ETag/LM 有意不同）：ETag 由服务端按 URL 复核，借错顶多多下一遍；
+        // md5 是纯本地判定，借错会让人"以为本地已是最新"而跳过下载。
+        // 代价只是升级后第一轮对每只文件多读一遍算摘要，之后照旧命中缓存。
+        val key = PREF_MD5_PREFIX + materialCacheKey(file)
         prefs.getString(key, null)?.let { saved ->
             if (saved.startsWith("$stamp:")) return saved.substring(stamp.length + 1)
         }
@@ -1954,12 +1998,19 @@ class MainActivity : AppCompatActivity() {
         return md5
     }
 
-    /** 素材文件从本机消失时清掉它的三项缓存（ETag / Last-Modified / md5），三处删除点共用 */
-    private fun clearMaterialCache(filename: String) {
+    /**
+     * 素材文件从本机消失时清掉它的三项缓存（ETag / Last-Modified / md5），三处删除点共用。
+     * 顺带清掉升级前的那把裸文件名旧键：删文件不清的话，日后同名素材重新落地会被旧 ETag 认成
+     * "没变过"（虽然 destFile 不在时 force 已经兜住，但这正是以前"删了又加回来却永远不重下"的现场成因）。
+     * 旧键本就分不清属于哪个目录，这里删掉它可能让另一个同名目录白下一遍 —— 一次多余下载，
+     * 换一把歧义缓存的清除，比留着划算。新键（带目录）才是长期有效的那一份。
+     */
+    private fun clearMaterialCache(file: File) {
+        val rel = materialCacheKey(file)
         prefs.edit()
-            .remove(PREF_ETAG_PREFIX + filename)
-            .remove(PREF_LM_PREFIX + filename)
-            .remove(PREF_MD5_PREFIX + filename)
+            .remove(PREF_ETAG_PREFIX + rel).remove(PREF_LM_PREFIX + rel).remove(PREF_MD5_PREFIX + rel)
+            .remove(PREF_ETAG_PREFIX + file.name).remove(PREF_LM_PREFIX + file.name)
+            .remove(PREF_MD5_PREFIX + file.name)
             .apply()
     }
     
