@@ -11,8 +11,8 @@ android {
         applicationId "com.xvj.app"
         minSdk 24
         targetSdk 34
-        versionCode 167
-        versionName "167"
+        versionCode 168
+        versionName "168"
 
         // MQTT 设备凭据（broker 鉴权改造）：密码绝不进公开仓库。
         // CI 由 GitHub Secret 注入环境变量 XVJ_MQTT_DEVICE_PW；本地构建可 -PXVJ_MQTT_DEVICE_PW=xxx 或同名环境变量；
