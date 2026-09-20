@@ -21,6 +21,12 @@ jobs:
 
     - name: Set up Android SDK
       uses: android-actions/setup-android@v3
+      with:
+        # 必须显式给 packages：action 的默认值是 "tools platform-tools"，而 legacy `tools` 包已被
+        # Google 从 SDK 仓库下架 → sdkmanager 报 "Warning: Failed to find package 'tools'" 后退出 1
+        # （run293 实测；run292 及之前还是绿的，是上游变化不是本仓库变化）。
+        # 这里按本工程实际需要列：compileSdk/buildToolsVersion 见 app/build.gradle。
+        packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
     - name: Create local.properties
       run: echo "sdk.dir=$ANDROID_HOME" > local.properties
@@ -69,6 +75,12 @@ jobs:
     - name: Diagnose failure
       if: failure()
       run: |
+        # Gradle 之前的步骤失败时 /tmp/gradle_output.txt 根本不存在；这个步骤自己再报一次
+        # "No such file or directory" 只会把真正的红点盖住（run293 就是这样被误当成构建问题）。
+        if [ ! -f /tmp/gradle_output.txt ]; then
+          echo "::error::失败发生在 Gradle 之前（见上面第一个红色步骤），无 gradle 输出可摘要"
+          exit 0
+        fi
         {
           echo "## Gradle 失败摘要"
           echo '```'
