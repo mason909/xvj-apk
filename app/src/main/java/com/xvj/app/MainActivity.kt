@@ -1481,7 +1481,7 @@ class MainActivity : AppCompatActivity() {
      *   3. 其余情况一律进计划，由 downloadWithETag 先看按<目录/文件>存的 ETag，
      *      命中 304 就直接 return UNCHANGED —— 也就是"云端 md5 变了但 ETag 没变"会被静默吃掉，
      *      本地保持旧文件、下一轮同步再重复报不一致。云端就地替换素材字节时必须让 ETag 一起变。
-     *   云端 md5 为空（老记录/预设引用）时平时只靠 ETag 去重；ETag 也没了才退到第 2 条的字节数判定。
+     *   云端 md5 为空（老记录、图片素材、回填前的预设引用）时平时只靠 ETag 去重；ETag 也没了才退到第 2 条的字节数判定。
      */
     private fun syncFolderWithIds(folderId: String, materialIds: org.json.JSONArray, cloudList: org.json.JSONArray?): List<SyncTask> {
         val tasks = ArrayList<SyncTask>()
@@ -1554,8 +1554,9 @@ class MainActivity : AppCompatActivity() {
                         ) {
                             // 【size 兜底】只在"云端给不出内容指纹 + 本机也没有可复核的 ETag/Last-Modified"时启用：
                             // 装 APK 会把 prefs 一起清掉（168 装机实测），缓存空了就只能无条件 GET 全量重下；
-                            // 而预设素材行的 md5 至今是 NULL（cp2p 不继承源素材），房间清单里 md5 就是空串 ——
-                            // 于是"本地已有同一只文件"这件事没有任何可比对的凭据，只能整目录重下一遍。
+                            // 而清单里的 md5 常常是空串 —— 图片素材上传时压根没算摘要（云端写入侧 2026-09-21 才补，
+                            // 存量另有一轮回填），空值经 cp2p 原样带进预设行，于是"本地已有同一只文件"
+                            // 这件事没有任何可比对的凭据，只能整目录重下一遍。
                             // 判定收紧到"无复核凭据"是必要的：常态下 nginx 的 ETag 能识破"就地替换同尺寸文件"，
                             // 一旦让字节数就当通行证跳过，那种替换就再也发现不了了。
                             sizeSkipped++
