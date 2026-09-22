@@ -157,6 +157,12 @@ class MainActivity : AppCompatActivity() {
     private val previews = mutableMapOf<String, PreviewState>()
     /** 看门狗二次武装的上限：拿到真实片长后按 duration+15s 重排，最长不超过这个值（长片不该被一刀砍） */
     private val PREVIEW_HARD_CAP_MS = 30 * 60 * 1000L
+    /**
+     * 设备播放链认的视频扩展名 —— 三端那份表的设备侧（云端 server.js 的 VIDEO_EXT 同源，前端 _pvDevExtRe 同源）。
+     * 同步比对、清空目录、播放列表、试播定位四处共用：写两份就会分裂成"同目录里一只算素材、一只算杂项"，
+     * 表现是同步永远差一只、或试播报"本机没有这只素材"而文件明明在。
+     */
+    private val VIDEO_EXTS = setOf("mp4", "mkv", "avi", "mov", "webm")
     /** 兜底窗口 ID：scenes 里两幕都没有任何窗口时，applySceneConfigs 自动建这一个 1920x1080 全屏 SCENE_A 窗口*/
     private val DEFAULT_WINDOW_ID = "win_1"
     /** 窗口容器 FrameLayout（根视图）*/
@@ -1549,7 +1555,7 @@ class MainActivity : AppCompatActivity() {
             if (!localFolder.exists()) localFolder.mkdirs()
 
             val localFiles = localFolder.listFiles()?.filter {
-                it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
+                it.extension.lowercase() in VIDEO_EXTS
             } ?: emptyList()
 
             val shouldExist = mutableSetOf<String>()
@@ -1716,7 +1722,7 @@ class MainActivity : AppCompatActivity() {
             }
             if (!localFolder.exists()) return
             val files = localFolder.listFiles()?.filter {
-                it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm")
+                it.extension.lowercase() in VIDEO_EXTS
             } ?: emptyList()
             for (file in files) {
                 Log.d(TAG, "清空文件夹" + folderId + "，删除: " + file.name)
@@ -2963,7 +2969,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val videos = physicalDir.listFiles()
-            ?.filter { it.extension.lowercase() in listOf("mp4", "mkv", "avi", "mov", "webm") }
+            ?.filter { it.extension.lowercase() in VIDEO_EXTS }
             ?.sortedBy { it.name } ?: return
         if (videos.isEmpty()) {
             Log.w(TAG, "playFolderInWindow: 物理文件夹 $physicalDir 内无视频")
@@ -3078,6 +3084,10 @@ class MainActivity : AppCompatActivity() {
     /** 把这只片挂上播放器并装好两个收尾钩子（首次试播与"中途换一只"共用） */
     private fun armPreview(winId: String, player: ExoPlayer, file: File, maxMs: Long) {
         val st = previews[winId] ?: return
+        // 同一扇窗连点第二次复用的是**同一个** PreviewState（快照不许重写），所以"是否已按真片长重排过"
+        // 必须在这里归零：否则上一只留下的 true 会让这一只永远停在云端那个 5 分钟兜底上，
+        // 十分钟的片子播到五分钟就被看门狗掐回正片 —— 现场只会看到"后面那半截没播"。
+        st.rearmed = false
         st.listener?.let { player.removeListener(it) }
         disarmPreviewWatchdog(st)
         player.setMediaItems(listOf(MediaItem.fromUri(Uri.fromFile(file))))
