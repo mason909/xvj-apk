@@ -103,6 +103,8 @@ import android.net.Uri
 import android.view.TextureView
 import org.json.JSONArray
 import com.xvj.app.databinding.ActivityMainBinding
+import com.xvj.app.serial.WallPanelEvent
+import com.xvj.app.serial.WallPanelLink
 import org.eclipse.paho.client.mqttv3.*
 import org.json.JSONObject
 import java.io.File
@@ -141,13 +143,21 @@ class MainActivity : AppCompatActivity() {
     private var deviceId: String = ""
 
     // ========== 多窗口系统 ==========
-    // RS485/DMX512 外部信号触发切幕是后续功能：目前既没有"当前幕"状态位，也没有 switchScene ——
-    // A/B 两幕的窗口本来就是合并渲染的，每个窗口播什么由自己的 content 决定。
+    // A/B 两幕的窗口本来就是合并渲染的，每个窗口播什么由自己的 content 决定（没有"当前幕"状态位）。
+    // 485 墙板走独立链路：WallPanelLink 收帧 → 编号事件 → 重排跟随墙板的窗口（见 handleWallPanelNumber）。
+    private var wallPanelLink: WallPanelLink? = null
+    /**
+     * 本机收到过的最后一个墙板编号；null = 这台机开机至今没人按过（跟随窗口改用房间默认编号）。
+     * 只在内存里，故意不落 prefs：重启后回到"没按过"，画面落在默认编号那一格 ——
+     * 现场要的是可预测的开机画面，而不是上一次营业结束时的状态；也因此不用跟 rev 对账。
+     * 读写都在主线程（墙板事件由 WallPanelLink post 到主线程，窗口应用也在主线程）。
+     */
+    private var wallPanelNo: Int? = null
     /** windowId -> ExoPlayer 实例（每个窗口独立播放器）*/
     private val windowPlayers = mutableMapOf<String, ExoPlayer>()
     /** windowId -> View 实例（窗口视图）*/
     private val windowViews = mutableMapOf<String, View>()
-    /** windowId -> 内容签名（type|folderId|color|inputIndex），实时更新时判定结构变化用 */
+    /** windowId -> 内容签名（type|folderId|color|inputIndex|follow），实时更新时判定结构变化用 */
     private val windowContentSigs = mutableMapOf<String, String>()
     /**
      * windowId -> 进行中的大屏试播（见 startWindowPreview）。
@@ -210,6 +220,12 @@ class MainActivity : AppCompatActivity() {
     private val syncLock = Any()
     /** 本机已应用的 scenes 结构指纹：同指纹不再全量重建（重建会打断正在播的视频） */
     private var appliedScenesFp: String? = null
+    /**
+     * 屏上画面所依据的那份 scenes（全量重建/实时更新最后应用的那份载荷，不是"最新收到的配置"）。
+     * 墙板按编号切窗要拿它查 panel_no 与 windows —— 现场高频操作，不在主线程重读 prefs 里那份 JSON。
+     * 只在应用成功后赋值（与 appliedScenesFp 同步），中途抛异常时它仍是旧的那份，编号切换照着旧画面走。
+     */
+    private var appliedScenes: org.json.JSONObject? = null
     /** 本机已应用的房间配置 rev（心跳回传，服务端拿它和房间真值比对，落后就补发同步）；重启后仍以 prefs 为准 */
     private var appliedRev: String = ""
 
@@ -226,6 +242,8 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_ETAG_PREFIX = "etag_"
         private const val PREF_LM_PREFIX = "lm_"
         private const val PREF_MD5_PREFIX = "md5_"
+        /** 串口节点白名单：与前端 WP_SERIAL_PATH_RE、服务端 isSafeSerialPath 同一把尺 */
+        private val WALLPANEL_PATH_RE = Regex("^/dev/[A-Za-z0-9_-]{1,64}$")
     }
 
     // 【A-11】 工具方法
@@ -563,6 +581,9 @@ class MainActivity : AppCompatActivity() {
 
         // 按 prefs 里的 debug_mode 刷一次运维层（启动即决定左下角文字/进度条是否可见）
         applyDebugUi()
+
+        // 485 墙板是本地硬件链路，离线也要能用：按 prefs 恢复开关，不等云端
+        applyWallPanelEnabled(prefs.getBoolean("wallpanel_enabled", false))
     }
 
     /**
@@ -611,6 +632,170 @@ class MainActivity : AppCompatActivity() {
             }
             if (!debug) binding.syncProgressBar?.visibility = View.GONE
         }
+    }
+
+    /**
+     * wallpanel_enabled 的唯一写入口：落 prefs + 收放串口链路（口径对齐 setDebugMode）。
+     * 来源三处，都走服务端 roomWallpanelFields 一份口径：auth_result / sync_room_materials 载荷、
+     * set_wallpanel 指令，以及 loadConfig 的 prefs 恢复（离线/重启后本地链路自己起来）。
+     * 链路正开着而房间把串口节点或波特率换了，旧 fd 还指着上一套参数 → 按新参数重开一次。
+     */
+    @Synchronized
+    private fun applyWallPanelEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("wallpanel_enabled", enabled).apply()
+        if (!enabled) {
+            wallPanelLink?.stop()
+            wallPanelLink = null
+            return
+        }
+        val path = wallPanelPath()
+        val baud = wallPanelBaud()
+        wallPanelLink?.let {
+            if (it.path == path && it.baud == baud) return
+            logToFile("墙板串口参数改为 $path${baud?.let { " @$it" } ?: "（驱动默认速率）"}，重开链路",
+                "INFO", "WALLPANEL", "CONFIG")
+            it.stop()
+            wallPanelLink = null
+        }
+        wallPanelLink = WallPanelLink(
+            path = path,
+            baud = baud,
+            onEvent = ::handleWallPanelEvent,
+            onError = { msg ->
+                Log.w(TAG, "墙板串口: $msg")
+                logToFile("墙板串口错误: $msg", "WARN", "WALLPANEL", "ERROR")
+            },
+            onNotice = { msg ->
+                Log.i(TAG, "墙板串口: $msg")
+                logToFile(msg, "INFO", "WALLPANEL", "LINK")
+            },
+        ).also { it.start() }
+    }
+
+    /**
+     * 本机等墙板的串口节点：房间没给或给的不是 /dev 下的设备名就用默认节点。
+     * 服务端 findWallpanelFieldError 已在写库时按同一把尺拦过（前端也拦一道），这里只是本机不被脏载荷带跑。
+     */
+    private fun wallPanelPath(): String {
+        val p = (prefs.getString("wallpanel_serial_path", "") ?: "").trim()
+        return if (WALLPANEL_PATH_RE.matches(p)) p else WallPanelLink.DEFAULT_PATH
+    }
+
+    /**
+     * 本机等墙板的波特率：房间没给或不在档内就用驱动默认（null），与服务端 roomWallpanelFields 同口径。
+     * prefs 里 0 = 没设（服务端"用驱动默认"下发的是 JSON null，落库统一存 0）。
+     */
+    private fun wallPanelBaud(): Int? =
+        prefs.getInt("wallpanel_baud", 0).takeIf { it in WallPanelLink.BAUDS }
+
+    /**
+     * 墙板硬件字段（默认编号 / 串口节点 / 波特率）的唯一写入口：载荷真带了那个字段才覆盖本地值
+     * （update_windows 这类载荷本来不带墙板字段，optXxx 的兜底值会把本地设置抹掉）。
+     * 三个来源同为服务端 roomWallpanelFields 一份口径：auth_result / sync_room_materials 载荷、set_wallpanel。
+     * 只写 prefs，不碰链路：收放串口统一由 [applyWallPanelEnabled] 按当前 prefs 决定，
+     * 所以调用方必须先调本函数再调它 —— 反过来的话同一跳里改的节点/波特率要等下一次载荷才生效。
+     */
+    private fun applyWallPanelFields(payload: JSONObject) {
+        if (payload.has("wallpanel_default_no")) {
+            // 服务端非法值一律下发 null；JSONObject 把 null 读成 optInt 的兜底 0，正好当"没默认编号"
+            val no = payload.optInt("wallpanel_default_no", 0)
+            prefs.edit().putInt("wallpanel_default_no", if (no > 0) no else 0).apply()
+            Log.d(TAG, "墙板默认编号: ${if (no > 0) no else "无"}")
+        }
+        if (payload.has("wallpanel_serial_path")) {
+            // 走 opt() 而不是 optString()：org.json 把 JSON null 读成字符串 "null"，那玩意儿存进 prefs
+            // 只会让下一次判重、判白名单都多一个假值（服务端恒下发字符串，本机不赌它）
+            val raw = payload.opt("wallpanel_serial_path")
+            val p = (if (raw == null || raw === JSONObject.NULL) "" else raw.toString()).trim()
+            if (p != (prefs.getString("wallpanel_serial_path", "") ?: "").trim()) {
+                prefs.edit().putString("wallpanel_serial_path", p).apply()
+                logToFile("墙板串口节点下发为 ${if (p.isEmpty()) "默认" else p}", "INFO", "WALLPANEL", "CONFIG")
+            }
+        }
+        if (payload.has("wallpanel_baud")) {
+            // 同样走 opt()：服务端"改回驱动默认"下发的是 null，只认 optInt>0 的话本地那档旧速率永远清不掉
+            val raw = payload.opt("wallpanel_baud")
+            val n = (if (raw == null || raw === JSONObject.NULL) 0 else raw.toString().toIntOrNull() ?: 0)
+            val b = if (n in WallPanelLink.BAUDS) n else 0
+            if (b != prefs.getInt("wallpanel_baud", 0)) {
+                prefs.edit().putInt("wallpanel_baud", b).apply()
+                logToFile("墙板波特率下发为 ${if (b > 0) "$b" else "驱动默认"}", "INFO", "WALLPANEL", "CONFIG")
+            }
+        }
+    }
+
+    private fun handleWallPanelEvent(event: WallPanelEvent) {
+        when (event) {
+            is WallPanelEvent.NumberSelect ->
+                // 1~32 是编号的域（与前端 WP_PANEL_MAX、服务端 PANEL_NO_MAX 同一把尺）；
+                // 写成 1..30 会让 31/32 号绑了也按不到 —— 30 是文件夹的个数，不是编号的个数
+                if (event.number in 1..32) handleWallPanelNumber(event.number)
+                else logToFile("墙板发来越界编号 ${event.number}（有效域 1~32），已丢弃", "WARN", "WALLPANEL", "SKIP")
+            is WallPanelEvent.Command ->
+                Log.d(TAG, "墙板功能帧: family=0x${Integer.toHexString(event.family)} key=0x${Integer.toHexString(event.key)}")
+            is WallPanelEvent.Raw -> Log.d(TAG, "墙板原始帧: " + event.bytes.joinToString(" ") { String.format("%02X", it) })
+        }
+    }
+
+    /**
+     * 编号事件的落点：先把这一号记下来，再把所有跟随墙板的窗口切到这一号绑定的那一格。
+     * 口径：
+     *   只动 content.follow == true 的窗口 —— folderId 是人工钉死的，墙板不越权去改它；
+     *   播哪一格一律交给 resolveWindowFolder，与全量重建同一个入口，两处不会各漂一份；
+     *   解析不出目标格（这一号没绑 / 那格不在映射里）→ 那扇窗保持原样，宁可停在旧画面也不切到黑屏；
+     *   正在试播的窗口先收尾再切 —— 不收的话试播播完的恢复回调会把画面拽回按号之前。
+     * 必须在主线程调用（换 playlist）；WallPanelLink 的事件已经 post 到主线程。
+     */
+    private fun handleWallPanelNumber(number: Int) {
+        // 同一号连着按只认第一次：重播会把跟随窗口全拽回片头，现场看就是"突然跳帧"。
+        // 不怕漏掉后续变化 —— panel_no 表在 scenes 指纹里，改绑定必然触发一次全量重建重排。
+        if (wallPanelNo == number) {
+            Log.d(TAG, "墙板编号 $number 已是当前编号，跳过重播")
+            logToFile("墙板重复按同一号 $number，画面已在该号，跳过重播", "INFO", "WALLPANEL", "SKIP")
+            return
+        }
+        Log.d(TAG, "墙板编号切换: $number")
+        logToFile("墙板编号切换: $number", "INFO", "WALLPANEL", "SWITCH")
+        wallPanelNo = number
+        val scenes = appliedScenes
+        if (scenes == null) {
+            logToFile("墙板编号 $number 未生效：本机还没应用过窗口配置", "WARN", "WALLPANEL", "SKIP")
+            return
+        }
+        val allWindows = mergeSceneWindows(scenes)
+        windowPlayers.keys.toList().forEach { winId ->
+            val content = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }
+                .find { it.optString("id") == winId }?.optJSONObject("content") ?: return@forEach
+            if (!content.optBoolean("follow", false)) return@forEach
+            if (previews.containsKey(winId)) restoreWindowPreview(winId, "墙板编号切换")
+            val folderId = resolveWindowFolder(scenes, content, winId)
+            if (folderId == null) {
+                Log.w(TAG, "窗口 $winId 跟随墙板编号 $number 解析不到可播的文件夹，保持原画面")
+                logToFile("窗口 [$winId] 编号 $number 无可播文件夹，保持原画面", "WARN", "WALLPANEL", "SKIP")
+            } else {
+                playFolderInWindow(winId, folderId)
+            }
+        }
+    }
+
+    /**
+     * 当前生效的墙板编号：按过的最后一号优先，没人按过才用房间默认编号（config.wallpanel_default_no，
+     * 随载荷落 prefs）。返回 null = 两者都没有，跟随窗口退回自己的 folderId / 自动选择逻辑。
+     */
+    private fun effectivePanelNo(): Int? =
+        wallPanelNo ?: prefs.getInt("wallpanel_default_no", 0).takeIf { it > 0 }
+
+    /**
+     * scenes[X].panel_no 反查：这一幕里编号 no 绑的是哪一格，返回不带幕前缀的文件夹编号（"12"）。
+     * 表是 {文件夹: 编号}，反查只能遍历；服务端 buildPrefixedScenes 出的键带幕前缀（"A01"），
+     * 老载荷可能没带，两种都认。值按字符串再转整数 —— org.json 里 3 可能是 Integer 也可能是 "3"，别赌。
+     */
+    private fun folderForPanelNo(scenes: JSONObject, sceneKey: String, no: Int): String? {
+        val table = scenes.optJSONObject(sceneKey)?.optJSONObject("panel_no") ?: return null
+        table.keys().forEach { fid ->
+            if (table.opt(fid).toString().trim().toIntOrNull() == no) return fid.removePrefix(sceneKey)
+        }
+        return null
     }
 
     // 【A-02】 MQTT 连接
@@ -757,6 +942,8 @@ class MainActivity : AppCompatActivity() {
      *             服务端【S-06】reconcileDeviceRev 拿它和房间真值比对，落后就补发一次同步 ——
      *             这是 QoS 丢消息 / 设备离线期间改配置的唯一兜底收敛路径。
      *   syncing = 此刻是否有素材对账在飞；为 true 时服务端跳过对账，免得下载中途被再插一刀。
+     *   panel_no = 本机当前生效的墙板编号（按过的最后一号，没按过则是房间默认编号）；
+     *              两者都没有就不带这个字段，服务端据此清掉这台机的显示值。
      * 服务端把 status 落到 devices.status、整段原文存 devices.status_data（该列没有读侧），
      * 并因带了 version/version_code 而 UPSERT device_versions —— 后台"版本管理"页看的正是这张表。
      * 未授权设备同样在上报，服务端不区分；心跳本身 30s 一次，不写 operation_logs。
@@ -773,6 +960,7 @@ class MainActivity : AppCompatActivity() {
                 put("version_code", VERSION_CODE)
                 put("syncing", syncing)
                 if (appliedRev.isNotEmpty()) put("rev", appliedRev)
+                effectivePanelNo()?.let { put("panel_no", it) }
                 put("timestamp", System.currentTimeMillis())
             }
             mqttClient?.publish(statusTopic, payload.toString().toByteArray(), 1, false)
@@ -857,6 +1045,16 @@ class MainActivity : AppCompatActivity() {
                             binding.statusText?.text = "已授权至房间 $roomId"
                             // 停止欢迎视频等旧播放器
                             releasePlayer()
+                            // 墙板字段要先于 applySceneConfigs：跟随窗口第一次落屏就按房间的默认编号选格，
+                            // 排在后面建完窗才落 prefs，这一场同步里跟随窗口就先播别的格、等下次按号才归位。
+                            // 也要先于 applyWallPanelEnabled：节点/波特率这一跳可能一起变，先落 prefs 再开链路
+                            // 才只开一次（反过来会拿旧参数开一遍、发现变了再重开，端口白闪断一轮）。
+                            // auth_result 也带这几个字段（服务端 roomSyncFields 一处收口），
+                            // 掉了 set_wallpanel 那一跳的设备靠重连这次自愈。
+                            applyWallPanelFields(resp)
+                            if (resp.has("wallpanel_enabled")) {
+                                applyWallPanelEnabled(resp.optBoolean("wallpanel_enabled", false))
+                            }
                             // 授权真值只在云端 devices 表；本机只留两样：scenes_json 缓存（冷启动恢复画面用）
                             // 和 last_authorized（能不能用这份缓存），每次 auth_result 覆盖。
                             if (scenes != null) {
@@ -1020,6 +1218,8 @@ class MainActivity : AppCompatActivity() {
      *   update              OTA：带 url/version/md5 → downloadAndInstall
      *   set_debug           立即开关 debug_mode（前端没有入口，只能手工 POST /api/devices/:id/command；
      *                       正常途径是 sync_room_materials / auth_result 载荷里的 debug 字段）
+     *   set_wallpanel       立即开关 485 墙板串口链路 + 默认编号/串口节点/波特率（同 set_debug：临时值，
+     *                       房间 config.wallpanel_* 才是真相，下一次带这些字段的载荷会覆盖）
      *   preview_material    在指定窗口试播一只本机素材，播完自动回到原画面（见 startWindowPreview）
      *   preview_stop        收掉试播、归还画面（带 win_id 只收那一扇，不带则全收）
      * ⚠️ 没有 "sync"：服务端的 action:'sync' 只是 HTTP 入参，publish 前已改写成 sync_room_materials
@@ -1070,6 +1270,13 @@ class MainActivity : AppCompatActivity() {
                     val hasDebug = cmd.has("debug")
                     val debug = hasDebug && cmd.optBoolean("debug", false)
                     if (hasDebug) setDebugMode(debug)
+                    // 墙板字段与 debug 同口径：只在载荷真带字段时才覆盖（服务端 roomWallpanelFields 恒算出
+                    // 确定形状，sync_room_materials / auth_result 两条载荷都带；update_windows 不带 → 不动本地状态）
+                    // 字段先落 prefs 再收放链路，同一跳里改了节点/波特率才只开一次（见 auth_result 处注释）
+                    applyWallPanelFields(cmd)
+                    if (cmd.has("wallpanel_enabled")) {
+                        applyWallPanelEnabled(cmd.optBoolean("wallpanel_enabled", false))
+                    }
                     val fmKeys = java.lang.StringBuilder()
                     folderMappings?.keys()?.let { val k = it; while (k.hasNext()) { fmKeys.append(k.next()).append(",") } }
                     logToFile("sync_room_materials: roomId=$roomId, folderMappings=" + fmKeys.toString() + ", debug=$debug")
@@ -1178,6 +1385,16 @@ class MainActivity : AppCompatActivity() {
                     setDebugMode(debug)
                     Log.d(TAG, "set_debug: debug=$debug")
                     logToFile("调试模式变更: debug=$debug")
+                }
+                "set_wallpanel" -> {
+                    // 墙板总闸的手动开关，和 sync_room_materials / auth_result 载荷里的
+                    // wallpanel_enabled 同走 applyWallPanelEnabled。同 set_debug 一样是临时值：
+                    // 房间 config.wallpanel_enabled 才是真相，下一次载荷会按它覆盖。
+                    val enabled = cmd.optBoolean("wallpanel_enabled", false)
+                    applyWallPanelFields(cmd)   // 先落节点/波特率，再按新参数收放链路（同 auth_result 处口径）
+                    applyWallPanelEnabled(enabled)
+                    Log.d(TAG, "set_wallpanel: enabled=$enabled")
+                    logToFile("墙板开关变更: enabled=$enabled 串口=${wallPanelPath()} 波特率=${wallPanelBaud() ?: "驱动默认"}")
                 }
                 "preview_material" -> {
                     // 大屏试播（云端【S-05p】POST /api/rooms/:id/preview）：目标窗口、带幕前缀的
@@ -1811,6 +2028,9 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         // 撤销挂起的续装轮询（retryPendingInstall），Activity 没了再复查只会崩
         installRetryHandler.removeCallbacksAndMessages(null)
+        // 485 墙板串口链路随 Activity 收摊（开关真值在 prefs，重启自恢复）
+        wallPanelLink?.stop()
+        wallPanelLink = null
         // mqttHandler 上挂着窗口启播、rev 记账、重连倒计时、进度条刷新，全部按"界面还在"写的，
         // 必须在 releaseAllWindows 之前清空，否则播放器 release 后仍有 post 排队进来
         mqttHandler.removeCallbacksAndMessages(null)
@@ -2478,7 +2698,7 @@ class MainActivity : AppCompatActivity() {
         windowContentSigs.clear()
 
         // 收集所有场景的窗口，A 和 B 的 windows 合并后统一渲染
-        // 每个窗口播什么由自身 content.type/folderId 决定，不需要"当前幕"概念（见文件头的 RS485 切幕预留说明）
+        // 每个窗口播什么由自身 content 决定，不需要"当前幕"概念（485 墙板走独立链路，见 handleWallPanelNumber）
         val allWindows = mergeSceneWindows(scenes)
 
         // 若所有场景均无窗口，为 Scene A 创建默认全屏窗口
@@ -2513,64 +2733,79 @@ class MainActivity : AppCompatActivity() {
 
         // 每个窗口根据自身 content.type 播放对应文件夹（SCENE_A/SCENE_B 指向各自场景的素材）
         windowPlayers.forEach { (winId, player) ->
-            // 找到对应窗口的 content 配置（遍历 allWindows 查找）
             val winObj = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }.find { it.optString("id") == winId }
             val content = winObj?.optJSONObject("content") ?: JSONObject()
-            val type = content.optString("type", "").uppercase()
-
-            val folderId: String? = when (type) {
-                "SCENE_A", "SCENE_B" -> {
-                    // 场景 folder_mappings 的 key 已带场景前缀（A01/B01，见 buildPrefixedScenes）
-                    val sceneKey = type.removePrefix("SCENE_")  // "SCENE_A" → "A"
-                    val sceneData = scenes.optJSONObject(sceneKey)
-                    val mappings = sceneData?.optJSONObject("folder_mappings") ?: JSONObject()
-                    val allEntries = mappings.keys().asSequence()
-                        .map { fid -> fid to (mappings.get(fid) as? org.json.JSONArray ?: org.json.JSONArray()) }
-                        .toList()
-                    // 指定了文件夹（content.folderId，纯编号如 "02"）：只播指定目录，
-                    // 该目录无素材/未映射时告警跳过，不偷偷换播别的文件夹
-                    val requested = content.optString("folderId", "").trim()
-                    if (requested.isNotEmpty()) {
-                        val entry = allEntries.find { it.first == sceneKey + requested }
-                            ?: allEntries.find { it.first == requested }  // 兼容已带前缀的 folderId
-                        when {
-                            entry == null -> {
-                                Log.w(TAG, "窗口 $winId [$type] 指定文件夹 $requested 不在场景 $sceneKey 的映射中，跳过播放")
-                                logToFile("窗口 [$type] 指定文件夹 $requested 不在场景 $sceneKey 映射中，跳过播放", "WARN", "PLAYBACK", "SKIP")
-                                null
-                            }
-                            entry.second.length() == 0 -> {
-                                Log.w(TAG, "窗口 $winId [$type] 指定文件夹 ${entry.first} 无素材，跳过播放")
-                                logToFile("窗口 [$type] 指定文件夹 ${entry.first} 无素材，跳过播放", "WARN", "PLAYBACK", "SKIP")
-                                null
-                            }
-                            else -> {
-                                Log.d(TAG, "窗口 $winId [$type] -> 指定文件夹 ${entry.first}")
-                                logToFile("窗口 [$type] -> 指定文件夹 ${entry.first}", "INFO", "PLAYBACK", "SELECT")
-                                prefixedPhysicalFolder(entry.first, sceneKey)
-                            }
-                        }
-                    } else {
-                        // 未指定：自动选场景中第一个有素材的文件夹（旧配置向后兼容）
-                        val auto = allEntries.firstOrNull { it.second.length() > 0 }?.first
-                        if (auto == null) {
-                            Log.d(TAG, "窗口 $winId [$type] 场景 $sceneKey 无素材，跳过播放")
-                            logToFile("窗口 [$type] 场景 $sceneKey 无素材，跳过播放（黑屏最常见原因）", "WARN", "PLAYBACK", "SKIP")
-                        } else {
-                            Log.d(TAG, "窗口 $winId [$type] -> 自动选择文件夹 $auto")
-                            logToFile("窗口 [$type] -> 自动选择文件夹 $auto", "INFO", "PLAYBACK", "SELECT")
-                        }
-                        auto?.let { prefixedPhysicalFolder(it, sceneKey) }
-                    }
-                }
-                "HDMI", "VIDEO_INPUT" -> "01"  // HDMI 输入默认文件夹01
-                else -> null
-            }
+            val folderId = resolveWindowFolder(scenes, content, winId)
             if (folderId != null && player != null) {
                 playFolderInWindow(winId, folderId)
             }
         }
+        appliedScenes = scenes
         appliedScenesFp = fp
+    }
+
+    /**
+     * 一扇窗在这幕里该播哪一格 —— 全量重建（applySceneConfigs）和墙板切换（handleWallPanelNumber）
+     * 都走这一个入口：两处各写一份时口径必然漂（folderId 带不带幕前缀就漂过一次）。
+     * 解析次序：
+     *   跟随墙板（content.follow）→ 生效编号反查 panel_no 拿到的那一格；反查不中（没按过、没默认编号、
+     *     这一号没绑）就退回下面的固定逻辑，不劫持；
+     *   content.folderId 非空 → 只播指定那格，不在映射/那格空则 null（不偷偷换播别的格）；
+     *   两者都空 → 本幕第一个有素材的文件夹（旧配置行为，也是没配映射时的兜底）。
+     * @return 带幕前缀的物理目录 id（playFolderInWindow 的 folderId 入参口径），null = 这一窗不播
+     */
+    private fun resolveWindowFolder(scenes: JSONObject, content: JSONObject, winId: String): String? {
+        val type = content.optString("type", "").uppercase()
+        if (type == "HDMI" || type == "VIDEO_INPUT") return "01"   // HDMI 输入默认文件夹01
+        if (type != "SCENE_A" && type != "SCENE_B") return null
+
+        // 场景 folder_mappings 的 key 已带场景前缀（A01/B01，见 buildPrefixedScenes）
+        val sceneKey = type.removePrefix("SCENE_")  // "SCENE_A" → "A"
+        val sceneData = scenes.optJSONObject(sceneKey)
+        val mappings = sceneData?.optJSONObject("folder_mappings") ?: JSONObject()
+        val allEntries = mappings.keys().asSequence()
+            .map { fid -> fid to (mappings.get(fid) as? org.json.JSONArray ?: org.json.JSONArray()) }
+            .toList()
+
+        val panelNo = if (content.optBoolean("follow", false)) effectivePanelNo() else null
+        val panelFolder = panelNo?.let { folderForPanelNo(scenes, sceneKey, it) }
+        // 指定了文件夹（content.folderId，纯编号如 "02"）：只播指定目录，
+        // 该目录无素材/未映射时告警跳过，不偷偷换播别的文件夹
+        val requested = panelFolder ?: content.optString("folderId", "").trim()
+        if (panelFolder != null) {
+            logToFile("窗口 [$type] 跟随墙板编号 $panelNo → 文件夹 $panelFolder", "INFO", "WALLPANEL", "SELECT")
+        }
+        if (requested.isEmpty()) {
+            // 未指定：自动选场景中第一个有素材的文件夹（旧配置向后兼容）
+            val auto = allEntries.firstOrNull { it.second.length() > 0 }?.first
+            if (auto == null) {
+                Log.d(TAG, "窗口 $winId [$type] 场景 $sceneKey 无素材，跳过播放")
+                logToFile("窗口 [$type] 场景 $sceneKey 无素材，跳过播放（黑屏最常见原因）", "WARN", "PLAYBACK", "SKIP")
+            } else {
+                Log.d(TAG, "窗口 $winId [$type] -> 自动选择文件夹 $auto")
+                logToFile("窗口 [$type] -> 自动选择文件夹 $auto", "INFO", "PLAYBACK", "SELECT")
+            }
+            return auto?.let { prefixedPhysicalFolder(it, sceneKey) }
+        }
+        val entry = allEntries.find { it.first == sceneKey + requested }
+            ?: allEntries.find { it.first == requested }  // 兼容已带前缀的 folderId
+        return when {
+            entry == null -> {
+                Log.w(TAG, "窗口 $winId [$type] 指定文件夹 $requested 不在场景 $sceneKey 的映射中，跳过播放")
+                logToFile("窗口 [$type] 指定文件夹 $requested 不在场景 $sceneKey 映射中，跳过播放", "WARN", "PLAYBACK", "SKIP")
+                null
+            }
+            entry.second.length() == 0 -> {
+                Log.w(TAG, "窗口 $winId [$type] 指定文件夹 ${entry.first} 无素材，跳过播放")
+                logToFile("窗口 [$type] 指定文件夹 ${entry.first} 无素材，跳过播放", "WARN", "PLAYBACK", "SKIP")
+                null
+            }
+            else -> {
+                Log.d(TAG, "窗口 $winId [$type] -> 指定文件夹 ${entry.first}")
+                logToFile("窗口 [$type] -> 指定文件夹 ${entry.first}", "INFO", "PLAYBACK", "SELECT")
+                prefixedPhysicalFolder(entry.first, sceneKey)
+            }
+        }
     }
 
     /**
@@ -2616,10 +2851,15 @@ class MainActivity : AppCompatActivity() {
         return allWindows
     }
 
-    /** 窗口内容签名：type/folderId/color/inputIndex 任一变化即视为结构变化（需重建播放器） */
+    /**
+     * 窗口内容签名：type/folderId/color/inputIndex/follow 任一变化即视为结构变化（需重建播放器）。
+     * follow 必须在里面：勾选/取消"跟随墙板"会改变这一窗该播哪一格，
+     * 不进签名就会走成 live 轻推（只改几何），画面停在旧文件夹上看不出来。
+     */
     private fun contentSignature(c: JSONObject): String =
         c.optString("type", "SCENE_A").uppercase() + "|" + c.optString("folderId", "") +
-            "|" + c.optString("color", "") + "|" + c.optInt("inputIndex", 0)
+            "|" + c.optString("color", "") + "|" + c.optInt("inputIndex", 0) +
+            "|" + c.optBoolean("follow", false)
 
     /** 物理文件夹统一带场景前缀：映射键可能是 "01"（纯编号）也可能是 "A01"，这里补齐成 "A01"。
      *  真正的落盘目录由 playFolderInWindow / syncFolderWithIds 再翻成 scenea/01（无前缀的 "01" 才用根目录 01/） */
@@ -2706,6 +2946,7 @@ class MainActivity : AppCompatActivity() {
             if (cv != null) c.post { applyTransformWhenReady(cv, w) }
         }
         // 屏上现在就是这份配置了：指纹跟着走，否则下一轮素材对账收尾会白重建一次、视频重头播
+        appliedScenes = scenes
         appliedScenesFp = scenesFingerprint(scenes)
         Log.d(TAG, "applyLiveWindowUpdate: 轻量应用 ${desiredSorted.size} 个窗口")
     }
@@ -3213,6 +3454,7 @@ class MainActivity : AppCompatActivity() {
         // 屏上已经没有窗口了，"已应用配置"的指纹必须一起作废：
         // 否则下次拿同一份 scenes 来 apply 会被幂等闸门挡掉，画面停在欢迎视频上不去
         appliedScenesFp = null
+        appliedScenes = null
         Log.d(TAG, "释放所有窗口资源")
     }
 }
