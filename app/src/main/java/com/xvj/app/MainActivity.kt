@@ -113,6 +113,7 @@ import android.view.animation.LinearInterpolator
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -3529,12 +3530,13 @@ class MainActivity : AppCompatActivity() {
                 val mine = settledPlayer(winId)
                 if (mine == null || mine.currentMediaItemIndex != li) {
                     // 不在可比状态：把这扇窗遗留的提速/减速归回 1.0x，别留个快慢放的尾巴
-                    windowPlayers[winId]?.let { if (it.playbackSpeed != 1f) it.playbackSpeed = 1f }
+                    windowPlayers[winId]?.let { if (it.playbackParameters.speed != 1f) it.playbackParameters = PlaybackParameters(1f) }
                     continue
                 }
                 val gap = lp - mine.currentPosition
-                mine.playbackSpeed = if (Math.abs(gap) <= SYNC_TOLERANCE_MS) 1f else
+                val speed = if (Math.abs(gap) <= SYNC_TOLERANCE_MS) 1f else
                     (1f + (gap / SYNC_CONVERGE_MS).toFloat().coerceIn(-SYNC_SPEED_MAX.toFloat(), SYNC_SPEED_MAX.toFloat()))
+                mine.playbackParameters = PlaybackParameters(speed)
             }
         }
     }
