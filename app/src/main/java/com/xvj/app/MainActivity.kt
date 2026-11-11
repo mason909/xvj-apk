@@ -113,7 +113,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.upstream.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultLoadControl
 import android.widget.FrameLayout
 import android.widget.TextView
 import android.view.Gravity
