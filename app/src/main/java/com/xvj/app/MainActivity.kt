@@ -113,6 +113,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.upstream.DefaultLoadControl
 import android.widget.FrameLayout
 import android.widget.TextView
 import android.view.Gravity
@@ -132,6 +133,7 @@ import java.io.FileWriter
 import java.io.PrintWriter
 import java.io.RandomAccessFile
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 // CI 固定 keystore（XVJ_DEBUG_KEYSTORE）证书 DER 的 SHA-256；改动签名必须同步更新，否则设备端 OTA 校验会拒绝安装
 private const val EXPECTED_CERT_FINGERPRINT = "d2b08c51a0bcca1f2bc29f20fd8ff5f3927725a9ce3d8355b770ef03c5c960df"
@@ -203,6 +205,8 @@ class MainActivity : AppCompatActivity() {
     // 单线程语义：submit 的是"整轮同步任务"，一轮只占 1 个线程；
     // 池给到 4 只是为了让 auth 触发的同步和手动 sync 不互相排队，文件夹内部仍是逐个串行下载。
     private val downloadExecutor = Executors.newFixedThreadPool(4)
+    /** MQTT 重连的排程线程：刻意与主线程分开，见 reconnectMQTT() */
+    private val reconnectScheduler = Executors.newSingleThreadScheduledExecutor()
     private var statusTimerRunnable: Runnable? = null
 
     // 设备指纹信息
@@ -303,6 +307,50 @@ class MainActivity : AppCompatActivity() {
     // @tag: generateDeviceFingerprint 设备指纹生成
     // @tag: sha256 签名校验指纹计算（注意：算的是证书 DER 的 SHA-256，不是素材 md5）
     // @tag: calculateMd5 素材文件校验
+    /** 本进程启动时刻：补传旧日志时用它把本会话刚写下的行排除掉 */
+    private val sessionStartMs = System.currentTimeMillis()
+    /** 旧日志每个进程只补一次，断线重连不再刷一遍 */
+    private var logTailFlushed = false
+
+    /**
+     * 把上一次会话的本地日志尾部补传上来。
+     * 设备被系统杀掉（LMK/SIGKILL）或原生崩溃时，Java 崩溃处理器根本没机会跑，而 MQTT 通道又随
+     * 进程一起没了 —— 后台只看到一个 socket EOF，一行错误都没有，现场彻底成黑盒（171 在 201 上
+     * 连加五个窗口后就是这样死的）。xvj.log 落在 filesDir，进程没了文件还在，所以重连后把本会话
+     * 之前的最后几行发一次，才有的查。
+     * 不挂 debug 闸门：debug 关掉时这是唯一还能拿到死因的通道，一次几 KB、每进程仅一次，量可控。
+     */
+    private fun flushPreviousSessionLog() {
+        if (logTailFlushed) return
+        logTailFlushed = true
+        try {
+            val lid = deviceId.ifEmpty { deviceFingerprint }
+            val client = mqttClient
+            if (lid.isEmpty() || client == null || !client.isConnected) return
+            val f = File(filesDir, "xvj.log")
+            if (!f.exists() || f.length() == 0L) return
+            RandomAccessFile(f, "r").use { raf ->
+                val from = maxOf(0L, raf.length() - 64 * 1024)
+                raf.seek(from)
+                val buf = ByteArray((raf.length() - from).toInt())
+                raf.readFully(buf)
+                // 按字节截的，第一行是半行必须丢掉；再排除本会话自己写的
+                val lines = String(buf, Charsets.UTF_8).split('\n').drop(1)
+                    .map { it.trim() }.filter { it.isNotEmpty() }
+                    .filter { (it.substringBefore(' ').toLongOrNull() ?: 0L) < sessionStartMs }
+                if (lines.isEmpty()) return
+                val body = lines.takeLast(25).joinToString("\n")
+                client.publish(
+                    "xvj/device/$lid/log",
+                    "${System.currentTimeMillis()} ERROR APP 上次会话尾部日志:\n${body.take(3600)}".toByteArray(),
+                    1, false
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "补传旧日志失败: ${e.message}")
+        }
+    }
+
     /**
      * 写入文件日志（xvj.log）
      * 若 debug_mode 开启，同时通过 MQTT 上报到 device_logs 表
@@ -935,6 +983,8 @@ class MainActivity : AppCompatActivity() {
                     mqttClient?.subscribe(commandTopic, 1)
                     mqttClient?.subscribe(AUTH_TOPIC, 1)
                     registerDevice()
+                    // 通道一通就先还旧账：上一次是怎么死的，全靠这几行
+                    flushPreviousSessionLog()
                     mqttHandler.post {
                         binding.statusText?.text = "云端已连接"
                     }
@@ -1226,7 +1276,7 @@ class MainActivity : AppCompatActivity() {
     private var mqttReconnectAttempts = 0
 
     // 单飞闸门：connectionLost 与"首次连接失败"两条路都会排重连，没有这道闸门时
-    // 一次网络抖动就能排队好几个 postDelayed，之后每个又各自再排 —— 越重试越密。
+    // 一次网络抖动就能排队好几个重连，之后每个又各自再排 —— 越重试越密。
     @Volatile private var mqttReconnectScheduled = false
 
     private fun reconnectMQTT() {
@@ -1236,20 +1286,25 @@ class MainActivity : AppCompatActivity() {
         }
         mqttReconnectScheduled = true
         val delayMs = (mqttReconnectDelaySeconds * 1000).toLong()
-        mqttHandler.postDelayed({
+        // 排程不能挂在 mqttHandler（=主线程 Looper）上：主线程一旦被窗口重建/解码器拖住，
+        // 排队里的重连永远轮不到，设备就带着还在播的界面一起离线，直到有人手动点开 app。
+        // 201 上 171 断线后 45 分钟不回，就是这个形状。
+        // 显式写 Runnable：schedule 有 Runnable/Callable 两个重载，闭包末尾只要留出一个非 Unit
+        // 返回值（比如 Handler.post 的 boolean），Kotlin 就会在两个重载之间报歧义。
+        reconnectScheduler.schedule(Runnable {
             // 放行闸门：本次尝试若再失败，失败分支需要能重新排下一次
             mqttReconnectScheduled = false
             // Activity 已退场（OTA 安装/系统回收/kiosk 重启）就别再起连接：重连成功后 MQTT 回调
             // 会继续往已销毁的界面 post 状态文本、弹窗，客户端也再没人 disconnect
             if (isFinishing || isDestroyed) {
                 Log.w(TAG, "Activity 已退场，放弃本次 MQTT 重连")
-                return@postDelayed
+            } else {
+                try { mqttClient?.close() } catch (e: Exception) {}
+                connectMQTT()
+                // OTA 轮询要弹权限引导/拉安装器，仍回主线程；它不在"链路先活过来"这条关键路径上
+                mqttHandler.post { checkForUpdate() }
             }
-            try { mqttClient?.close() } catch (e: Exception) {}
-            connectMQTT()
-            // P4 fix: checkForUpdate 移入 postDelayed 闭包内，等待重连窗口再执行
-            checkForUpdate()
-        }, delayMs)
+        }, delayMs, TimeUnit.MILLISECONDS)
     }
 
     // 连接成功时调用（由 MQTT callback 触发），重置退避计数器
@@ -2106,6 +2161,8 @@ class MainActivity : AppCompatActivity() {
             mqttClient?.close()
         } catch (e: Exception) {}
         downloadExecutor.shutdown()
+        // 排程线程不归主线程管，不收就会在 Activity 退场后继续 connect 一次
+        reconnectScheduler.shutdownNow()
     }
 
     /** 终端模式：吃掉返回键，不允许退出 */
@@ -3218,12 +3275,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 每路播放器自己的缓冲预算。返回新实例，不能共享：DefaultLoadControl 在 onInitialized 里
+     * 认死一个播放器，第二个来初始化会抛 IllegalStateException。
+     *
+     * 【为什么非改不可】media3 的默认值按网络流设计 —— 缓冲到 50MB 或 50 秒才罢手，而"要攒多久才肯
+     * 开播"的门槛是 2.5 秒（首次）/ 5 秒（换片后续播）。素材全在本地文件里，读盘没有网络抖动：
+     * 50MB 是纯白占，6 扇 1080p 窗口 = 300MB，顶穿这台手机 256MB 的 Java 堆上限，OOM 崩在解码取帧线程
+     * （实测 MediaCodecRenderer.drainOutputBuffer），现场表现就是"点开应用立刻闪退、只回桌面"；
+     * 那 5 秒门槛则是"切视频有轻微延迟"的其中一段。
+     *
+     * 【为什么按毫秒收口、不按字节】setTargetBufferBytes 看着更直观，但它会同时接管停灌条件和起播条件：
+     * 起播要等字节灌满，而停灌可能先按时长满足 —— 两个阈值不一致时永远等不齐，画面直接死住。
+     * 时长口径下 2500ms 就是硬闸（20Mbps 素材约 6MB/路，6 路 36MB），起播只等 600ms。
+     */
+    private fun localBufferLoadControl(): DefaultLoadControl = DefaultLoadControl.Builder()
+        // 1000/2500：攒够 1 秒才算"不缺粮"，最多攒到 2.5 秒（默认是 50 秒，内存根本装不下）
+        // 300/600：开播与换片后续播的等待门槛（默认 2500/5000 —— 现场那半秒多的凝滞就是它）
+        .setBufferDurationsMs(1000, 2500, 300, 600)
+        .build()
+
     /** 视频播放窗口（每个窗口独立 ExoPlayer，TextureView 承载以支持旋转/镜像矩阵变换）*/
     private fun createVideoWindowView(winId: String, w: JSONObject, content: JSONObject): View {
         val container = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         val textureView = FadeTextureView(this)
         container.addView(textureView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        val player = ExoPlayer.Builder(this).build().apply {
+        val player = ExoPlayer.Builder(this).setLoadControl(localBufferLoadControl()).build().apply {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
             setVideoTextureView(textureView)
@@ -3232,22 +3309,44 @@ class MainActivity : AppCompatActivity() {
             // 只报第一次 READY（playlist 循环切歌不重复刷）；播放器随窗口重建，计数天然归零。
             val tCreated = android.os.SystemClock.elapsedRealtime()
             var readyLogged = false
+            // 换片凝滞 = 进 STATE_BUFFERING 到下一次 STATE_READY 的墙钟差。本地文件里这段时间只可能是
+            // "打开下一只 + 解码器重配置 + 攒够 600ms 续播门槛"，跟网络无关。以前这段没有任何数，
+            // 只有首次首帧有 —— 所以"切视频慢"到底是慢在攒缓冲还是慢在重开解码器，改之前先分清。
+            var bufferingSince = 0L
             addListener(object : Player.Listener {
                 override fun onPlayerError(error: PlaybackException) {
                     // 播放器级错误（文件损坏/编码不支持/源丢失）此前只进 logcat，后台完全黑盒
                     logToFile("窗口 $winId 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "PLAYBACK", "ERROR")
                 }
                 override fun onEvents(p: Player, events: Player.Events) {
-                    if (readyLogged || p.playbackState != Player.STATE_READY) return
-                    readyLogged = true
-                    val costMs = android.os.SystemClock.elapsedRealtime() - tCreated
-                    val vs = (p as? ExoPlayer)?.videoSize
-                    // 只报分辨率，不报帧率：本工程的 media3 1.2.1 里 VideoSize 还没有 frameRate
-                    // 字段（run294 编译就是这么断的）。要帧率得升 media3 或改走 currentTracks 的
-                    // Format.frameRate，为一条日志不值当，先看分辨率——4K/1080p 才是 CPU 的主要变量。
-                    logToFile("窗口 $winId 首帧就绪: 用时 ${costMs}ms" +
-                        (if (vs != null) "，输入 ${vs.width}x${vs.height}" else "") +
-                        "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "READY")
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    when (p.playbackState) {
+                        Player.STATE_BUFFERING -> if (bufferingSince == 0L) bufferingSince = now
+                        Player.STATE_READY -> {
+                            val since = bufferingSince
+                            bufferingSince = 0L
+                            if (readyLogged) {
+                                // 首帧之后才有"换片"可言；不到 100ms 的凝滞人眼看不出来，别刷日志
+                                if (since > 0 && now - since >= 100) {
+                                    val vs = (p as? ExoPlayer)?.videoSize
+                                    logToFile("窗口 $winId 换片凝滞 ${now - since}ms" +
+                                        (if (vs != null) "，输入 ${vs.width}x${vs.height}" else "") +
+                                        "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "SWITCH")
+                                }
+                            } else {
+                                readyLogged = true
+                                val vs = (p as? ExoPlayer)?.videoSize
+                                // 只报分辨率，不报帧率：本工程的 media3 1.2.1 里 VideoSize 还没有 frameRate
+                                // 字段（run294 编译就是这么断的）。要帧率得升 media3 或改走 currentTracks 的
+                                // Format.frameRate，为一条日志不值当，先看分辨率——4K/1080p 才是 CPU 的主要变量。
+                                logToFile("窗口 $winId 首帧就绪: 用时 ${now - tCreated}ms" +
+                                    (if (vs != null) "，输入 ${vs.width}x${vs.height}" else "") +
+                                    "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "READY")
+                            }
+                        }
+                        // IDLE/ENDED：这一轮的等待作废，别再拿旧时间戳去减
+                        else -> bufferingSince = 0L
+                    }
                 }
             })
         }
@@ -3467,7 +3566,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         player.addListener(listener)
-        val incoming = ExoPlayer.Builder(this).build().apply {
+        val incoming = ExoPlayer.Builder(this).setLoadControl(localBufferLoadControl()).build().apply {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = false
             volume = 0f
