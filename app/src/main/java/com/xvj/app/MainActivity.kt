@@ -268,7 +268,8 @@ class MainActivity : AppCompatActivity() {
     /** 预卷存活上限：超过这个还没淡入（片长突然变了/解码卡住）就撤掉第二路，别让它一直占着解码器 */
     private val PREROLL_MAX_MS = 8000L
     private var playTickRunning = false
-    private val playTick = Runnable {
+    // 类型必须显式写：lambda 里引用了 playTick 自身，靠推断会撞 Kotlin 的递归类型检查
+    private val playTick: Runnable = Runnable {
         tickPlaySettings()
         if (playTickNeeded()) mqttHandler.postDelayed(playTick, PLAY_TICK_MS) else playTickRunning = false
     }
