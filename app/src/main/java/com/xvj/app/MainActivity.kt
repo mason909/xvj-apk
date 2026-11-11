@@ -283,10 +283,20 @@ class MainActivity : AppCompatActivity() {
     private val PREROLL_MAX_MS = 8000L
     /** 同步组漂移在容忍带内就不动速度：50ms 以内肉眼看不出，硬拽反而抖 */
     private val SYNC_TOLERANCE_MS = 50L
-    /** 漂移收敛时间常数：落后 gap 毫秒就按 1+gap/这个值 提速，指数式贴回基准、不过冲 */
-    private val SYNC_CONVERGE_MS = 2500.0
-    /** 速度校正幅度上限：±10% 足够两三秒吃掉实测那点 0.1~0.5s 散差，再多就看出了快慢放 */
-    private val SYNC_SPEED_MAX = 0.10
+    /**
+     * 漂移收敛时间常数：落后 gap 毫秒就按 1+gap/这个值 提速，指数式贴回基准、不过冲。
+     * 放宽到 3500：校正越慢，瞬时速度越贴近 1，音频越不走调（见 SYNC_SPEED_MAX）。
+     */
+    private val SYNC_CONVERGE_MS = 3500.0
+    /**
+     * 速度校正幅度上限。
+     * 【为什么从 0.10 收到 0.03】音频要保留（用户定调，叠化还做音量交叉），而 media3 1.2.1 的
+     * PlaybackParameters 只有速度、没有独立音高，变速即变调。±10% ≈ 一个全音，校正那两三秒里人耳
+     * 听得出走调，按严格标准算 BUG。±3% ≈ 半个全音、且只在个别窗瞬时越界时打满；两次交接之间慢慢
+     * 攒出来的残差本就在百毫秒内，落到速度上约 +1~3%，基本听不出。大的散差（实测 0.5s）不靠这里补：
+     * 自然轮播交接时 groupClock 已经用 setMediaItems 把整组对齐到同一位置，那是一次性硬对齐、不变速。
+     */
+    private val SYNC_SPEED_MAX = 0.03
     private var playTickRunning = false
     // 自引用的巡检闹钟必须写成 object：lambda 版会在自己的初始化器里读 playTick，
     // Kotlin 先报递归类型推断、显式标注类型后又报"必须初始化"。用 this 重投自己就绕开了属性初始化时序。
@@ -3498,7 +3508,8 @@ class MainActivity : AppCompatActivity() {
      * 对一次（groupClock）也不够 —— 之后每次轮播交接都会再散一截，永久留在屏上。所以持续校正。
      * 三条不动手的规矩，都是为了"校正本身别变成新的抖动"：
      *  1. **只用速度、从不 seek** —— seek 会再触发一次 STATE_BUFFERING→READY 的凝滞，越拽越散。
-     *     落后 gap 毫秒就按 1+gap/SYNC_CONVERGE_MS 提速，指数式贴回基准、不过冲（|gap| 每轮缩约 40%）。
+     *     落后 gap 毫秒就按 1+gap/SYNC_CONVERGE_MS 提速、封顶 ±SYNC_SPEED_MAX（音频不走调，见常量注释），
+     *     百毫秒级残差约三五秒贴平。大的散差不靠这里：自然交接时 groupClock 已一次性硬对齐过。
      *  2. **基准窗没落在 READY 就整组这轮不动** —— 免得参考点从一扇跳到另一扇，反而把全组带偏。
      *  3. **成员在试播/叠化/非 READY/整片错位时只归位速度、不写进度** —— 交接进行中硬拽必抖，等它自己
      *     滚到基准那一只下一轮自然接上；不在屏上的旧播放器也不能碰（往释放过的实例上写会崩）。
