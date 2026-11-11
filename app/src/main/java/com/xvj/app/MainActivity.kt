@@ -20,7 +20,8 @@
  * 【A-12】播放设置 & 叠化（playSettingsOf / playSettingsJson / ensurePlayTicker / tickPlaySettings /
  *         beginWindowFade / startWindowFade / completeWindowFade / cancelWindowFade；100ms 巡检的 playTick 本体在字段区）
  * 【A-13】大屏试播（startGroupPreview / previewTargets / startWindowPreview / restorePreviewGroup /
- *         restoreWindowPreview / abortAllPreviews；同格同步组那条见 groupClock / folderPlaylists）
+ *         restoreWindowPreview / abortAllPreviews；同格同步组那条见 groupClock / folderPlaylists，
+ *         轮播途中持续拽齐见 tickSyncGroups / settledPlayer）
  * 【A-14】墙板 485 链路（applyWallPanelEnabled / applyWallPanelFields / wallPanelPath / wallPanelBaud /
  *         handleWallPanelEvent / handleWallPanelNumber / effectivePanelNo / folderForPanelNo；
  *         收帧解析与 termios 在 serial/WallPanelLink.kt）
@@ -280,12 +281,29 @@ class MainActivity : AppCompatActivity() {
     private val PREROLL_WARMUP_MS = 1200L
     /** 预卷存活上限：超过这个还没淡入（片长突然变了/解码卡住）就撤掉第二路，别让它一直占着解码器 */
     private val PREROLL_MAX_MS = 8000L
+    /** 同步组漂移在容忍带内就不动速度：50ms 以内肉眼看不出，硬拽反而抖 */
+    private val SYNC_TOLERANCE_MS = 50L
+    /**
+     * 漂移收敛时间常数：落后 gap 毫秒就按 1+gap/这个值 提速，指数式贴回基准、不过冲。
+     * 放宽到 3500：校正越慢，瞬时速度越贴近 1，音频越不走调（见 SYNC_SPEED_MAX）。
+     */
+    private val SYNC_CONVERGE_MS = 3500.0
+    /**
+     * 速度校正幅度上限。
+     * 【为什么从 0.10 收到 0.03】音频要保留（用户定调，叠化还做音量交叉），而 media3 1.2.1 的
+     * PlaybackParameters 只有速度、没有独立音高，变速即变调。±10% ≈ 一个全音，校正那两三秒里人耳
+     * 听得出走调，按严格标准算 BUG。±3% ≈ 半个全音、且只在个别窗瞬时越界时打满；两次交接之间慢慢
+     * 攒出来的残差本就在百毫秒内，落到速度上约 +1~3%，基本听不出。大的散差（实测 0.5s）不靠这里补：
+     * 自然轮播交接时 groupClock 已经用 setMediaItems 把整组对齐到同一位置，那是一次性硬对齐、不变速。
+     */
+    private val SYNC_SPEED_MAX = 0.03
     private var playTickRunning = false
     // 自引用的巡检闹钟必须写成 object：lambda 版会在自己的初始化器里读 playTick，
     // Kotlin 先报递归类型推断、显式标注类型后又报"必须初始化"。用 this 重投自己就绕开了属性初始化时序。
     private val playTick: Runnable = object : Runnable {
         override fun run() {
             tickPlaySettings()
+            tickSyncGroups()
             if (playTickNeeded()) mqttHandler.postDelayed(this, PLAY_TICK_MS) else playTickRunning = false
         }
     }
@@ -3471,6 +3489,66 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
+    /**
+     * 这一格是不是一个"需要校正的同步组"：同格 ≥2 扇、基准窗（组内 ID 最小那扇）已落在可比进度的
+     * 状态。playTickNeeded 用它决定闹钟要不要继续排，校正本身用同一个判据，两边不会各说各话。
+     */
+    private fun syncGroupsWithCorrection(): Boolean {
+        val groups = videoSurfaces.entries
+            .filter { (_, surf) -> surf.folderKey.isNotEmpty() }
+            .groupBy { (_, surf) -> surf.folderKey }
+        return groups.values.any { members ->
+            members.size >= 2 && settledPlayer(members.map { it.key }.sorted().first()) != null
+        }
+    }
+
+    /**
+     * 巡检同步组的漂移，用播放速度微调把落后的窗悄悄拽回基准。
+     * 散差（实测 0.12~0.55s）的根因是每路解码器各自的换片凝滞不同，加缓冲治不了；只在起播那一刻
+     * 对一次（groupClock）也不够 —— 之后每次轮播交接都会再散一截，永久留在屏上。所以持续校正。
+     * 三条不动手的规矩，都是为了"校正本身别变成新的抖动"：
+     *  1. **只用速度、从不 seek** —— seek 会再触发一次 STATE_BUFFERING→READY 的凝滞，越拽越散。
+     *     落后 gap 毫秒就按 1+gap/SYNC_CONVERGE_MS 提速、封顶 ±SYNC_SPEED_MAX（音频不走调，见常量注释），
+     *     百毫秒级残差约三五秒贴平。大的散差不靠这里：自然交接时 groupClock 已一次性硬对齐过。
+     *  2. **基准窗没落在 READY 就整组这轮不动** —— 免得参考点从一扇跳到另一扇，反而把全组带偏。
+     *  3. **成员在试播/叠化/非 READY/整片错位时只归位速度、不写进度** —— 交接进行中硬拽必抖，等它自己
+     *     滚到基准那一只下一轮自然接上；不在屏上的旧播放器也不能碰（往释放过的实例上写会崩）。
+     * 只能在主线程调用（读播放器进度 + 写速度）。
+     */
+    private fun tickSyncGroups() {
+        val groups = videoSurfaces.entries
+            .filter { (_, surf) -> surf.folderKey.isNotEmpty() }
+            .groupBy { (_, surf) -> surf.folderKey }
+        for ((_, members) in groups) {
+            if (members.size < 2) continue
+            val ordered = members.map { it.key }.sorted()
+            val lead = settledPlayer(ordered[0]) ?: continue   // 基准窗没落定，整组这轮不动
+            val li = lead.currentMediaItemIndex
+            val lp = lead.currentPosition
+            for (winId in ordered.drop(1)) {
+                val mine = settledPlayer(winId)
+                if (mine == null || mine.currentMediaItemIndex != li) {
+                    // 不在可比状态：把这扇窗遗留的提速/减速归回 1.0x，别留个快慢放的尾巴
+                    windowPlayers[winId]?.let { if (it.playbackSpeed != 1f) it.playbackSpeed = 1f }
+                    continue
+                }
+                val gap = lp - mine.currentPosition
+                mine.playbackSpeed = if (Math.abs(gap) <= SYNC_TOLERANCE_MS) 1f else
+                    (1f + (gap / SYNC_CONVERGE_MS).toFloat().coerceIn(-SYNC_SPEED_MAX.toFloat(), SYNC_SPEED_MAX.toFloat()))
+            }
+        }
+    }
+
+    /**
+     * 这扇窗此刻是否停在"可比进度"的状态：播放器在屏上、READY、有清单，且没在试播也没在叠化。
+     * 试播窗播的不是正片内容、叠化窗的第二路正按自己的时刻交接，都不能拿它们的 currentPosition 当基准。
+     */
+    private fun settledPlayer(winId: String): ExoPlayer? {
+        if (previews.containsKey(winId) || windowFades.containsKey(winId)) return null
+        val p = windowPlayers[winId] ?: return null
+        return p.takeIf { it.playbackState == Player.STATE_READY && it.mediaItemCount > 0 }
+    }
+
     // 【A-12】 文件夹级播放设置：随机/顺序循环 + 只在轮播交接处叠化
     // @tag: playSettingsOf 播放设置 叠化 随机循环
     // @tag: beginWindowFade 叠化预卷 第二路播放器
@@ -3560,9 +3638,10 @@ class MainActivity : AppCompatActivity() {
         canonicalJson(scenes.optJSONObject("A")?.opt("play_settings")) + "|" +
             canonicalJson(scenes.optJSONObject("B")?.opt("play_settings"))
 
-    /** 只有开了叠化的窗口才需要巡检；一路都没有就把这颗 100ms 的闹钟停掉，别白烧主线程 */
+    /** 有叠化要巡检、或有同步组要漂移校正时才需要这颗 100ms 闹钟；两者都没有就停掉，别白烧主线程 */
     private fun playTickNeeded(): Boolean =
-        windowFades.isNotEmpty() || videoSurfaces.values.any { it.settings.dissolve }
+        windowFades.isNotEmpty() || videoSurfaces.values.any { it.settings.dissolve } ||
+            syncGroupsWithCorrection()
 
     private fun ensurePlayTicker() {
         if (!playTickNeeded()) {
