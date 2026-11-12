@@ -18,10 +18,11 @@
  * 【A-10】系统 UI（hideSystemUI）
  * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint / calculateMd5）
  * 【A-12】播放设置 & 叠化（playSettingsOf / playSettingsJson / ensurePlayTicker / tickPlaySettings /
- *         beginWindowFade / startWindowFade / completeWindowFade / cancelWindowFade；100ms 巡检的 playTick 本体在字段区）
+ *         groupFadeGateOpen / beginWindowFade / startWindowFade / completeWindowFade / cancelWindowFade；
+ *         100ms 巡检的 playTick 本体在字段区）
  * 【A-13】大屏试播（startGroupPreview / previewTargets / startWindowPreview / restorePreviewGroup /
  *         restoreWindowPreview / abortAllPreviews；同格同步组那条见 groupClock / folderPlaylists，
- *         轮播途中持续拽齐见 tickSyncGroups / settledPlayer）
+ *         轮播交接的"快窗等慢窗 + 硬对齐"见 tickSyncGroups / holdForGroup / hardAlign / settledPlayer）
  * 【A-14】墙板 485 链路（applyWallPanelEnabled / applyWallPanelFields / wallPanelPath / wallPanelBaud /
  *         handleWallPanelEvent / handleWallPanelNumber / effectivePanelNo / folderForPanelNo；
  *         收帧解析与 termios 在 serial/WallPanelLink.kt）
@@ -276,35 +277,61 @@ class MainActivity : AppCompatActivity() {
     private val videoSurfaces = mutableMapOf<String, VideoSurface>()
     /** windowId -> 在飞的叠化（预卷的第二路播放器 + 淡入动画）；同一扇窗最多一路 */
     private val windowFades = mutableMapOf<String, WindowFade>()
+    /** 同步组里正在"等慢窗"而被摁住的快窗：winId -> 摁住的时刻（elapsedRealtime） */
+    private val syncHolds = mutableMapOf<String, Long>()
+    /** winId -> 上一次硬对齐（seek 拽回）的时刻，见 SYNC_ALIGN_COOLDOWN_MS */
+    private val syncAlignAt = mutableMapOf<String, Long>()
+    /** folderKey -> 本轮算出的交接闸门（组内最慢那扇离自己的淡入点还有多久）；tickPlaySettings 起淡入前查它 */
+    private val folderGates = mutableMapOf<String, GroupGate>()
+    /** folderKey -> 连续"整组散开并且真拽了一次"的轮数，见 SYNC_ALIGN_STRIKES */
+    private val folderAlignStrikes = mutableMapOf<String, Int>()
+    /** 拽不齐、已经退出校正的格子：不 seek、不减速、不摁住，直到有窗子重新进这一格 */
+    private val parkedFolders = mutableSetOf<String>()
     /** 叠化巡检间隔：100ms 足够把 400ms 的淡入切成 4 段触发判定，再密就是白烧主线程 */
     private val PLAY_TICK_MS = 100L
     /** 预卷要留给第二路解码器的热身时间：现网 1080p 首帧实测 203~589ms，1200ms 是留了余量的上沿 */
     private val PREROLL_WARMUP_MS = 1200L
     /** 预卷存活上限：超过这个还没淡入（片长突然变了/解码卡住）就撤掉第二路，别让它一直占着解码器 */
     private val PREROLL_MAX_MS = 8000L
-    /** 同步组漂移在容忍带内就不动速度：50ms 以内肉眼看不出，硬拽反而抖 */
+    /** 同步组内两扇窗的进度差在容忍带内就不动手：50ms 以内肉眼看不出，来回纠正反而抖 */
     private val SYNC_TOLERANCE_MS = 50L
     /**
-     * 漂移收敛时间常数：落后 gap 毫秒就按 1+gap/这个值 提速，指数式贴回基准、不过冲。
-     * 放宽到 3500：校正越慢，瞬时速度越贴近 1，音频越不走调（见 SYNC_SPEED_MAX）。
-     */
-    private val SYNC_CONVERGE_MS = 3500.0
-    /**
-     * 速度校正幅度上限。
+     * 速度校正幅度上限（只用它减速，从不提速，见 tickSyncGroups）。
      * 【为什么从 0.10 收到 0.03】音频要保留（用户定调，叠化还做音量交叉），而 media3 1.2.1 的
      * PlaybackParameters 只有速度、没有独立音高，变速即变调。±10% ≈ 一个全音，校正那两三秒里人耳
-     * 听得出走调，按严格标准算 BUG。±3% ≈ 半个全音、且只在个别窗瞬时越界时打满；两次交接之间慢慢
-     * 攒出来的残差本就在百毫秒内，落到速度上约 +1~3%，基本听不出。大的散差（实测 0.5s）不靠这里补：
-     * 自然轮播交接时 groupClock 已经用 setMediaItems 把整组对齐到同一位置，那是一次性硬对齐、不变速。
+     * 听得出走调，按严格标准算 BUG。±3% 只在快窗往回收的时候打满，慢窗永远是 1.0x —— 全组最慢那扇
+     * 就是基准，没人比它更慢，所以提速这条路整个删掉了（原 SYNC_CONVERGE_MS 随之删除）。
      */
     private val SYNC_SPEED_MAX = 0.03
+    /**
+     * 不叠化的同步组：快窗离交接点只剩这么多毫秒还没等到基准，就把画面摁住等。
+     * 150ms ≈ 一颗巡检（100ms）+ 余量；再小就可能一轮巡不到、白放它过界。
+     */
+    private val SYNC_FREEZE_MS = 150L
+    /** 等待上限：摁过这个时长还没等到基准就放行。画面定在屏上比散这一次交接严重得多，绝不能这样 */
+    private val SYNC_HOLD_MAX_MS = 1200L
+    /**
+     * 散开阈值：组内最大进度差超过这个毫秒数，就不再让快窗等（等不起），整组一次 seek 跳到最前面那扇。
+     * 900ms 的取法：交接凝滞实测最高 553ms，两倍多一点还归"等"；比这更大的差只可能是某扇窗丢了交接
+     * 或刚被单独重建过，那种情况拽回来比重播半只片子划算。
+     */
+    private val SYNC_ALIGN_MAX_MS = 900L
+    /** 硬对齐冷却：seek 自己要付一次凝滞，同一扇窗两次拽回至少隔这么久，免得来回拽把整组带抖 */
+    private val SYNC_ALIGN_COOLDOWN_MS = 1500L
+    /**
+     * 熔断阈值：同一格连续这么多次"整组散开→整组 seek"还没拽齐，就退出校正。
+     * 拽不齐的差不是轮播攒出来的（那种一次就够），而是某一路天生追不动 —— 典型是同格混了 4K 和 1080p，
+     * 凝滞差远大于校正能力。继续硬拽就是每隔 1.5s 全屏跳一次，比并排放两只片子还难看，还每次付一遍解码器重配。
+     */
+    private val SYNC_ALIGN_STRIKES = 3
     private var playTickRunning = false
     // 自引用的巡检闹钟必须写成 object：lambda 版会在自己的初始化器里读 playTick，
     // Kotlin 先报递归类型推断、显式标注类型后又报"必须初始化"。用 this 重投自己就绕开了属性初始化时序。
     private val playTick: Runnable = object : Runnable {
         override fun run() {
-            tickPlaySettings()
+            // 顺序不能反：先由同步组算出"谁最慢、该不该等"并放行摁住的窗，叠化那一轮才照着闸门起淡入
             tickSyncGroups()
+            tickPlaySettings()
             if (playTickNeeded()) mqttHandler.postDelayed(this, PLAY_TICK_MS) else playTickRunning = false
         }
     }
@@ -2848,6 +2875,12 @@ class MainActivity : AppCompatActivity() {
         windowPlayers.values.forEach { it.release() }
         windowPlayers.clear()
         videoSurfaces.clear()
+        // 同步组那三本账随窗口一起清：留着摁住记录，下一轮就会去放行一扇新起的、根本没被我们摁过的窗
+        syncHolds.clear()
+        syncAlignAt.clear()
+        folderGates.clear()
+        folderAlignStrikes.clear()
+        parkedFolders.clear()
 
         // 移除旧的窗口视图
         windowViews.values.forEach { flSurface?.removeView(it) }
@@ -3431,6 +3464,12 @@ class MainActivity : AppCompatActivity() {
         val ps = playSettingsOf(scenes, folderId)
         videoSurfaces[winId]?.settings = ps
         videoSurfaces[winId]?.folderKey = folderId
+        // 进这一格 = 重新来过：摁着的放行、上一份清单的记账全清。带着旧指纹会被判成"另一组"而跟不上基准
+        releaseSyncHold(winId)
+        syncAlignAt.remove(winId)
+        // 重新进格是最后一次"整组对齐到同一位置"的机会，熔断也就到此为止
+        folderAlignStrikes.remove(folderId)
+        parkedFolders.remove(folderId)
         val listed = videos.map { MediaItem.fromUri(Uri.fromFile(it)) }
         // 不用 ExoPlayer 自带的 shuffleModeEnabled：叠化那一路要照同一份顺序克隆 playlist，
         // 内置洗牌的两路顺序对不上，交接时会跳到另一只片子。
@@ -3439,6 +3478,7 @@ class MainActivity : AppCompatActivity() {
         val playlist = if (cached != null && sameItems(cached, listed)) cached
             else (if (ps.shuffle && listed.size > 1) listed.shuffled() else listed)
                 .also { folderPlaylists[folderId] = it }
+        videoSurfaces[winId]?.playlistSig = playlistSig(playlist)
         // 组里已有窗在播这一格 → 新起这扇从它的当前位置进场，不回到第 1 只重头播；
         // 否则每次换窗/重建/切墙板都把同步组打散一次
         val clock = groupClock(folderId, winId)?.takeIf { sameItems(it.items, playlist) }
@@ -3454,10 +3494,12 @@ class MainActivity : AppCompatActivity() {
              else "，从头起播") + ")", "INFO", "PLAYBACK", "START")
     }
 
-    // ================= 同步组：同一格内容的窗口共用一份清单、一把位置基准 =================
+    // ================= 同步组：同一格内容的窗口共用一份清单、一把位置基准、一个交接时刻 =================
     // 用户定调的硬约束：任何情况下所有窗口的播放画面严格同步。多扇窗各挂一路播放器，
-    // 结构上就只能"对齐到同一个位置基准"，做不到硬件级同帧 —— 这里先把两处必然各走各的
-    // 地方收口（洗牌顺序、起播位置），试播那条见 startGroupPreview。
+    // 结构上就只能"对齐到同一个位置基准"，做不到硬件级同帧 —— 这里把三处必然各走各的地方收口：
+    // 洗牌顺序（一份清单只洗一次）、起播位置（groupClock 跟随组内基准）、
+    // 以及每次轮播交接的时刻（tickSyncGroups：快窗等慢窗 + 过界硬对齐，见那里的三档力度）；
+    // 试播那条见 startGroupPreview。
 
     /** 一格的轮播位置基准：第几只 + 第几毫秒；items 是那一格的整份清单（恢复正片时要照着它回） */
     private class RotationClock(
@@ -3466,12 +3508,42 @@ class MainActivity : AppCompatActivity() {
         val positionMs: Long
     )
 
+    /**
+     * 同步组里一扇窗这一轮的读数。下标统一折算到基准那一路的清单空间（lap = 相对基准多走完了几只）：
+     * 叠化交接过的那一路 playlist 换了起点，直接比 currentMediaItemIndex 会把同一只片子读成差一只。
+     */
+    private class SyncClock(
+        val winId: String,
+        val player: ExoPlayer,
+        /** 此刻正在播的那只片子的落盘 URI：硬对齐时靠它把目标下标翻译回自己那份清单 */
+        val clipUri: String,
+        val lap: Int,
+        val positionMs: Long,
+        val remainingMs: Long
+    )
+
+    /** 一格的交接闸门：本轮组内最慢那扇离它自己的淡入点还剩多少毫秒、淡入点定在几毫秒 */
+    private class GroupGate(val refRemainingMs: Long, val waitMs: Long)
+
     /** 一只片子的落盘 URI（localConfiguration 在 1.2.1 是可空公开字段，离线/占位 item 取不到就当空串） */
     private fun itemUri(item: MediaItem): String = item.localConfiguration?.uri?.toString() ?: ""
 
     /** 两份清单算不算同一份内容：MediaItem 的等值比较不可靠（还带元数据、裁剪），只逐个比落盘 URI */
     private fun sameItems(a: List<MediaItem>, b: List<MediaItem>): Boolean =
         a.size == b.size && a.indices.all { itemUri(a[it]) == itemUri(b[it]) }
+
+    /**
+     * 一份清单的内容指纹。为什么不像 sameItems 那样逐个比：叠化交接后那一路的 playlist 是同一份内容
+     * 从下一只重新排的（见 beginWindowFade 的 rotated），逐个比会把刚交接完的窗判成"另一组"，
+     * 于是它再也跟不上基准。排序后比的是内容集合，与从第几只起播无关。
+     */
+    private fun playlistSig(items: List<MediaItem>): String = items.map { itemUri(it) }.sorted().joinToString("|")
+
+    /** 同一只片子在另一路播放器的清单里排第几（-1 = 不在那份清单里）：换过起点的两路下标不通用 */
+    private fun indexOfItem(player: ExoPlayer, uri: String): Int {
+        for (i in 0 until player.mediaItemCount) if (itemUri(player.getMediaItemAt(i)) == uri) return i
+        return -1
+    }
 
     /**
      * 这一格此刻的正片位置。基准窗 = 组内 ID 最小、且真有播放器在跑的那扇 —— 固定次序，
@@ -3498,55 +3570,195 @@ class MainActivity : AppCompatActivity() {
         val groups = videoSurfaces.entries
             .filter { (_, surf) -> surf.folderKey.isNotEmpty() }
             .groupBy { (_, surf) -> surf.folderKey }
-        return groups.values.any { members ->
-            members.size >= 2 && settledPlayer(members.map { it.key }.sorted().first()) != null
+        return groups.any { (folderKey, members) ->
+            members.size >= 2 && !parkedFolders.contains(folderKey) &&
+                settledPlayer(members.map { it.key }.sorted().first()) != null
         }
     }
 
     /**
-     * 巡检同步组的漂移，用播放速度微调把落后的窗悄悄拽回基准。
-     * 散差（实测 0.12~0.55s）的根因是每路解码器各自的换片凝滞不同，加缓冲治不了；只在起播那一刻
-     * 对一次（groupClock）也不够 —— 之后每次轮播交接都会再散一截，永久留在屏上。所以持续校正。
-     * 三条不动手的规矩，都是为了"校正本身别变成新的抖动"：
-     *  1. **只用速度、从不 seek** —— seek 会再触发一次 STATE_BUFFERING→READY 的凝滞，越拽越散。
-     *     落后 gap 毫秒就按 1+gap/SYNC_CONVERGE_MS 提速、封顶 ±SYNC_SPEED_MAX（音频不走调，见常量注释），
-     *     百毫秒级残差约三五秒贴平。大的散差不靠这里：自然交接时 groupClock 已一次性硬对齐过。
-     *  2. **基准窗没落在 READY 就整组这轮不动** —— 免得参考点从一扇跳到另一扇，反而把全组带偏。
-     *  3. **成员在试播/叠化/非 READY/整片错位时只归位速度、不写进度** —— 交接进行中硬拽必抖，等它自己
-     *     滚到基准那一只下一轮自然接上；不在屏上的旧播放器也不能碰（往释放过的实例上写会崩）。
-     * 只能在主线程调用（读播放器进度 + 写速度）。
+     * 巡检同步组：让组里每一扇窗在**同一时刻**走到下一只。
+     *
+     * 【基准是谁】组内进度最靠后那一扇（离交接点还剩最多毫秒的）。让快窗等慢窗，而不是让慢窗提速去赶
+     * 快窗 —— media3 变速即变调，提速那一两秒音频听着就走调（用户定调音频要保留）；等待换来的是交接前
+     * 一小段画面停住，大屏上"四扇窗同时切"比"其中一扇慢半秒"值这个代价。
+     *
+     * 三档力度按误差从小到大，一轮巡检只落在其中一档：
+     *  1. **减速贴齐** —— 按"和基准同时到达交接点"要的倍速（remaining_我 / remaining_基准），幅度封顶
+     *     -SYNC_SPEED_MAX。3% 以内听不出，也不会把整组节奏拖慢。
+     *  2. **摁住等待** —— 减速追不上（误差超过这一只剩余时长能吃下的量）就停在交接点前 SYNC_FREEZE_MS
+     *     （开了叠化的格子停在淡入点前），基准到了自然放行；最长等 SYNC_HOLD_MAX_MS，超时先放行 ——
+     *     一扇窗定在屏上比散这一次交接严重得多。
+     *  3. **硬对齐** —— 已经抢跑过交接点（播到下一只去了）的，一次 seek 拽回基准正在播的那一帧；整组散过
+     *     SYNC_ALIGN_MAX_MS 则反过来，全组一次 seek 跳到最前面那扇（落后几扇的片尾不播了，也好过屏上
+     *     并排放两只不同的片子）。seek 自己也要付一次凝滞，所以带 SYNC_ALIGN_COOLDOWN_MS 冷却。
+     *
+     * 三条不动手的规矩：
+     *  1. **组内 ID 最小那扇（落定判据窗，不是位置基准）没落在可比状态就整组这轮不动** —— 判据窗固定按
+     *     ID 取，免得这轮从一扇跳到另一扇反而把全组带偏；摁住的窗由超时放行兜底，不会一直停着。
+     *  2. **只对齐同一份清单的窗** —— 素材刚变过、只重建了其中一扇时两路内容不同，拽过去会让它播到别的
+     *     片子上，屏上看着对、内容已经错。
+     *  3. **成员在试播 / 淡入动画中 / 非 READY 时一律不动手** —— 交接正在进行，那一路归叠化自己收尾。
+     *  4. **熔断** —— 同一格连着 SYNC_ALIGN_STRIKES 轮"整组散开并且真 seek 过"还拽不齐，这格就永久退出校正
+     *     （parkedFolders），直到有窗口重新进这一格：那种差不是轮播攒的，是某一路天生追不动（同格混了
+     *     4K 和 1080p），继续硬拽只是每 1.5s 全屏跳一次，比并排放两只片子更糟。
+     * 只能在主线程调用（读播放器进度 + 写速度/暂停/seek）。
      */
     private fun tickSyncGroups() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        // 过期收摊先做：这一轮哪怕整组都不落定，被摁住的窗也有个放行的日子；已经不存在的窗照样放行，
+        // 别让"画面没人要了但播放器还在"的那扇停在最后一帧上
+        for ((winId, since) in syncHolds.toList()) {
+            if (!videoSurfaces.containsKey(winId) || now - since >= SYNC_HOLD_MAX_MS) releaseSyncHold(winId)
+        }
+        // 只留还在屏上的窗：窗口已经重建过的，冷却时刻和上一份清单绑在一起，留着没意义
+        for (winId in syncAlignAt.keys.toList()) if (!videoSurfaces.containsKey(winId)) syncAlignAt.remove(winId)
         val groups = videoSurfaces.entries
             .filter { (_, surf) -> surf.folderKey.isNotEmpty() }
             .groupBy { (_, surf) -> surf.folderKey }
-        for ((_, members) in groups) {
-            if (members.size < 2) continue
+        // 闸门同理：这一轮算不出来的格子（散会了、只剩一扇、判据窗没落定）在下面各分支里逐个 remove，
+        // 这里先把这一轮压根不存在的格子清掉，别让淡入被一个陈旧读数拦住
+        for (folderKey in folderGates.keys.toList()) if (!groups.containsKey(folderKey)) folderGates.remove(folderKey)
+        for ((folderKey, members) in groups) {
             val ordered = members.map { it.key }.sorted()
-            val lead = settledPlayer(ordered[0]) ?: continue   // 基准窗没落定，整组这轮不动
-            val li = lead.currentMediaItemIndex
-            val lp = lead.currentPosition
-            for (winId in ordered.drop(1)) {
-                val mine = settledPlayer(winId)
-                if (mine == null || mine.currentMediaItemIndex != li) {
-                    // 不在可比状态：把这扇窗遗留的提速/减速归回 1.0x，别留个快慢放的尾巴
-                    windowPlayers[winId]?.let { if (it.playbackParameters.speed != 1f) it.playbackParameters = PlaybackParameters(1f) }
-                    continue
+            if (members.size < 2) { folderGates.remove(folderKey); continue }
+            // 熔断过的格子整轮跳过：连闸门也不写（写了就等于拦住淡入），这组照旧各走各的
+            if (parkedFolders.contains(folderKey)) { folderGates.remove(folderKey); continue }
+            val anchorId = ordered.first()
+            // 规矩 1：判据窗（组内 ID 最小那扇，不是位置基准）没落定这轮不动手；闸门同时撤掉 = 放行，
+            // 别让开了叠化的那几扇干等到超时
+            val anchor = settledPlayer(anchorId)
+            if (anchor == null) { folderGates.remove(folderKey); continue }
+            val count = anchor.mediaItemCount
+            val unit = anchor.duration
+            val anchorSig = videoSurfaces[anchorId]?.playlistSig ?: ""
+            // 时长未知（直播流/坏文件）算不出谁在前；指纹为空 = 这一路还没走过 playFolderInWindow，没有清单可比
+            if (count == 0 || unit <= 0 || anchorSig.isEmpty()) { folderGates.remove(folderKey); continue }
+            val anchorIdx = anchor.currentMediaItemIndex
+            // 规矩 2：只收清单一致、落在可比状态的窗
+            val clocks = ordered.mapNotNull { winId ->
+                val p = settledPlayer(winId) ?: return@mapNotNull null
+                val surf = videoSurfaces[winId] ?: return@mapNotNull null
+                if (p.mediaItemCount != count || surf.playlistSig != anchorSig) return@mapNotNull null
+                val uri = itemUri(p.getMediaItemAt(p.currentMediaItemIndex))
+                val lapPos = indexOfItem(anchor, uri)
+                if (lapPos < 0) return@mapNotNull null
+                val d = lapPos - anchorIdx
+                // 圆环上取最短：一格只有 4 只时"差 3 只"是落后 1 只，不是超前 3 只
+                SyncClock(winId, p, uri,
+                    if (d > count / 2) d - count else if (d < -(count / 2)) d + count else d,
+                    p.currentPosition, (p.duration - p.currentPosition).coerceAtLeast(0L))
+            }
+            if (clocks.size < 2) { folderGates.remove(folderKey); continue }
+            // 进度铺平成一把连续尺子：只比 currentMediaItemIndex 比不出"刚过界 0.3s"和"片尾还差 0.2s"
+            // 谁在前，而这两个恰恰是交接那一瞬间要分的东西
+            val sorted = clocks.sortedBy { syncProgress(it, unit) }
+            val ref = sorted.first()
+            val lead = sorted.last()
+            val spread = syncProgress(lead, unit) - syncProgress(ref, unit)
+            if (spread > SYNC_ALIGN_MAX_MS) {
+                // 散到这个程度已经等不起（要等的比一只片子还长）：整组一次 seek 归到最前面那扇
+                // 返回 true 才是真拽了（冷却里的不算），只有真拽才记账 —— 否则三轮巡检（300ms）就把整组熔断了
+                var sought = 0
+                for (c in clocks) {
+                    if (syncProgress(c, unit) != syncProgress(lead, unit) &&
+                        hardAlign(c, lead, now, "整组散开 ${spread}ms")) sought++
                 }
-                val gap = lp - mine.currentPosition
-                val speed = if (Math.abs(gap) <= SYNC_TOLERANCE_MS) 1f else
-                    (1f + (gap / SYNC_CONVERGE_MS).toFloat().coerceIn(-SYNC_SPEED_MAX.toFloat(), SYNC_SPEED_MAX.toFloat()))
-                mine.playbackParameters = PlaybackParameters(speed)
+                if (sought > 0) {
+                    val strikes = (folderAlignStrikes[folderKey] ?: 0) + 1
+                    folderAlignStrikes[folderKey] = strikes
+                    if (strikes >= SYNC_ALIGN_STRIKES) {
+                        parkedFolders.add(folderKey)
+                        folderAlignStrikes.remove(folderKey)
+                        // 下车前把速度归位、把摁住的放开：这一组从这一刻起就交回给各路自己的时刻表
+                        for (c in clocks) { setSyncSpeed(c.player, 1f); releaseSyncHold(c.winId) }
+                        logToFile("同步组 $folderKey 连续 $strikes 轮整组散开（末轮 ${spread}ms）拽不齐：退出同步校正，" +
+                            "直到有窗口重新进这一格。多半是同格素材规格不一（4K 混 1080p），先做归一（任务 #159）",
+                            "WARN", "PLAYBACK", "SYNC")
+                    }
+                }
+                folderGates.remove(folderKey)
+                continue
+            }
+            folderAlignStrikes.remove(folderKey)   // 本轮没散开 = 连续计数归零，熔断只认"连着拽不动"
+            val gs = videoSurfaces[ref.winId]?.settings ?: PlaySettings()
+            val waitMs = if (gs.dissolve) gs.dissolveMs else SYNC_FREEZE_MS
+            folderGates[folderKey] = GroupGate(ref.remainingMs, waitMs)
+            for (c in clocks) {
+                if (c.winId == ref.winId) { releaseSyncHold(c.winId); setSyncSpeed(c.player, 1f); continue }
+                val ahead = syncProgress(c, unit) - syncProgress(ref, unit)
+                if (ahead <= SYNC_TOLERANCE_MS) { releaseSyncHold(c.winId); setSyncSpeed(c.player, 1f); continue }
+                if (c.lap > ref.lap) { hardAlign(c, ref, now, "抢跑 ${ahead}ms"); continue }
+                // 已经摁住的就继续摁着：等 ahead 自己归零放行，别在"减速一点点"和"停住"之间来回跳
+                if (c.remainingMs > waitMs) {
+                    val need = (if (ref.remainingMs <= 0) 1f else c.remainingMs.toFloat() / ref.remainingMs.toFloat())
+                        .coerceIn(0f, 1f)
+                    setSyncSpeed(c.player, if (need >= 1f - SYNC_SPEED_MAX) need else 1f - SYNC_SPEED_MAX.toFloat())
+                } else holdForGroup(c, now)
             }
         }
     }
 
     /**
-     * 这扇窗此刻是否停在"可比进度"的状态：播放器在屏上、READY、有清单，且没在试播也没在叠化。
-     * 试播窗播的不是正片内容、叠化窗的第二路正按自己的时刻交接，都不能拿它们的 currentPosition 当基准。
+     * 一扇窗在这一格里的连续进度（毫秒）：相对基准多走完的只数 × 单只时长 + 本只内位置。
+     * unit 统一取基准窗那一只的时长 —— 同组素材长短不一时这是个近似，但 lap 只差 0/1 的判定用它够了，
+     * 真正要精确比的是同一只片子里的位置差。
+     */
+    private fun syncProgress(c: SyncClock, unit: Long) = c.lap.toLong() * unit + c.positionMs
+
+    /** 写速度前先比一下：每 100ms 无脑重设 playbackParameters 会让 media3 一路发事件，白折腾 */
+    private fun setSyncSpeed(p: ExoPlayer, speed: Float) {
+        if (Math.abs(p.playbackParameters.speed - speed) < 0.005f) return
+        p.playbackParameters = PlaybackParameters(speed)
+    }
+
+    /** 摁住这扇快窗等基准：只暂停、不 seek —— 画面停在最后一帧，比跳一次位置稳，也不额外付凝滞 */
+    private fun holdForGroup(c: SyncClock, now: Long) {
+        setSyncSpeed(c.player, 1f)   // 速度先归位：放行后它按原速走完最后那一段，不用一边起步一边补速
+        if (syncHolds.containsKey(c.winId)) return
+        syncHolds[c.winId] = now
+        c.player.playWhenReady = false
+    }
+
+    /** 放行：只有我们摁过的才由我们放开（别人暂停的窗口不是我们的事），顺手把速度归位 */
+    private fun releaseSyncHold(winId: String) {
+        if (syncHolds.remove(winId) == null) return
+        windowPlayers[winId]?.let {
+            it.playWhenReady = true
+            setSyncSpeed(it, 1f)
+        }
+    }
+
+    /**
+     * 一次 seek 把某扇窗拽到目标窗正在播的那一帧附近（只在过交接点、或整组散开时用）。
+     * 目标下标靠 clipUri 翻译回自己那份清单：叠化交接过的那一路是从下一只重新排的，直接用目标的
+     * index 会落到另一只片子上 —— 内容看着同步了，其实各播各的。
+     * 返回值 = 这一下是否真拽了：在冷却里、或目标片子根本不在这一路的清单里，都没动它，
+     * 调用方（熔断计数）只认真正发生过的 seek。
+     */
+    private fun hardAlign(c: SyncClock, target: SyncClock, now: Long, reason: String): Boolean {
+        releaseSyncHold(c.winId)
+        // 拽不拽都得先把速度归位：冷却里放过它，更不能让它带着校正用的减速继续跑
+        setSyncSpeed(c.player, 1f)
+        val last = syncAlignAt[c.winId]
+        if (last != null && now - last < SYNC_ALIGN_COOLDOWN_MS) return false
+        val idx = indexOfItem(c.player, target.clipUri)
+        if (idx < 0) return false
+        syncAlignAt[c.winId] = now
+        c.player.seekTo(idx, target.positionMs)
+        logToFile("窗口 ${c.winId} 同步硬对齐（$reason）→ 第 ${idx + 1}/${c.player.mediaItemCount} 只 @${target.positionMs}ms",
+            "INFO", "PLAYBACK", "SYNC")
+        return true
+    }
+
+    /**
+     * 这扇窗此刻是否停在"可比进度"的状态：播放器在屏上、READY、有清单，且没在试播、淡入也还没起跑。
+     * 淡入一旦起跑就归叠化自己收尾（两路在同一刻交接），不能再拿它的 currentPosition 当基准；
+     * 预卷还没起跑的那一路照读 —— 那正是"该不该等慢窗"要判定的时刻。
      */
     private fun settledPlayer(winId: String): ExoPlayer? {
-        if (previews.containsKey(winId) || windowFades.containsKey(winId)) return null
+        if (previews.containsKey(winId)) return null
+        windowFades[winId]?.let { if (it.fading) return null }
         val p = windowPlayers[winId] ?: return null
         return p.takeIf { it.playbackState == Player.STATE_READY && it.mediaItemCount > 0 }
     }
@@ -3581,13 +3793,15 @@ class MainActivity : AppCompatActivity() {
      * 一扇视频窗口的画面现场。播放器实例不在这儿（唯一真值是 windowPlayers），只放叠化要摸的东西。
      * folderKey = 这扇窗此刻在播哪一格（playFolderInWindow 落的），同步组就按它认成员；
      * 叠化交接换新 VideoSurface 时必须把它带上，丢了这扇窗就从组里消失了。
+     * playlistSig = 这一路正在播的那份清单的内容指纹，同组成员只有它相等才允许互相对齐（理由见那里）。
      */
     private class VideoSurface(
         val container: FrameLayout,
         val texture: TextureView,
         var winJson: JSONObject,
         var settings: PlaySettings,
-        var folderKey: String = ""
+        var folderKey: String = "",
+        var playlistSig: String = ""
     )
 
     /** 一次在飞的叠化：预卷的第二路 + 它上面那块 TextureView + 正在淡出的正片那一路 */
@@ -3640,10 +3854,10 @@ class MainActivity : AppCompatActivity() {
         canonicalJson(scenes.optJSONObject("A")?.opt("play_settings")) + "|" +
             canonicalJson(scenes.optJSONObject("B")?.opt("play_settings"))
 
-    /** 有叠化要巡检、或有同步组要漂移校正时才需要这颗 100ms 闹钟；两者都没有就停掉，别白烧主线程 */
+    /** 有叠化要巡检、有同步组要校正、或还有窗子被摁着等慢窗时才需要这颗 100ms 闹钟；都没有就停掉，别白烧主线程 */
     private fun playTickNeeded(): Boolean =
         windowFades.isNotEmpty() || videoSurfaces.values.any { it.settings.dissolve } ||
-            syncGroupsWithCorrection()
+            syncGroupsWithCorrection() || syncHolds.isNotEmpty()
 
     private fun ensurePlayTicker() {
         if (!playTickNeeded()) {
@@ -3682,13 +3896,24 @@ class MainActivity : AppCompatActivity() {
                 if (remaining <= ps.dissolveMs + PREROLL_WARMUP_MS) beginWindowFade(winId, surf, player)
             } else if (!fade.fading) {
                 // 第二路还没解码出首帧就起淡入 = 淡上来一块黑；宁可等正片滚过去再硬切
-                if (remaining <= ps.dissolveMs && fade.incoming.playbackState == Player.STATE_READY) {
+                if (remaining <= ps.dissolveMs && fade.incoming.playbackState == Player.STATE_READY &&
+                    groupFadeGateOpen(surf.folderKey)) {
                     startWindowFade(winId, fade, ps)
                 } else if (now - fade.bornAt > PREROLL_MAX_MS) {
                     cancelWindowFade(winId, "预卷超时")
                 }
             }
         }
+    }
+
+    /**
+     * 整组同时起淡入才叫同步交接：只要组内最慢那扇还没到自己的淡入点，已经到点的这几扇就先别淡。
+     * 没有闸门读数（单窗 / 基准窗没落定 / 清单不一致 / 整组散开正在硬对齐）一律放行 —— 拦人的代价是
+     * 一扇窗停在屏上，等不到基准自有 SYNC_HOLD_MAX_MS 兜底，绝不能让淡入被一个算不出来的读数卡死。
+     */
+    private fun groupFadeGateOpen(folderKey: String): Boolean {
+        val gate = folderGates[folderKey] ?: return true
+        return gate.refRemainingMs <= gate.waitMs + SYNC_TOLERANCE_MS
     }
 
     /** 起第二路：同一份 playlist 从下一只开始，挂在正片上面那块 TextureView 上，alpha=0 先藏着 */
@@ -3736,6 +3961,8 @@ class MainActivity : AppCompatActivity() {
 
     /** 起淡入：上面那路 alpha 0→1，音量同步交叉（底下正片保持不透明，这就是交叉叠化） */
     private fun startWindowFade(winId: String, fade: WindowFade, ps: PlaySettings) {
+        // 闸门放行 = 组里最慢那扇也到自己的淡入点了：把正片从"等慢窗"的停帧里放开，两路一起走完这段
+        releaseSyncHold(winId)
         fade.fading = true
         fade.incoming.playWhenReady = true
         val anim = ValueAnimator.ofFloat(0f, 1f)
@@ -3763,6 +3990,8 @@ class MainActivity : AppCompatActivity() {
      */
     private fun completeWindowFade(winId: String, reason: String) {
         val fade = windowFades.remove(winId) ?: return
+        // 交接后换了播放器实例，"等慢窗"那本账必须在这一刻清干净：留着它，下一轮会去放行一个不相干的实例
+        releaseSyncHold(winId)
         stopFadeAnimator(fade)
         fade.outgoing.removeListener(fade.listener)
         val surf = videoSurfaces[winId]
@@ -3782,7 +4011,9 @@ class MainActivity : AppCompatActivity() {
         // 提升后必须补一脚，否则窗口会定格在下一只的首帧。已在播时这句是空操作。
         fade.incoming.playWhenReady = true
         windowPlayers[winId] = fade.incoming
-        videoSurfaces[winId] = VideoSurface(surf.container, fade.incomingView, surf.winJson, surf.settings, surf.folderKey)
+        // 清单指纹原样带过去：交接后的那一路是同一份内容换了起点，指纹一丢这扇窗就从同步组里消失了
+        videoSurfaces[winId] = VideoSurface(surf.container, fade.incomingView, surf.winJson, surf.settings,
+            surf.folderKey, surf.playlistSig)
         applyTransformWhenReady(surf.container, surf.winJson)
         logToFile("窗口 $winId 叠化交接完成（$reason）", "INFO", "PLAYBACK", "DISSOLVE")
         ensurePlayTicker()
@@ -3791,6 +4022,8 @@ class MainActivity : AppCompatActivity() {
     /** 撤掉第二路，画面原样留给正片（换文件夹/试播接管/配置重建/预热失败都走这里） */
     private fun cancelWindowFade(winId: String, reason: String) {
         val fade = windowFades.remove(winId) ?: return
+        // 正片可能正被同步组摁着等慢窗；这一路的叠化不走了，就更不能让它停在画面上
+        releaseSyncHold(winId)
         stopFadeAnimator(fade)
         fade.outgoing.removeListener(fade.listener)
         fade.outgoing.volume = 1f   // 淡入中途被撤时正片音量已经被压下去了，得还回来
@@ -3916,6 +4149,9 @@ class MainActivity : AppCompatActivity() {
         // 试播接管 = 硬切（用户定调）：在飞的叠化先撤掉，快照才是在屏上那只正片，
         // 否则试播播完恢复时第二路还在淡入，画面会被拽回一个谁也没打算播的中间态
         cancelWindowFade(winId, "试播接管")
+        // 快照之前先解除"等慢窗"的摁住：不然存进去的 playWhenReady=false 会跟着恢复正片一起回来，
+        // 那扇窗播完试播就再也起不来了
+        releaseSyncHold(winId)
 
         val existing = previews[winId]
         if (existing == null) {
@@ -4090,6 +4326,12 @@ class MainActivity : AppCompatActivity() {
         windowPlayers.values.forEach { it.release() }
         windowPlayers.clear()
         videoSurfaces.clear()
+        // 同步组那三本账随窗口一起清：留着摁住记录，下一轮就会去放行一扇新起的、根本没被我们摁过的窗
+        syncHolds.clear()
+        syncAlignAt.clear()
+        folderGates.clear()
+        folderAlignStrikes.clear()
+        parkedFolders.clear()
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
         // 屏上已经没有窗口了，"已应用配置"的指纹必须一起作废：
