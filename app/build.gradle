@@ -11,8 +11,14 @@ android {
         applicationId "com.xvj.app"
         minSdk 24
         targetSdk 34
-        versionCode 177
-        versionName "177"
+        // 版本号 = GitHub Actions 的 run 号（2026-11-12 用户定调：废掉 176/177 这种自己排的号，包的身份就是 run 号，
+        // 报障时"run #309"直接对应到这一个包，不用两头换算）。
+        // GITHUB_RUN_NUMBER 由 Actions 自动注入每个 step；本地构建没有它，落 1 —— 本地包永远不会被 OTA 当成新版。
+        // run 号单调递增，所以覆盖安装/版本比较与旧号段（176 等）天然兼容；同 run 号重复构建会被控制台上传的
+        // version_code 查重（409）挡下，正好不允许两个包抢同一个号。
+        def runNo = System.getenv("GITHUB_RUN_NUMBER") ?: "1"
+        versionCode runNo.toInteger()
+        versionName runNo
 
         // MQTT 设备凭据（broker 鉴权改造）：密码绝不进公开仓库。
         // CI 由 GitHub Secret 注入环境变量 XVJ_MQTT_DEVICE_PW；本地构建可 -PXVJ_MQTT_DEVICE_PW=xxx 或同名环境变量；

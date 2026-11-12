@@ -106,8 +106,15 @@ jobs:
           exit 1
         fi
 
+    - name: Label APK with the Actions run number
+      run: |
+        # 包名直接带 run 号（2026-11-12 定调：以后只认 run 号，不再自己排 176/177 那种号）
+        APK=$(find app/build/outputs -name "*.apk" | head -1)
+        mv "$APK" "$(dirname "$APK")/xvj-${GITHUB_RUN_NUMBER}.apk"
+        ls -l "$(dirname "$APK")"
+
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: xvj-apk
+        name: xvj-apk-${{ github.run_number }}
         path: app/build/outputs/**/*.apk
