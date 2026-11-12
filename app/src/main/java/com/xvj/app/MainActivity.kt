@@ -3392,6 +3392,11 @@ class MainActivity : AppCompatActivity() {
                         Player.STATE_READY -> {
                             val since = bufferingSince
                             bufferingSince = 0L
+                            // 从 BUFFERING 回到 READY 的这一刻必须把闹钟重新排上：判据窗在换片那段时间不是
+                            // READY，playTickNeeded 判 false 就把这颗 100ms 巡检收掉，而硬切轮播里换片本身
+                            // 不走 playFolderInWindow —— 没有任何事件会再排它，同步校正会在第一次凝滞之后
+                            // 睡死到下一次重建，散差照旧攒起来且一行日志都不留。
+                            if (since > 0) mqttHandler.post { ensurePlayTicker() }
                             if (readyLogged) {
                                 // 首帧之后才有"换片"可言；不到 100ms 的凝滞人眼看不出来，别刷日志
                                 if (since > 0 && now - since >= 100) {
@@ -3780,7 +3785,9 @@ class MainActivity : AppCompatActivity() {
     //  3. 只淡入上面那一路（alpha 0→1），底下正片保持不透明 —— 这就是标准交叉叠化，省一半动画。
     //  4. 收尾两条路谁先到谁说了算：动画跑完，或正片自己滚到下一只（onMediaItemTransition AUTO）。
     //     **不用 STATE_ENDED**：REPEAT_MODE_ALL 下它根本不来，而且那个钩子是试播恢复专用的。
-    //  5. 热身没赶上 / 片长未知 / 播放器出错 → 撤掉第二路，硬切。宁可少一次特效，不能让大屏黑一下。
+    //  5. 起淡入的门槛是第二路**真画出首帧**（onRenderedFirstFrame），不是 STATE_READY：READY 只说缓冲够播，
+    //     上面那层没画面也是一整块不透明的黑，alpha 涨多少就黑多少 —— 观众看到的就是"闪黑"。
+    //  6. 热身没赶上 / 片长未知 / 播放器出错 → 撤掉第二路，硬切。宁可少一次特效，不能让大屏黑一下。
 
     /** 一格的播放设置；全默认 = 不叠化 + 顺序循环（与云端 playSettingsValue 的"默认不落键"同口径） */
     private class PlaySettings(
@@ -3815,6 +3822,11 @@ class MainActivity : AppCompatActivity() {
     ) {
         var animator: ValueAnimator? = null
         var fading = false
+        /**
+         * 第二路有没有真把一帧画进那块 TextureView。STATE_READY 只说明"缓冲够、能播"，
+         * 不保证画面已经落上来 —— 而淡入期间上面这层是不透明的，黑屏也算"一层"，alpha 一样会把它淡上来。
+         */
+        var firstFrameRendered = false
     }
 
     /**
@@ -3854,7 +3866,11 @@ class MainActivity : AppCompatActivity() {
         canonicalJson(scenes.optJSONObject("A")?.opt("play_settings")) + "|" +
             canonicalJson(scenes.optJSONObject("B")?.opt("play_settings"))
 
-    /** 有叠化要巡检、有同步组要校正、或还有窗子被摁着等慢窗时才需要这颗 100ms 闹钟；都没有就停掉，别白烧主线程 */
+    /**
+     * 有叠化要巡检、有同步组要校正、或还有窗子被摁着等慢窗时才需要这颗 100ms 闹钟；都没有就停掉，别白烧主线程。
+     * 注意这里"停"是暂时的：判据窗正在换片凝滞时 syncGroupsWithCorrection 判 false，闹钟跟着收摊，
+     * 等它回到 READY 由播放器回调（createVideoWindowView 里的 onEvents）重新排上 —— 别把收摊理解成"这组不用管了"。
+     */
     private fun playTickNeeded(): Boolean =
         windowFades.isNotEmpty() || videoSurfaces.values.any { it.settings.dissolve } ||
             syncGroupsWithCorrection() || syncHolds.isNotEmpty()
@@ -3895,10 +3911,12 @@ class MainActivity : AppCompatActivity() {
             if (fade == null) {
                 if (remaining <= ps.dissolveMs + PREROLL_WARMUP_MS) beginWindowFade(winId, surf, player)
             } else if (!fade.fading) {
-                // 第二路还没解码出首帧就起淡入 = 淡上来一块黑；宁可等正片滚过去再硬切
-                if (remaining <= ps.dissolveMs && fade.incoming.playbackState == Player.STATE_READY &&
-                    groupFadeGateOpen(surf.folderKey)) {
-                    startWindowFade(winId, fade, ps)
+                // 第二路还没解码出首帧就起淡入 = 淡上来一块黑；宁可等正片滚过去再硬切。
+                // READY 挡不住这种黑：它只保证缓冲够播，不保证那块 TextureView 上已经有画面，
+                // 而叠化那层是不透明铺在正片上面的，alpha 涨多少就压多少黑下去。
+                if (remaining <= ps.dissolveMs && fade.firstFrameRendered &&
+                    fade.incoming.playbackState == Player.STATE_READY && groupFadeGateOpen(surf.folderKey)) {
+                    startWindowFade(winId, fade, ps, remaining)
                 } else if (now - fade.bornAt > PREROLL_MAX_MS) {
                     cancelWindowFade(winId, "预卷超时")
                 }
@@ -3945,28 +3963,43 @@ class MainActivity : AppCompatActivity() {
             volume = 0f
             setVideoTextureView(view)
             setMediaItems(rotated)
-            prepare()
         }
+        // 监听闭包只认这一个 fade 实例：交接成功后第二路升为正片、监听还挂在它身上，
+        // 之后每只片子的首帧不能再顺手点亮下一轮叠化的标记
+        var born: WindowFade? = null
         incoming.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 logToFile("窗口 $winId 叠化预卷失败: ${error.errorCodeName} ${error.message ?: ""}", "WARN", "PLAYBACK", "DISSOLVE")
                 mqttHandler.post { cancelWindowFade(winId, "预卷播放器出错") }
             }
+            override fun onRenderedFirstFrame() {
+                born?.firstFrameRendered = true
+            }
         })
-        windowFades[winId] = WindowFade(incoming, view, player, surf.texture, android.os.SystemClock.elapsedRealtime(), listener)
+        val fade = WindowFade(incoming, view, player, surf.texture, android.os.SystemClock.elapsedRealtime(), listener)
+        windowFades[winId] = fade
+        born = fade
+        // prepare 放在监听之后：首帧回调只认已登记的监听，早一步 prepare 会把这一帧漏成"永远没首帧"，
+        // 那这扇窗从此每次都退化成硬切，还一行日志都不留
+        incoming.prepare()
         // 新挂上来的这块也要套同一份截取/旋转/镜像，否则淡到一半画面会突然错位
         applyTransformWhenReady(surf.container, surf.winJson)
         logToFile("窗口 $winId 叠化预卷：下一只开始热身（留 ${PREROLL_WARMUP_MS}ms）", "INFO", "PLAYBACK", "DISSOLVE")
     }
 
-    /** 起淡入：上面那路 alpha 0→1，音量同步交叉（底下正片保持不透明，这就是交叉叠化） */
-    private fun startWindowFade(winId: String, fade: WindowFade, ps: PlaySettings) {
+    /**
+     * 起淡入：上面那路 alpha 0→1，音量同步交叉（底下正片保持不透明，这就是交叉叠化）。
+     * remainingMs = 起这一刻正片还剩多少，动画就按它定长：照 dissolve_ms 定长会被片尾抢先截断
+     * （巡检 100ms 一跳，淡入最多晚起 100ms，实测 188 次收尾里 159 次都是「正片已滚到下一只」），
+     * 最后一瞬从九成直接跳到满 —— 观众看到的不是 1 秒交叉，是 0.9 秒交叉加一次小闪跳。
+     */
+    private fun startWindowFade(winId: String, fade: WindowFade, ps: PlaySettings, remainingMs: Long) {
         // 闸门放行 = 组里最慢那扇也到自己的淡入点了：把正片从"等慢窗"的停帧里放开，两路一起走完这段
         releaseSyncHold(winId)
         fade.fading = true
         fade.incoming.playWhenReady = true
         val anim = ValueAnimator.ofFloat(0f, 1f)
-        anim.duration = ps.dissolveMs
+        anim.duration = remainingMs.coerceAtLeast(1L)
         // 线性：缓动会让中段两路都半透明，画面整体发灰
         anim.interpolator = LinearInterpolator()
         anim.addUpdateListener {
@@ -3980,7 +4013,7 @@ class MainActivity : AppCompatActivity() {
         })
         fade.animator = anim
         anim.start()
-        logToFile("窗口 $winId 叠化开始（${ps.dissolveMs}ms）", "INFO", "PLAYBACK", "DISSOLVE")
+        logToFile("窗口 $winId 叠化开始（实际 ${anim.duration}ms，设定 ${ps.dissolveMs}ms）", "INFO", "PLAYBACK", "DISSOLVE")
     }
 
     /**
