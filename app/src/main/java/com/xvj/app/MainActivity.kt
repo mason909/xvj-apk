@@ -3287,16 +3287,17 @@ class MainActivity : AppCompatActivity() {
         val grp = ShareGroup(folderId, leaderId, container, canvas, ids)
         shareGroups[folderId] = grp
         for (winId in ids) winShareGroup[winId] = grp
-        // 一路解码器喂一块画布：素材分辨率变了（4K 混 1080p）由 VideoListener 报给离屏纹理，
-        // 尺寸不落对，MediaCodec 就可能按 1x1 起流水线
+        // 一路解码器喂一块画布。解码端的 Surface 要等画布拿到 TextureView 的 st、建好 GL 上下文
+        // 才诞生（比这里晚），所以交接走回调；素材分辨率变了（4K 混 1080p）由 VideoSize 回调报给
+        // 离屏纹理，尺寸不落对，MediaCodec 就可能按 1x1 起流水线
         val player = ExoPlayer.Builder(this).setLoadControl(localBufferLoadControl()).build().apply {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
-            setVideoSurface(canvas.decoderSurface)
-            addVideoListener(object : Player.VideoListener {
-                override fun onVideoSizeChanged(videoSize: VideoSize) { canvas.setDecoderSize(videoSize.width, videoSize.height) }
-            })
         }
+        canvas.onDecoderSurface = { surf -> player.setVideoSurface(surf) }
+        player.addListener(object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) { canvas.setDecoderSize(videoSize.width, videoSize.height) }
+        })
         armWindowLogger(leaderId, player)
         windowPlayers[leaderId] = player
         for (p in ordered) {

@@ -39,10 +39,10 @@ import java.util.concurrent.TimeUnit
  *  - 取景或旋转让采样越出纹理边界时按夹边取样（边缘拉伸），原来是容器黑底。
  * 单窗房间完全不走这条路，画面链路与改动前逐字节一致。
  *
- * 【线程】一个视图一条 GL HandlerThread + 一个 EGL 上下文；解码纹理 attach 到这个上下文，
- * updateTexImage 只在这条线程上调。几何改动来自主线程（synchronized 交接，下一帧自然生效）。
- * TextureView 那块承载用的 SurfaceTexture 会随后台/失焦销毁、回前台重建，所以 GL 线程与 EGL
- * 跟着它拆了再建；喂解码器的那块离屏纹理不属于 TextureView，只在 shutdown 里交还。
+ * 【线程】一个视图一条 GL HandlerThread + 一个 EGL 上下文，两者都活到 shutdown。喂解码器的那块
+ * 离屏 SurfaceTexture 就长在这个上下文里，所以它不随 TextureView 承载用的 st 生灭：后台/失焦时
+ * 框架收掉 st，我们只摘掉对应那层窗口表面；回前台再挂一块新的，解码端全程不必重来。
+ * updateTexImage 只在 GL 线程上调；几何改动来自主线程（synchronized 交接，下一帧自然生效）。
  */
 class ShareCanvasView(context: Context) : TextureView(context), TextureView.SurfaceTextureListener {
 
@@ -61,9 +61,32 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
         val flip: String
     )
 
-    /** 解码器写入的那张纹理的产出端。MainActivity 用 decoderSurface 喂唯一那一路 ExoPlayer */
-    val decoderTexture: SurfaceTexture = SurfaceTexture()
-    val decoderSurface: Surface = Surface(decoderTexture)
+    /**
+     * 解码器写入的离屏纹理与它的产出端。只能在 GL 线程上建（构造函数要一个当前上下文里的纹理名），
+     * 建好之后一路用到 shutdown；主线程只读 decoderSurface。
+     */
+    @Volatile
+    private var decoderTexture: SurfaceTexture? = null
+
+    /** GL 线程建好之后由主线程读；null = 画布还没拿到过 TextureView 的 st，也就还没有解码端 */
+    @Volatile
+    var decoderSurface: Surface? = null
+        private set
+
+    @Volatile
+    private var surfaceCb: ((Surface) -> Unit)? = null
+
+    /**
+     * 解码端就绪后把 Surface 交给那唯一一路 ExoPlayer（画布可见才有，所以是回调不是取值）。
+     * 一律回主线程：赋值时若已就绪也补一次，免得哪天构造顺序反过来把 Surface 丢掉。
+     */
+    var onDecoderSurface: ((Surface) -> Unit)?
+        get() = surfaceCb
+        set(value) {
+            surfaceCb = value
+            val s = decoderSurface
+            if (value != null && s != null) post { value(s) }
+        }
 
     private val lock = Any()
     private var members: List<Member> = emptyList()
@@ -71,12 +94,15 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
     private var glThread: HandlerThread? = null
     private var glHandler: Handler? = null
     /** 只在 shutdown 里置真 = 永久收摊；TextureView 的 st 销毁重建不算，画布要能在下一次 available 复活 */
-    private var released = false
+    @Volatile private var released = false
 
     // 以下全部只在 GL 线程上碰
     private var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
+    private var eglConfig: EGLConfig? = null
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+    /** 着色器/纹理/解码端建好过一次 —— 上下文常驻，所以只建一次 */
+    private var prepared = false
     private var program = 0
     private var locPosition = 0
     private var locTexCoord = 0
@@ -84,12 +110,18 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
     private var locStMatrix = 0
     private var locTexture = 0
     private var oesTexture = 0
-    private var attached = false
+    /** 真取到过一帧才画：在此之前变换矩阵还没有效值，画出来是垃圾 */
+    private var hasFrame = false
     private var vertexBuf: FloatBuffer? = null
     private val stMatrix = FloatArray(16)
 
-    private val frameListener = SurfaceTexture.OnFrameAvailableListener { glHandler?.post(drawTick) }
     private val drawTick = Runnable { drawFrame() }
+    /** 1 参重载会在任意线程回调（24/25 只能用那个），所以这个标志得跨线程可见 */
+    @Volatile private var framePending = false
+    private val frameListener = SurfaceTexture.OnFrameAvailableListener {
+        framePending = true
+        glHandler?.post(drawTick)
+    }
 
     init {
         // 透明承载：并集矩形里没被成员盖住的区域要透出下层窗口，不能由本层涂黑
@@ -105,16 +137,19 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
 
     /** 主线程：解码分辨率到位后告诉离屏纹理，MediaCodec 按它分配输出缓冲 */
     fun setDecoderSize(width: Int, height: Int) {
-        if (width > 0 && height > 0) decoderTexture.setDefaultBufferSize(width, height)
+        if (width > 0 && height > 0) decoderTexture?.setDefaultBufferSize(width, height)
     }
 
     override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
         if (released) return
-        val t = HandlerThread("xvj-share-gl").also { it.start() }
-        glThread = t
-        val h = Handler(t.looper)
-        glHandler = h
-        h.post { initGl(st, width, height) }
+        // GL 线程与上下文只建一次：随 st 生灭的只有窗口表面那一层（见 unbindWindow）
+        var t = glThread
+        if (t == null) {
+            t = HandlerThread("xvj-share-gl").also { it.start() }
+            glThread = t
+            glHandler = Handler(t.looper)
+        }
+        glHandler?.post { bindWindow(st, width, height) }
     }
 
     override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
@@ -122,11 +157,18 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
     }
 
     override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-        // 后台/失焦时 TextureView 会收掉自己那块 st，回到前台再给一块新的：这里只跟着拆 GL（线程和 EGL
-        // 都绑在这块 st 上），不动解码端 —— 离屏纹理与它的 Surface 属于本视图，一旦 release，
-        // 那一路 ExoPlayer 的输出端就永久死了，回前台再也接不上（表现是"切一下后台画面再也不动了"）
-        if (!released) teardownGl()
-        return true
+        // 后台/失焦时 TextureView 会收掉自己那块 st，回前台再给一块新的。这里只摘窗口表面，
+        // 不动上下文、更不动解码端 —— 那一路 ExoPlayer 的输出端一旦 release 就永久死了，
+        // 回前台再也接不上（表现是"切一下后台画面再也不动了"）。
+        // 返回 false 是把 st 的回收排到解绑之后：框架抢在 GL 线程之前 release，
+        // 等于从还挂着它的 EGLSurface 底下把窗口抽掉。
+        val h = glHandler
+        if (released || h == null) return true
+        h.post {
+            unbindWindow()
+            try { st.release() } catch (e: Exception) { }
+        }
+        return false
     }
 
     override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
@@ -139,13 +181,16 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
         if (released) return
         released = true
         teardownGl()
-        try { decoderSurface.release() } catch (e: Exception) { }
+        val s = decoderSurface
+        decoderSurface = null
+        decoderTexture = null
+        try { s?.release() } catch (e: Exception) { }
     }
 
     /**
      * 收掉 GL 线程上的全部资源再停线程。从主线程调用时用一次同步等待：EGL 上下文只能由创建它的线程销毁，
      * 而解码器那边随时可能又来写帧，不能让它对着一个已经作废的上下文继续跑。
-     * 只在主线程调用（TextureView 的两个生命周期回调都在这里）。
+     * 只在主线程调用（shutdown 与 TextureView 的生命周期回调都在这里）。
      */
     private fun teardownGl() {
         val h = glHandler
@@ -162,12 +207,48 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
 
     // ================= GL 线程 =================
 
-    private fun initGl(st: SurfaceTexture, viewWidth: Int, viewHeight: Int) {
+    /**
+     * 把 TextureView 新给的承载 st 挂到常驻上下文上。上下文与解码端只建一次；
+     * 之后每回一次前台，换的只是窗口表面这一层。
+     */
+    private fun bindWindow(st: SurfaceTexture, viewWidth: Int, viewHeight: Int) {
+        // 拆组与 st 到达可能在同一条队列上排了个前后：排在 shutdown 之后的这一颗直接作废，
+        // 不然会把刚 terminate 的上下文重新建起来，变出一块没人收的僵尸画布
+        if (released) return
         st.setDefaultBufferSize(viewWidth, viewHeight)
+        if (!ensureContext()) return
+        val d = display
+        val cfg = eglConfig ?: return
+        val s = EGL14.eglCreateWindowSurface(d, cfg, st, intArrayOf(EGL14.EGL_NONE), 0)
+        if (s == EGL14.EGL_NO_SURFACE) {
+            Log.e(TAG, "共享画布：创建窗口表面失败 " + EGL14.eglGetError())
+            return
+        }
+        if (!EGL14.eglMakeCurrent(d, s, s, eglContext)) {
+            Log.e(TAG, "共享画布：eglMakeCurrent 失败 " + EGL14.eglGetError())
+            EGL14.eglDestroySurface(d, s)
+            return
+        }
+        eglSurface = s
+        if (!prepared && !prepare()) return
+        drawFrame()
+    }
+
+    /** 承载 st 被框架收走：先摘 current 再毁这一层的 EGLSurface。上下文、解码端、着色器全部留着 */
+    private fun unbindWindow() {
+        if (eglSurface == EGL14.EGL_NO_SURFACE) return
+        EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+        EGL14.eglDestroySurface(display, eglSurface)
+        eglSurface = EGL14.EGL_NO_SURFACE
+    }
+
+    /** 幂等。EGL 显示/配置/上下文都不需要窗口，所以解码端能在画布可见之前先备好 */
+    private fun ensureContext(): Boolean {
+        if (eglContext != EGL14.EGL_NO_CONTEXT) return true
         val d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-        if (d == EGL14.EGL_NO_DISPLAY) { Log.e(TAG, "共享画布：eglGetDisplay 失败"); return }
+        if (d == EGL14.EGL_NO_DISPLAY) { Log.e(TAG, "共享画布：eglGetDisplay 失败"); return false }
         val ver = IntArray(2)
-        if (!EGL14.eglInitialize(d, ver, 0, ver, 1)) { Log.e(TAG, "共享画布：eglInitialize 失败"); return }
+        if (!EGL14.eglInitialize(d, ver, 0, ver, 1)) { Log.e(TAG, "共享画布：eglInitialize 失败"); return false }
         display = d
         val cfgAttrs = intArrayOf(
             EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
@@ -178,23 +259,24 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
         val cfgs = arrayOfNulls<EGLConfig>(1)
         val got = IntArray(1)
         if (!EGL14.eglChooseConfig(d, cfgAttrs, 0, cfgs, 0, 1, got, 0) || got[0] < 1) {
-            Log.e(TAG, "共享画布：找不到 RGBA8888 ES2 配置"); EGL14.eglTerminate(d); return
+            Log.e(TAG, "共享画布：找不到 RGBA8888 ES2 配置")
+            EGL14.eglTerminate(d); display = EGL14.EGL_NO_DISPLAY; return false
         }
         val cfg = cfgs[0]!!
         eglContext = EGL14.eglCreateContext(d, cfg, EGL14.EGL_NO_CONTEXT,
             intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
-        if (eglContext == EGL14.EGL_NO_CONTEXT) { Log.e(TAG, "共享画布：创建上下文失败"); EGL14.eglTerminate(d); return }
-        eglSurface = EGL14.eglCreateWindowSurface(d, cfg, st, intArrayOf(EGL14.EGL_NONE), 0)
-        if (eglSurface == EGL14.EGL_NO_SURFACE) {
-            Log.e(TAG, "共享画布：创建窗口表面失败 " + EGL14.eglGetError())
-            EGL14.eglDestroyContext(d, eglContext); eglContext = EGL14.EGL_NO_CONTEXT; EGL14.eglTerminate(d); return
+        if (eglContext == EGL14.EGL_NO_CONTEXT) {
+            Log.e(TAG, "共享画布：创建上下文失败")
+            EGL14.eglTerminate(d); display = EGL14.EGL_NO_DISPLAY; return false
         }
-        if (!EGL14.eglMakeCurrent(d, eglSurface, eglSurface, eglContext)) {
-            Log.e(TAG, "共享画布：eglMakeCurrent 失败 " + EGL14.eglGetError())
-            releaseGl(); return
-        }
+        eglConfig = cfg
+        return true
+    }
+
+    /** 只在 GL 线程、上下文已 current 时调用一次：着色器 + 外部纹理 + 解码端，然后把 Surface 交给播放器 */
+    private fun prepare(): Boolean {
         program = buildProgram()
-        if (program == 0) { releaseGl(); return }
+        if (program == 0) return false
         locPosition = GLES20.glGetAttribLocation(program, "aPosition")
         locTexCoord = GLES20.glGetAttribLocation(program, "aTexCoord")
         locParam = GLES20.glGetAttribLocation(program, "aParam")
@@ -209,21 +291,23 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
         // 旋转 90°/270° 或裁切推到边界外时，采样会越出纹理边缘：夹边，别绕回去取到另一头的画面
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        try {
-            decoderTexture.attachToGLContext(oesTexture)
-            attached = true
-        } catch (e: IllegalArgumentException) {
-            Log.e(TAG, "共享画布：解码纹理 attach 失败", e)
-        }
-        decoderTexture.getTransformMatrix(stMatrix)
+        // 这块离屏纹理构造函数就要一个当前上下文里的纹理名，所以解码端只能生在 GL 线程；
+        // 生在这里、死在 shutdown，中间不随承载 st 的生灭搬家（不用 attach/detach 换来换去）
+        val dec = SurfaceTexture(oesTexture)
+        decoderTexture = dec
+        prepared = true
         // 帧通知直接在 GL 线程落地（API 26 起才有带 Handler 的重载）；24/25 退回旧签名，
         // 由 frameListener 自己 post 到同一条线程 —— 两条路画的都是"最新一帧"，重复触发无害
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            decoderTexture.setOnFrameAvailableListener(frameListener, glHandler)
+        val h = glHandler
+        if (h != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            dec.setOnFrameAvailableListener(frameListener, h)
         } else {
-            decoderTexture.setOnFrameAvailableListener(frameListener)
+            dec.setOnFrameAvailableListener(frameListener)
         }
-        drawFrame()
+        val surf = Surface(dec)
+        decoderSurface = surf
+        post { surfaceCb?.invoke(surf) }
+        return true
     }
 
     private fun drawFrame() {
@@ -238,11 +322,14 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
         val ew = ws[0]
         val eh = hs[0]
         if (ew <= 0 || eh <= 0) return
-        if (attached) {
-            // 没有新帧时它只是不动，重复调（几何改动触发的补画）因此是安全的
-            try { decoderTexture.updateTexImage() } catch (e: Exception) { Log.e(TAG, "共享画布：取帧失败", e) }
-            decoderTexture.getTransformMatrix(stMatrix)
+        val dec = decoderTexture
+        if (dec != null && framePending) {
+            framePending = false
+            try { dec.updateTexImage(); hasFrame = true } catch (e: Exception) { Log.e(TAG, "共享画布：取帧失败", e) }
+            dec.getTransformMatrix(stMatrix)
         }
+        // 一帧都还没取到就不画：变换矩阵还没有效值，画出来是垃圾。什么都不画等于透明，下层照常露出
+        if (!hasFrame) return
         val buf = ensureCapacity(list.size) ?: return
         val efx = 2f / ew
         val efy = 2f / eh
@@ -323,11 +410,10 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
 
     private fun ensureCapacity(memberCount: Int): FloatBuffer? {
         val need = memberCount * 6 * FLOATS_PER_VERTEX
-        var buf = vertexBuf
-        if (buf == null || buf.capacity() < need) {
-            buf = ByteBuffer.allocateDirect(need * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-            vertexBuf = buf
-        }
+        val old = vertexBuf
+        val buf = if (old != null && old.capacity() >= need) old else ByteBuffer.allocateDirect(need * 4)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer()
+        vertexBuf = buf
         buf.limit(need)
         buf.position(0)
         return buf
@@ -366,20 +452,26 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
         return s
     }
 
-    /** 只在 GL 线程调用：先趁上下文还在Current 时清 GL 对象，再摘 current、毁 surface/context、terminate */
+    /** 只在 GL 线程调用：趁上下文还 current 时清 GL 对象，再摘 current、毁 surface/context、terminate */
     private fun releaseGl() {
         if (display == EGL14.EGL_NO_DISPLAY) return
-        if (attached) {
-            try { decoderTexture.detachFromGLContext() } catch (e: Exception) { }
-            attached = false
+        val dec = decoderTexture
+        decoderTexture = null
+        prepared = false
+        hasFrame = false
+        framePending = false
+        if (dec != null) {
+            try { dec.setOnFrameAvailableListener(null) } catch (e: Exception) { }
+            // 趁上下文还活着先解绑：纹理名马上要删，留着一个指向死纹理的 attach 只是给驱动找茬
+            try { dec.detachFromGLContext() } catch (e: Exception) { }
         }
-        try { decoderTexture.setOnFrameAvailableListener(null) } catch (e: Exception) { }
         if (program != 0) { GLES20.glDeleteProgram(program); program = 0 }
         if (oesTexture != 0) { GLES20.glDeleteTextures(1, intArrayOf(oesTexture), 0); oesTexture = 0 }
         EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
         if (eglSurface != EGL14.EGL_NO_SURFACE) { EGL14.eglDestroySurface(display, eglSurface); eglSurface = EGL14.EGL_NO_SURFACE }
         // 上下文必须由"不再 current"的线程销毁，否则 EGL_BAD_ACCESS，毁不掉就一直占着驱动资源
         if (eglContext != EGL14.EGL_NO_CONTEXT) { EGL14.eglDestroyContext(display, eglContext); eglContext = EGL14.EGL_NO_CONTEXT }
+        eglConfig = null
         EGL14.eglTerminate(display)
         display = EGL14.EGL_NO_DISPLAY
     }
