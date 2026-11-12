@@ -4118,7 +4118,10 @@ class MainActivity : AppCompatActivity() {
     /**
      * 这一格的试播落在哪些窗口 —— 认本机当前的 folderKey，不认云端算好的 win_ids：
      * 云端按库里那份配置算窗口，设备却可能刚应用过一版新的，那一刻"谁在播这一格"只有设备知道。
-     * folderKey 还没落上（默认窗口刚建、配置刚改过）才退回云端点名的那几扇兜底。
+     * folderKey 还没落上（默认窗口刚建、配置刚改过）才退回云端点名的那几扇兜底，
+     * 但兜底也要按幕筛过（2026-11-12 用户定调）：一只片子只有一个物理目录、只属于一幕，
+     * 另一幕那几扇窗跟这一格没关系，不该被接管 —— 曾经云端把两幕一起点进来，第二幕来源的窗
+     * 也跟着播了第一幕的素材。
      */
     private fun previewTargets(folderId: String, winIds: List<String>): List<String> {
         val named = winIds.filter { windowPlayers.containsKey(it) }
@@ -4126,7 +4129,33 @@ class MainActivity : AppCompatActivity() {
         val inGroup = videoSurfaces.keys.filter {
             windowPlayers.containsKey(it) && videoSurfaces[it]?.folderKey == folderId
         }
-        return if (inGroup.isNotEmpty()) inGroup else named
+        if (inGroup.isNotEmpty()) return inGroup
+        val scene = sceneOfFolder(folderId) ?: return named   // 无前缀的 id 认不出归属，不拦
+        return named.filter { sceneOfWindow(it) == scene }
+    }
+
+    /** "A02" → "A"；"02" 这类无前缀 id 与非法形态 → null（= 幕次未知，调用方按不拦处理） */
+    private fun sceneOfFolder(folderId: String): String? =
+        if (folderId.length == 3 && folderId[0].isLetter()) folderId[0].uppercaseChar().toString() else null
+
+    /**
+     * 一扇窗属于哪一幕：先认本机正在播的那一格（resolveWindowFolder 出来的 folderKey 必带幕前缀），
+     * 还没落上（这一格无素材、HDMI 窗、默认窗刚建）再回配置查 content.type —— 那是设备自己的生效配置，
+     * 比云端载荷可信。两边都认不出（不在配置里 / HDMI / 配置没到）返回 null，调用方按"不是这一幕"处理。
+     */
+    private fun sceneOfWindow(winId: String): String? {
+        sceneOfFolder(videoSurfaces[winId]?.folderKey ?: "")?.let { return it }
+        val scenes = appliedScenes ?: return null
+        for (k in listOf("A", "B")) {
+            val arr = scenes.optJSONObject(k)?.optJSONArray("windows") ?: continue
+            for (i in 0 until arr.length()) {
+                val w = arr.optJSONObject(i) ?: continue
+                if (w.optString("id") != winId) continue
+                val type = w.optJSONObject("content")?.optString("type", "")?.uppercase()
+                return if (type == "SCENE_$k") k else null
+            }
+        }
+        return null
     }
 
     /** 单扇窗的接管动作：全局校验已由 startGroupPreview 做完，这里只换这只窗自己的 playlist */
