@@ -12,7 +12,9 @@
  * 【A-06】素材同步（requestRoomMaterialSync / runRoomSyncLoop / doRoomMaterialSync / fetchRoomMaterials /
  *         syncSceneFolders / syncFolderWithIds / runDownloadPlan / downloadWithETag / cachedMd5 /
  *         clearMaterialCache / deleteMaterialFile）
- * 【A-07】窗口配置 & 渲染（applySceneConfigs / scenesFingerprint / applyLiveWindowUpdate / createWindowView / playFolderInWindow）
+ * 【A-07】窗口配置 & 渲染（applySceneConfigs / scenesFingerprint / applyLiveWindowUpdate / createWindowView / playFolderInWindow；
+ *         同格 ≥2 扇共享一路解码那层见 enabledWindowsSorted / createShareGroup / refreshShareGroup / destroyShareGroups，
+ *         GL 画布本体在 ShareCanvasView.kt，单窗与共享那一路的日志共用 armWindowLogger）
  * 【A-08】窗口释放（releaseAllWindows）
  * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk / retryPendingInstall）
  * 【A-10】系统 UI（hideSystemUI）
@@ -64,7 +66,17 @@
  *     （用户定调：现场先要普通切换稳，特效另立项再做）。存量载荷里残留的 dissolve / dissolve_ms
  *     键本机不再读，等于自动忽略，不必清库
  *   - 改设置不动映射 → 服务端发 update_windows 轻通道；但设置不在窗口 content 里，内容签名比不出它，
- *     所以本机另记 appliedPlaySettingsJson，真变了就判成结构变化回退全量重建（视频会从头播）
+ *     所以本机另记 appliedWindowOrder + appliedPlaySettingsJson，真变了就判成结构变化回退全量重建（视频会从头播）
+ *
+ * 同格共享解码（任务 #175，改窗口渲染前必读）：
+ *   - 同一格（folderId）挂了 ≥2 扇视频窗时，本机只起 **一路** ExoPlayer：解码输出落进一块离屏
+ *     SurfaceTexture，由 ShareCanvasView 在 GL 线程按每扇窗自己的位置/尺寸/取景/旋转/镜像/透明度/亮度
+ *     把同一张纹理各画一遍。窗口数不再线性放大解码开销 —— 6 扇同格实测散差 3.5s、混 4K 那路凝滞 4.8s，
+ *     同步校正在第一次交接就熔断，就是这个结构问题
+ *   - 只有这一种情形走这条路：单窗（含 1 扇窗的格子）链路逐字节照旧，不必担心回归
+ *   - 组的基准窗 = 组内 ID 最小那扇（与 groupClock / 判据窗同一口径），播放器记在 windowPlayers[leaderId]，
+ *     成员窗没有播放器；因此同步巡检对共享格整组跳过（散差按构造是 0），试播/墙板/日志都按 winShareGroup 换算成真实扇数
+ *   - 代价：整组是一块画布（成员矩形并集），跨组 z 交错没了；音频只剩一路
  *
  * 素材文件校验契约（改同步前必读）：
  *   - 云端 materials.md5 存的是 **faststart 重封装之后** 的字节摘要（服务端上传时就地重写文件），
@@ -112,6 +124,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
 import android.widget.FrameLayout
@@ -279,6 +292,20 @@ class MainActivity : AppCompatActivity() {
     private val folderAlignStrikes = mutableMapOf<String, Int>()
     /** 拽不齐、已经退出校正的格子：不 seek、不减速、不摁住，直到有窗子重新进这一格 */
     private val parkedFolders = mutableSetOf<String>()
+    /**
+     * folderKey -> 同格共享解码单元（任务 #175）：以前这一格挂几扇窗就起几路解码，
+     * 交接延迟与凝滞按窗数线性放大（6 扇实测散差 3.5s），而解出来的画面是一模一样的。
+     * 现在 ≥2 扇同格只起一路播放器，画面由一块 GL 画布按每扇窗自己的几何画 N 遍。
+     */
+    private val shareGroups = mutableMapOf<String, ShareGroup>()
+    /** winId -> 它所属的共享单元：跟随窗也在这张表里（它们没有播放器，切格时靠它把账记回整组） */
+    private val winShareGroup = mutableMapOf<String, ShareGroup>()
+    /**
+     * 屏上那份配置的生效窗口次序（按 z 升序、含共享组的跟随窗）。
+     * 实时更新的"窗口增删/换序"判据原来是从 flSurface 的孩子反推的 —— 共享组是一块画布代表 N 扇窗，
+     * 按孩子数就永远数不齐，每一轮轻量更新都会误判成结构变化而白重建一次（视频从头播）。
+     */
+    private var appliedWindowOrder: List<String> = emptyList()
     /** 同步组巡检间隔：100ms 足够在交接点前把超前的那扇摁住，再密就是白烧主线程 */
     private val PLAY_TICK_MS = 100L
     /** 同步组内两扇窗的进度差在容忍带内就不动手：50ms 以内肉眼看不出，来回纠正反而抖 */
@@ -911,10 +938,21 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val allWindows = mergeSceneWindows(scenes)
-        windowPlayers.keys.toList().forEach { winId ->
-            val content = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }
-                .find { it.optString("id") == winId }?.optJSONObject("content") ?: return@forEach
-            if (!content.optBoolean("follow", false)) return@forEach
+        val follows = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }
+            .map { Pair(it.optString("id"), it.optJSONObject("content") ?: JSONObject()) }
+            .filter { it.second.optBoolean("follow", false) && isVideoContentType(it.second) }
+        // 共享组必须整组同格才成立：成员被编号分到不同格子（或某一格解析不出素材）时组的构成就变了，
+        // 原地重排做不到（解码路数跟着变），只能回全量重建。墙板切格本来就低频。
+        if (shareGroups.isNotEmpty() && follows.isNotEmpty()) {
+            val newFolder = follows.associate { (id, content) -> id to resolveWindowFolder(scenes, content, id) }
+            val broken = shareGroups.values.any { grp -> grp.members.map { newFolder[it] }.distinct().size > 1 }
+            if (broken) {
+                logToFile("墙板编号 $number 会让共享解码组的成员分家，回退全量重建", "INFO", "WALLPANEL", "REBUILD")
+                applySceneConfigs(scenes, force = true)
+                return
+            }
+        }
+        for ((winId, content) in follows) {
             if (previews.containsKey(winId)) restorePreviewGroup(winId, "墙板编号切换")
             val folderId = resolveWindowFolder(scenes, content, winId)
             if (folderId == null) {
@@ -2855,6 +2893,8 @@ class MainActivity : AppCompatActivity() {
         windowPlayers.values.forEach { it.release() }
         windowPlayers.clear()
         videoSurfaces.clear()
+        // 共享解码单元紧跟播放器之后拆：那块 Surface 底下就是解码器正在写的纹理，先放播放器再收画布
+        destroyShareGroups()
         // 同步组那几本账随窗口一起清：留着摁住记录，下一轮就会去放行一扇新起的、根本没被我们摁过的窗
         syncHolds.clear()
         syncAlignAt.clear()
@@ -2891,27 +2931,36 @@ class MainActivity : AppCompatActivity() {
             allWindows.put(defaultWin)
             Log.d(TAG, "所有场景无窗口，自动创建默认全屏窗口1 -> SCENE_A")
         } else {
-            // 按 zIndex 升序创建所有窗口（A 和 B 的窗口都加载）
-            val sorted = sortWindowsByZ(allWindows)
-            for (i in 0 until sorted.length()) {
-                val w = sorted.getJSONObject(i)
-                val winId = w.optString("id", "win_$i")
-                createWindowView(winId, w)
+            // 生效窗口按 z 升序（id 口径与实时更新共用 enabledWindowsSorted，两边才不会比出假结构变化）
+            val plan = enabledWindowsSorted(scenes).map { (winId, w) ->
+                val content = w.optJSONObject("content") ?: JSONObject()
+                // 播哪一格先解析出来：同格 ≥2 扇要在起播放器之前就认成一组，等各路解码各建好了再合就晚了
+                PlanWindow(winId, w, content, resolveWindowFolder(scenes, content, winId))
             }
-        }
-
-        // 每个窗口根据自身 content.type 播放对应文件夹（SCENE_A/SCENE_B 指向各自场景的素材）
-        windowPlayers.forEach { (winId, player) ->
-            val winObj = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }.find { it.optString("id") == winId }
-            val content = winObj?.optJSONObject("content") ?: JSONObject()
-            val folderId = resolveWindowFolder(scenes, content, winId)
-            if (folderId != null && player != null) {
-                playFolderInWindow(winId, folderId, scenes)
+            // 纯色 / HDMI 窗口本来就零解码，不掺进共享组
+            val groupsByFolder = plan.filter { isVideoContentType(it.content) && it.folderId != null }
+                .groupBy { it.folderId!! }
+                .filterValues { it.size >= 2 }
+            // 组的画布放在"该组最上层那扇成员"原来的 z 位置：下面的窗口照常透出来，
+            // 被并集矩形盖到的别组窗口则按这一层的 z 被压过去（共享解码的唯一取舍，见 ShareCanvasView）
+            val lastIdxOfGroup = HashMap<String, Int>()
+            for ((idx, p) in plan.withIndex()) p.folderId?.let { if (groupsByFolder.containsKey(it)) lastIdxOfGroup[it] = idx }
+            for ((idx, p) in plan.withIndex()) {
+                val fk = p.folderId
+                if (fk != null && groupsByFolder.containsKey(fk)) {
+                    if (lastIdxOfGroup[fk] == idx) createShareGroup(fk, groupsByFolder[fk]!!)
+                    continue
+                }
+                createWindowView(p.winId, p.win)
             }
+            // 每个窗口根据自身 content.type 播放对应文件夹（共享组的跟随窗在 playFolderInWindow 里自己让路）
+            for (p in plan) p.folderId?.let { playFolderInWindow(p.winId, it, scenes) }
         }
         appliedScenes = scenes
         appliedScenesFp = fp
         appliedPlaySettingsJson = playSettingsJson(scenes)
+        // 次序账与指纹同步落地（默认窗口那条兜底分支也要走到，否则实时更新会一直误判成结构变化）
+        appliedWindowOrder = enabledWindowsSorted(scenes).map { it.first }
     }
 
     /**
@@ -3037,32 +3086,34 @@ class MainActivity : AppCompatActivity() {
         if (key.startsWith(sceneKey)) key else sceneKey + key
 
     /**
+     * 屏上该有哪些窗：z 升序 → 补缺省 id（"win_位置"，位置按含隐藏窗口的完整排序数组算）→ 只留启用。
+     * 全量重建与实时更新共用这一个入口：两边各自算次序时，缺省 id 与 enabled 过滤会算出"假的"结构变化，
+     * 每一轮轻量更新都白重建一次（视频从头播）。
+     */
+    private fun enabledWindowsSorted(scenes: JSONObject): List<Pair<String, JSONObject>> {
+        val arr = sortWindowsByZ(mergeSceneWindows(scenes))
+        return (0 until arr.length()).map { idx ->
+            val w = arr.getJSONObject(idx)
+            w.optString("id", "win_$idx") to w
+        }.filter { it.second.optBoolean("enabled", true) }
+    }
+
+    /**
      * 实时窗口更新（update_windows 轻量路径）：编辑器拖动/调参的亚秒级跟随。
      * 仅几何/视觉属性变化 → 原地改 LayoutParams/alpha/遮罩/矩阵，播放器持续播放不重建；
      * 结构变化（窗口增删/内容签名/显隐/z序/播放设置）→ 回退 applySceneConfigs 全量重建。
      */
     private fun applyLiveWindowUpdate(scenes: JSONObject) {
-        val allWindows = mergeSceneWindows(scenes)
-        val desiredSorted = sortWindowsByZ(allWindows).let { arr ->
-            (0 until arr.length()).map { arr.getJSONObject(it) }.filter { it.optBoolean("enabled", true) }
-        }
-        val desiredIds = desiredSorted.map { it.optString("id") }
+        val desired = enabledWindowsSorted(scenes)
+        val desiredIds = desired.map { it.first }
 
-        // 当前 flSurface 上窗口容器的 z 序（后加入者在上层）
-        val currentIds = mutableListOf<String>()
-        flSurface?.let { fs ->
-            for (i in 0 until fs.childCount) {
-                val ch = fs.getChildAt(i)
-                for ((k, v) in windowViews) if (v === ch) { currentIds.add(k); break }
-            }
-        }
-
+        // 屏上次序读自己记的那本（applySceneConfigs 成功落地时写的），不从 flSurface 的孩子反推：
+        // 共享解码组是一块画布代表 N 扇窗，按孩子数永远数不齐，每轮轻量更新都会误判成结构变化白重建一次
         // 播放设置不在窗口 content 里，内容签名比不出它：只改顺序（随机/顺序）时必须判成结构变化回退重建，
         // 否则轻路径改改几何就返回，playlist 不重排、设置看着保存了却永远不生效
-        var structural = desiredIds != currentIds || playSettingsJson(scenes) != appliedPlaySettingsJson
+        var structural = desiredIds != appliedWindowOrder || playSettingsJson(scenes) != appliedPlaySettingsJson
         if (!structural) {
-            for (w in desiredSorted) {
-                val winId = w.optString("id")
+            for ((winId, w) in desired) {
                 if (windowContentSigs[winId] != contentSignature(w.optJSONObject("content") ?: JSONObject())) {
                     structural = true
                     break
@@ -3075,8 +3126,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        for (w in desiredSorted) {
-            val winId = w.optString("id")
+        for ((winId, w) in desired) {
+            // 窗口 JSON 先落到 surf：共享组重排画面、下一次比较都从它取最新配置。
+            // 共享组成员的几何/透明度/亮度长在 GL 画布上（一块画布代表整组），这里一律跳过，
+            // 组级重排放到循环后面做一次 —— 并集矩形要按全组最新的几何算，逐扇改会改出一半新一半旧
+            videoSurfaces[winId]?.winJson = w
+            if (winShareGroup.containsKey(winId)) continue
             val c = windowViews[winId] as? FrameLayout ?: continue
 
             val (x, y, wd, ht) = windowGeom(w)
@@ -3114,17 +3169,17 @@ class MainActivity : AppCompatActivity() {
 
             // 布局稳定后重算截取/旋转/镜像矩阵（取景与 90°/270° 预缩放都依赖视图实际尺寸）；
             // 尺寸仍为 0 时由 applyTransformWhenReady 挂一次性布局监听补做。
-            // 窗口 JSON 存进 surf 是为了后面重算矩阵时拿得到最新配置（换文件夹/更新几何后都一样）
-            videoSurfaces[winId]?.winJson = w
             val cv = c.getChildAt(0)
             if (cv != null) c.post { applyTransformWhenReady(cv, w) }
         }
+        // 共享解码组按全组最新几何重排画面（并集矩形 + 每扇窗自己的矩形）
+        for (fk in shareGroups.keys.toList()) refreshShareGroup(fk)
         // 屏上现在就是这份配置了：指纹跟着走，否则下一轮素材对账收尾会白重建一次、视频重头播
         appliedScenes = scenes
         appliedScenesFp = scenesFingerprint(scenes)
         appliedPlaySettingsJson = playSettingsJson(scenes)
         ensurePlayTicker()
-        Log.d(TAG, "applyLiveWindowUpdate: 轻量应用 ${desiredSorted.size} 个窗口")
+        Log.d(TAG, "applyLiveWindowUpdate: 轻量应用 ${desired.size} 个窗口")
     }
 
     /** 创建单个窗口视图并加入 flSurface */
@@ -3186,6 +3241,140 @@ class MainActivity : AppCompatActivity() {
         container.post { applyTransformWhenReady(view, w) }
         val cr = cropRect(w)
         Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y) opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)} crop=(${cr[0]},${cr[1]},${cr[2]},${cr[3]})")
+    }
+
+    /**
+     * 一扇窗在这份配置里的完整现场（applySceneConfigs 两趟共用：先解析、再按解析结果建视图）。
+     * folderId 为 null = 这一窗不播（没映射 / 那格空 / 纯色 / HDMI）。
+     */
+    private class PlanWindow(val winId: String, val win: JSONObject, val content: JSONObject, val folderId: String?)
+
+    /**
+     * 同格共享解码单元：一路 ExoPlayer（记在基准窗 id 上）+ 一块 GL 画布（成员矩形的并集），
+     * 画布把解码出来的同一张纹理按每扇成员窗的几何各画一遍。
+     * leaderId 取组内 ID 最小那扇 —— 与 groupClock / 巡检判据窗同一口径，不在两处各挑一个。
+     * members 按 z 升序，画布照这个次序叠（后画的在上），与原来"后加入者在上层"的观感对齐。
+     */
+    private class ShareGroup(
+        val folderKey: String,
+        val leaderId: String,
+        val container: FrameLayout,
+        val canvas: ShareCanvasView,
+        val members: List<String>
+    )
+
+    /** 这扇窗的内容是不是真素材轮播 —— 只有它谈得上共享解码（纯色/HDMI 本来就不起解码器） */
+    private fun isVideoContentType(content: JSONObject): Boolean {
+        val type = content.optString("type", "SCENE_A").uppercase()
+        return type != "HDMI" && type != "VIDEO_INPUT" && type != "COLOR"
+    }
+
+    /**
+     * 建一个共享解码单元：同格 ≥2 扇窗只起一路播放器，其余窗口既不建 TextureView 也不建播放器。
+     * 只在 applySceneConfigs（全量重建）里调用：组成员变化必然伴随窗口增删或内容变化，那两种都算结构变化，
+     * 轻量路径一律回退到这里，所以 update_windows 永远不必改组的构成。
+     * 只能在主线程调用（addView + 建播放器）。
+     */
+    private fun createShareGroup(folderId: String, items: List<PlanWindow>) {
+        val ordered = items.sortedBy { it.win.optInt("zIndex", 0) }
+        val ids = ordered.map { it.winId }
+        val leaderId = ids.sorted().first()
+        val canvas = ShareCanvasView(this)
+        val container = FrameLayout(this)
+        container.addView(canvas, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        flSurface?.addView(container, FrameLayout.LayoutParams(1, 1).apply { gravity = Gravity.TOP or Gravity.START })
+        val grp = ShareGroup(folderId, leaderId, container, canvas, ids)
+        shareGroups[folderId] = grp
+        for (winId in ids) winShareGroup[winId] = grp
+        // 一路解码器喂一块画布：素材分辨率变了（4K 混 1080p）由 VideoListener 报给离屏纹理，
+        // 尺寸不落对，MediaCodec 就可能按 1x1 起流水线
+        val player = ExoPlayer.Builder(this).setLoadControl(localBufferLoadControl()).build().apply {
+            repeatMode = Player.REPEAT_MODE_ALL
+            playWhenReady = true
+            setVideoSurface(canvas.decoderSurface)
+            addVideoListener(object : Player.VideoListener {
+                override fun onVideoSizeChanged(videoSize: VideoSize) { canvas.setDecoderSize(videoSize.width, videoSize.height) }
+            })
+        }
+        armWindowLogger(leaderId, player)
+        windowPlayers[leaderId] = player
+        for (p in ordered) {
+            // 成员共用同一块容器：windowViews 里每扇窗都指到它，摘旧视图时重复 removeView 是无害空转
+            windowViews[p.winId] = container
+            windowContentSigs[p.winId] = contentSignature(p.content)
+            videoSurfaces[p.winId] = VideoSurface(container, canvas, p.win, PlaySettings())
+        }
+        refreshShareGroup(folderId)
+        logToFile("同格 $folderId 共享解码：${ids.size} 扇窗只起 1 路播放器（基准 $leaderId，成员 ${ids.joinToString("、")}）",
+            "INFO", "WINDOW", "CREATE")
+    }
+
+    /**
+     * 按每扇成员窗最新的配置重算共享画布：容器摆到成员矩形的并集，画布内按各自几何与画面参数排 N 个矩形。
+     * 全量重建建组时调一次，update_windows 轻量路径每轮也调（编辑器拖窗、改取景、改透明度都走这里，
+     * 不必回退重建）。只能在主线程调用（读窗口配置、写 LayoutParams）。
+     */
+    private fun refreshShareGroup(folderKey: String) {
+        val grp = shareGroups[folderKey] ?: return
+        val raw = ArrayList<ShareCanvasView.Member>()
+        for (winId in grp.members) {
+            val surf = videoSurfaces[winId] ?: continue
+            val w = surf.winJson
+            val g = windowGeom(w)
+            val masterB = w.optDouble("_masterB", 1.0).toFloat().coerceIn(0f, 1f)
+            raw.add(ShareCanvasView.Member(
+                winId = winId,
+                left = g[0],
+                top = g[1],
+                width = g[2],
+                height = g[3],
+                alpha = w.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f),
+                brightness = (w.optDouble("brightness", 1.0).toFloat() * masterB).coerceIn(0f, 1f),
+                crop = cropRect(w),
+                rotation = w.optInt("rotation", 0),
+                flip = w.optString("flip", "none")
+            ))
+        }
+        if (raw.isEmpty()) return
+        var minX = raw[0].left
+        var minY = raw[0].top
+        var maxX = minX + raw[0].width
+        var maxY = minY + raw[0].height
+        for (m in raw) {
+            if (m.left < minX) minX = m.left
+            if (m.top < minY) minY = m.top
+            if (m.left + m.width > maxX) maxX = m.left + m.width
+            if (m.top + m.height > maxY) maxY = m.top + m.height
+        }
+        val cw = (maxX - minX).coerceAtLeast(1)
+        val ch = (maxY - minY).coerceAtLeast(1)
+        val p = grp.container.layoutParams as? FrameLayout.LayoutParams
+            ?: FrameLayout.LayoutParams(cw, ch).apply { gravity = Gravity.TOP or Gravity.START }
+        if (p.leftMargin != minX || p.topMargin != minY || p.width != cw || p.height != ch) {
+            p.leftMargin = minX
+            p.topMargin = minY
+            p.width = cw
+            p.height = ch
+            grp.container.layoutParams = p
+        }
+        // 成员坐标换成"画布内部像素"，画布因此可以整块挪到并集左上角
+        grp.canvas.setMembers(raw.map { it.copy(left = it.left - minX, top = it.top - minY) })
+    }
+
+    /**
+     * 拆掉所有共享单元。调用点必须紧跟在播放器 release 之后（那块 Surface 就是解码器的输出端），
+     * 也在旧视图移除前后都无所谓 —— removeView 会把画布的 SurfaceTexture 拆掉，GL 线程随之不再画，
+     * 但线程与 EGL 得在这里收干净，否则每次重建漏一条线程。
+     */
+    private fun destroyShareGroups() {
+        if (shareGroups.isEmpty()) return
+        for ((_, grp) in shareGroups.toList()) {
+            grp.canvas.shutdown()
+            flSurface?.removeView(grp.container)
+            for (winId in grp.members) winShareGroup.remove(winId)
+        }
+        shareGroups.clear()
     }
 
     /**
@@ -3351,62 +3540,70 @@ class MainActivity : AppCompatActivity() {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
             setVideoTextureView(textureView)
-            // 首帧耗时 = 窗口创建 → 第一次 STATE_READY。现场那句"要点一下才出来"要的就是这个数：
-            // 高分辨率素材的解码器起流水线 + 读满缓冲池全在这段，以前它是完全没数据的黑盒。
-            // 只报第一次 READY（playlist 循环切歌不重复刷）；播放器随窗口重建，计数天然归零。
-            val tCreated = android.os.SystemClock.elapsedRealtime()
-            var readyLogged = false
-            // 换片凝滞 = 进 STATE_BUFFERING 到下一次 STATE_READY 的墙钟差。本地文件里这段时间只可能是
-            // "打开下一只 + 解码器重配置 + 攒够 600ms 续播门槛"，跟网络无关。以前这段没有任何数，
-            // 只有首次首帧有 —— 所以"切视频慢"到底是慢在攒缓冲还是慢在重开解码器，改之前先分清。
-            var bufferingSince = 0L
-            addListener(object : Player.Listener {
-                override fun onPlayerError(error: PlaybackException) {
-                    // 播放器级错误（文件损坏/编码不支持/源丢失）此前只进 logcat，后台完全黑盒
-                    logToFile("窗口 $winId 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "PLAYBACK", "ERROR")
-                }
-                override fun onEvents(p: Player, events: Player.Events) {
-                    val now = android.os.SystemClock.elapsedRealtime()
-                    when (p.playbackState) {
-                        Player.STATE_BUFFERING -> if (bufferingSince == 0L) bufferingSince = now
-                        Player.STATE_READY -> {
-                            val since = bufferingSince
-                            bufferingSince = 0L
-                            // 从 BUFFERING 回到 READY 的这一刻必须把闹钟重新排上：判据窗在换片那段时间不是
-                            // READY，playTickNeeded 判 false 就把这颗 100ms 巡检收掉，而硬切轮播里换片本身
-                            // 不走 playFolderInWindow —— 没有任何事件会再排它，同步校正会在第一次凝滞之后
-                            // 睡死到下一次重建，散差照旧攒起来且一行日志都不留。
-                            if (since > 0) mqttHandler.post { ensurePlayTicker() }
-                            if (readyLogged) {
-                                // 首帧之后才有"换片"可言；不到 100ms 的凝滞人眼看不出来，别刷日志
-                                if (since > 0 && now - since >= 100) {
-                                    val vs = (p as? ExoPlayer)?.videoSize
-                                    logToFile("窗口 $winId 换片凝滞 ${now - since}ms" +
-                                        (if (vs != null) "，输入 ${vs.width}x${vs.height}" else "") +
-                                        "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "SWITCH")
-                                }
-                            } else {
-                                readyLogged = true
-                                val vs = (p as? ExoPlayer)?.videoSize
-                                // 只报分辨率，不报帧率：本工程的 media3 1.2.1 里 VideoSize 还没有 frameRate
-                                // 字段（run294 编译就是这么断的）。要帧率得升 media3 或改走 currentTracks 的
-                                // Format.frameRate，为一条日志不值当，先看分辨率——4K/1080p 才是 CPU 的主要变量。
-                                logToFile("窗口 $winId 首帧就绪: 用时 ${now - tCreated}ms" +
-                                    (if (vs != null) "，输入 ${vs.width}x${vs.height}" else "") +
-                                    "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "READY")
-                            }
-                        }
-                        // IDLE/ENDED：这一轮的等待作废，别再拿旧时间戳去减
-                        else -> bufferingSince = 0L
-                    }
-                }
-            })
         }
+        armWindowLogger(winId, player)
         windowPlayers[winId] = player
         // 播放设置要等 playFolderInWindow 才知道播哪一格，这里先落默认值（顺序循环）
         videoSurfaces[winId] = VideoSurface(container, textureView, w, PlaySettings())
 
         return container
+    }
+
+    /**
+     * 给一路播放器装首帧 / 换片凝滞那本账，并把"看片断流"和巡检闹钟挂上。
+     * 单窗播放器与共享解码组那一路共用同一个入口：两处各写一份时，同格 6 扇窗只剩一路解码反而没人记账。
+     */
+    private fun armWindowLogger(winId: String, player: ExoPlayer) {
+        // 首帧耗时 = 窗口创建 → 第一次 STATE_READY。现场那句"要点一下才出来"要的就是这个数：
+        // 高分辨率素材的解码器起流水线 + 读满缓冲池全在这段，以前它是完全没数据的黑盒。
+        // 只报第一次 READY（playlist 循环切歌不重复刷）；播放器随窗口重建，计数天然归零。
+        val tCreated = android.os.SystemClock.elapsedRealtime()
+        var readyLogged = false
+        // 换片凝滞 = 进 STATE_BUFFERING 到下一次 STATE_READY 的墙钟差。本地文件里这段时间只可能是
+        // "打开下一只 + 解码器重配置 + 攒够 600ms 续播门槛"，跟网络无关。以前这段没有任何数，
+        // 只有首次首帧有 —— 所以"切视频慢"到底是慢在攒缓冲还是慢在重开解码器，改之前先分清。
+        var bufferingSince = 0L
+        player.addListener(object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                // 播放器级错误（文件损坏/编码不支持/源丢失）此前只进 logcat，后台完全黑盒
+                logToFile("窗口 $winId 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "PLAYBACK", "ERROR")
+            }
+            override fun onEvents(p: Player, events: Player.Events) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                when (p.playbackState) {
+                    Player.STATE_BUFFERING -> if (bufferingSince == 0L) bufferingSince = now
+                    Player.STATE_READY -> {
+                        val since = bufferingSince
+                        bufferingSince = 0L
+                        // 从 BUFFERING 回到 READY 的这一刻必须把闹钟重新排上：判据窗在换片那段时间不是
+                        // READY，playTickNeeded 判 false 就把这颗 100ms 巡检收掉，而硬切轮播里换片本身
+                        // 不走 playFolderInWindow —— 没有任何事件会再排它，同步校正会在第一次凝滞之后
+                        // 睡死到下一次重建，散差照旧攒起来且一行日志都不留。
+                        if (since > 0) mqttHandler.post { ensurePlayTicker() }
+                        if (readyLogged) {
+                            // 首帧之后才有"换片"可言；不到 100ms 的凝滞人眼看不出来，别刷日志
+                            if (since > 0 && now - since >= 100) {
+                                val vs = (p as? ExoPlayer)?.videoSize
+                                logToFile("窗口 $winId 换片凝滞 ${now - since}ms" +
+                                    (if (vs != null) "，输入 ${vs.width}x${vs.height}" else "") +
+                                    "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "SWITCH")
+                            }
+                        } else {
+                            readyLogged = true
+                            val vs = (p as? ExoPlayer)?.videoSize
+                            // 只报分辨率，不报帧率：本工程的 media3 1.2.1 里 VideoSize 还没有 frameRate
+                            // 字段（run294 编译就是这么断的）。要帧率得升 media3 或改走 currentTracks 的
+                            // Format.frameRate，为一条日志不值当，先看分辨率——4K/1080p 才是 CPU 的主要变量。
+                            logToFile("窗口 $winId 首帧就绪: 用时 ${now - tCreated}ms" +
+                                (if (vs != null) "，输入 ${vs.width}x${vs.height}" else "") +
+                                "，已缓冲 ${p.bufferedPercentage}%", "INFO", "PLAYBACK", "READY")
+                        }
+                    }
+                    // IDLE/ENDED：这一轮的等待作废，别再拿旧时间戳去减
+                    else -> bufferingSince = 0L
+                }
+            }
+        })
     }
 
     /**
@@ -3418,6 +3615,16 @@ class MainActivity : AppCompatActivity() {
      */
     private fun playFolderInWindow(winId: String, folderId: String, scenes: JSONObject? = appliedScenes) {
         logToFile("开始播放窗口: winId=$winId, folderId=$folderId", "INFO", "PLAYBACK", "START")
+        val grp = winShareGroup[winId]
+        if (grp != null && grp.leaderId != winId) {
+            // 共享组的跟随窗：画面跟着基准那一路解码走，这里只把自己的账记上
+            // （熔断、试播接管范围、巡检认成都按 folderKey 找人，不认播放器）
+            videoSurfaces[winId]?.let {
+                it.settings = playSettingsOf(scenes, folderId)
+                it.folderKey = grp.folderKey
+            }
+            return
+        }
         val player = windowPlayers[winId] ?: run {
             Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
             logToFile("找不到窗口 $winId 的播放器", "ERROR", "PLAYBACK", "START")
@@ -3461,6 +3668,16 @@ class MainActivity : AppCompatActivity() {
             else (if (ps.shuffle && listed.size > 1) listed.shuffled() else listed)
                 .also { folderPlaylists[folderId] = it }
         videoSurfaces[winId]?.playlistSig = playlistSig(playlist)
+        // 共享组的跟随窗没有自己的播放器，这一格的账只能由基准这一路代记：清单指纹、播放设置、folderKey
+        // 三样都得到位，否则试播认接管范围、熔断认格子、巡检认成员都会漏掉它们
+        winShareGroup[winId]?.let { grp ->
+            val sig = videoSurfaces[winId]?.playlistSig ?: ""
+            for (mid in grp.members) if (mid != winId) videoSurfaces[mid]?.let {
+                it.settings = ps
+                it.folderKey = folderId
+                it.playlistSig = sig
+            }
+        }
         // 组里已有窗在播这一格 → 新起这扇从它的当前位置进场，不回到第 1 只重头播；
         // 否则每次换窗/重建/切墙板都把同步组打散一次
         val clock = groupClock(folderId, winId)?.takeIf { sameItems(it.items, playlist) }
@@ -3549,7 +3766,8 @@ class MainActivity : AppCompatActivity() {
             .filter { (_, surf) -> surf.folderKey.isNotEmpty() }
             .groupBy { (_, surf) -> surf.folderKey }
         return groups.any { (folderKey, members) ->
-            members.size >= 2 && !parkedFolders.contains(folderKey) &&
+            // 共享解码组不参与校正：整组只有一路播放器，散差按构造就是 0，继续巡检只是白烧主线程
+            members.size >= 2 && !shareGroups.containsKey(folderKey) && !parkedFolders.contains(folderKey) &&
                 settledPlayer(members.map { it.key }.sorted().first()) != null
         }
     }
@@ -3597,6 +3815,8 @@ class MainActivity : AppCompatActivity() {
         for ((folderKey, members) in groups) {
             val ordered = members.map { it.key }.sorted()
             if (members.size < 2) continue
+            // 共享解码的格子整组跳过：只有一路解码，画面天生同帧，没有可校正的东西（见 createShareGroup）
+            if (shareGroups.containsKey(folderKey)) continue
             // 熔断过的格子整轮跳过：这组照旧各走各的，直到有窗口重新进这一格
             if (parkedFolders.contains(folderKey)) continue
             val anchorId = ordered.first()
@@ -3751,6 +3971,8 @@ class MainActivity : AppCompatActivity() {
      * 一扇视频窗口的画面现场。播放器实例不在这儿（唯一真值是 windowPlayers），只放同步组要摸的东西。
      * folderKey = 这扇窗此刻在播哪一格（playFolderInWindow 落的），同步组就按它认成员；
      * playlistSig = 这一路正在播的那份清单的内容指纹，同组成员只有它相等才允许互相对齐（理由见那里）。
+     * texture = 承载画面的那块视图：单窗是自己的 TextureView，共享解码组的成员是整组共用的 ShareCanvasView
+     * （它是 TextureView 的子类，但变换长在 GL 里，不再对它 setTransform，见 refreshShareGroup）。
      */
     private class VideoSurface(
         val container: FrameLayout,
@@ -3885,9 +4107,11 @@ class MainActivity : AppCompatActivity() {
         // 同一格连点第二次不重写 —— 这份快照说的是"正片在哪儿"，与中途换了几只试播无关。
         if (!previewClocks.containsKey(folderId)) groupClock(folderId)?.let { previewClocks[folderId] = it }
         targets.forEach { startWindowPreview(it, folderId, file, filename, maxMs) }
-        logToFile("试播接管: $folderId/$filename → ${targets.size} 扇窗 ${targets.joinToString("、")}",
+        // 共享解码的组里只有基准那一路在 previews 记账，但它一带 N 扇窗：日志与状态文字报真实扇数
+        val panels = targets.sumOf { winShareGroup[it]?.members?.size ?: 1 }
+        logToFile("试播接管: $folderId/$filename → $panels 扇窗同步（${targets.size} 路解码）",
             "INFO", "PLAYBACK", "PREVIEW")
-        previewStatusText("试播中: $filename（${targets.size} 扇窗同步）")
+        previewStatusText("试播中: $filename（$panels 扇窗同步）")
     }
 
     /**
@@ -4012,10 +4236,12 @@ class MainActivity : AppCompatActivity() {
         if (back.isNotEmpty()) {
             // 报的是"回到了哪儿"：第几只/共几只 + 毫秒。现场说"画面跳错了"时，这一行就是全部依据。
             val (idx, total, pos) = back[0]
-            logToFile("试播结束（$reason）：${back.size} 扇窗同步回到正片 " +
+            // 共享解码的组一路顶 N 扇窗，扇数按组成员算才不骗人
+            val panels = group.sumOf { winShareGroup[it]?.members?.size ?: 1 }
+            logToFile("试播结束（$reason）：$panels 扇窗同步回到正片 " +
                 (if (total == 0) "（这一格无素材可播）" else "第 $idx/$total 只 @${pos}ms") +
                 " → " + group.joinToString("、"), "INFO", "PLAYBACK", "PREVIEW")
-            previewStatusText("试播结束，${back.size} 扇窗已回到正片")
+            previewStatusText("试播结束，$panels 扇窗已回到正片")
         }
     }
 
@@ -4085,6 +4311,8 @@ class MainActivity : AppCompatActivity() {
         windowPlayers.values.forEach { it.release() }
         windowPlayers.clear()
         videoSurfaces.clear()
+        // 共享解码单元紧跟播放器之后拆（那块 Surface 是解码器的输出端，先放播放器才谈得上收画布）
+        destroyShareGroups()
         // 同步组那几本账随窗口一起清：留着摁住记录，下一轮就会去放行一扇新起的、根本没被我们摁过的窗
         syncHolds.clear()
         syncAlignAt.clear()
@@ -4097,6 +4325,8 @@ class MainActivity : AppCompatActivity() {
         appliedScenesFp = null
         appliedScenes = null
         appliedPlaySettingsJson = null
+        // 屏上次序账同理作废：留着它，stop 之后同一份配置的 update_windows 会被比成"没变"
+        appliedWindowOrder = emptyList()
         Log.d(TAG, "释放所有窗口资源")
     }
 }
