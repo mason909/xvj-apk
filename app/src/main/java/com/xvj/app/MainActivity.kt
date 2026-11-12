@@ -17,9 +17,7 @@
  * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk / retryPendingInstall）
  * 【A-10】系统 UI（hideSystemUI）
  * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint / calculateMd5）
- * 【A-12】播放设置 & 叠化（playSettingsOf / playSettingsJson / ensurePlayTicker / tickPlaySettings /
- *         groupFadeGateOpen / beginWindowFade / startWindowFade / completeWindowFade / cancelWindowFade；
- *         100ms 巡检的 playTick 本体在字段区）
+ * 【A-12】播放设置（playSettingsOf / playSettingsJson / ensurePlayTicker；100ms 巡检的 playTick 本体在字段区）
  * 【A-13】大屏试播（startGroupPreview / previewTargets / startWindowPreview / restorePreviewGroup /
  *         restoreWindowPreview / abortAllPreviews；同格同步组那条见 groupClock / folderPlaylists，
  *         轮播交接的"快窗等慢窗 + 硬对齐"见 tickSyncGroups / holdForGroup / hardAlign / settledPlayer）
@@ -59,10 +57,12 @@
  *     隐藏容器即可，文字照常更新；现场要排查就开调试
  * 
  * 文件夹级播放设置（scenes[X].play_settings，三端共用一份口径，详见【A-12】）：
- *   - 每格 { dissolve, dissolve_ms, order }；全默认的格子云端不落键 —— 落了会让全库 rev 漂移一次，
+ *   - 每格只有 { order }：'seq' 顺序循环 | 'shuffle' 随机循环；全默认的格子云端不落键 —— 落了会让全库 rev 漂移一次，
  *     部署后每台在线设备都被对账判成"落后"补发同步、视频从头播
  *   - 表键带幕前缀（"A01"），本机按物理目录 id 查；老载荷的裸 "01" 也认（见 playSettingsOf）
- *   - 叠化只作用于同一文件夹内素材轮播的交接（含最后一只回到第一只）；切墙板/切幕/试播接管一律硬切
+ *   - **素材轮播的交接一律硬切**：叠化（第二路预卷 + alpha 淡入）整条链路已于 2026-11-12 删除
+ *     （用户定调：现场先要普通切换稳，特效另立项再做）。存量载荷里残留的 dissolve / dissolve_ms
+ *     键本机不再读，等于自动忽略，不必清库
  *   - 改设置不动映射 → 服务端发 update_windows 轻通道；但设置不在窗口 content 里，内容签名比不出它，
  *     所以本机另记 appliedPlaySettingsJson，真变了就判成结构变化回退全量重建（视频会从头播）
  *
@@ -99,9 +99,6 @@ package com.xvj.app
 
 import android.content.Intent
 import android.content.pm.ActivityInfo
-import android.animation.Animator
-import android.animation.AnimatorListenerAdapter
-import android.animation.ValueAnimator
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -110,7 +107,6 @@ import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.view.animation.LinearInterpolator
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -266,45 +262,37 @@ class MainActivity : AppCompatActivity() {
     /**
      * 屏上那份播放设置的规范化 JSON（两幕的 play_settings 拼一起）。
      * update_windows 轻路径只比窗口 id 与内容签名，播放设置不在窗口 content 里 ——
-     * 不单独记一份的话，"只改了叠化/顺序"会被判成纯几何变化，原地改改 alpha 就返回，设置永远不生效。
+     * 不单独记一份的话，"只改了顺序（随机/顺序）"会被判成纯几何变化，原地改改 alpha 就返回，设置永远不生效。
      */
     private var appliedPlaySettingsJson: String? = null
     /**
      * windowId -> 视频窗口的画面现场（内层容器 + 主 TextureView + 窗口配置 + 这一格的播放设置）。
-     * 播放器实例仍以 windowPlayers 为唯一真值，这里只放叠化要摸的东西，避免两份播放器状态各漂一份。
+     * 播放器实例仍以 windowPlayers 为唯一真值，这里只放同步组要摸的东西，避免两份播放器状态各漂一份。
      * COLOR/HDMI 窗口没有 TextureView，也就不进这张表（它们本来就没有"素材轮播"这回事）。
      */
     private val videoSurfaces = mutableMapOf<String, VideoSurface>()
-    /** windowId -> 在飞的叠化（预卷的第二路播放器 + 淡入动画）；同一扇窗最多一路 */
-    private val windowFades = mutableMapOf<String, WindowFade>()
     /** 同步组里正在"等慢窗"而被摁住的快窗：winId -> 摁住的时刻（elapsedRealtime） */
     private val syncHolds = mutableMapOf<String, Long>()
     /** winId -> 上一次硬对齐（seek 拽回）的时刻，见 SYNC_ALIGN_COOLDOWN_MS */
     private val syncAlignAt = mutableMapOf<String, Long>()
-    /** folderKey -> 本轮算出的交接闸门（组内最慢那扇离自己的淡入点还有多久）；tickPlaySettings 起淡入前查它 */
-    private val folderGates = mutableMapOf<String, GroupGate>()
     /** folderKey -> 连续"整组散开并且真拽了一次"的轮数，见 SYNC_ALIGN_STRIKES */
     private val folderAlignStrikes = mutableMapOf<String, Int>()
     /** 拽不齐、已经退出校正的格子：不 seek、不减速、不摁住，直到有窗子重新进这一格 */
     private val parkedFolders = mutableSetOf<String>()
-    /** 叠化巡检间隔：100ms 足够把 400ms 的淡入切成 4 段触发判定，再密就是白烧主线程 */
+    /** 同步组巡检间隔：100ms 足够在交接点前把超前的那扇摁住，再密就是白烧主线程 */
     private val PLAY_TICK_MS = 100L
-    /** 预卷要留给第二路解码器的热身时间：现网 1080p 首帧实测 203~589ms，1200ms 是留了余量的上沿 */
-    private val PREROLL_WARMUP_MS = 1200L
-    /** 预卷存活上限：超过这个还没淡入（片长突然变了/解码卡住）就撤掉第二路，别让它一直占着解码器 */
-    private val PREROLL_MAX_MS = 8000L
     /** 同步组内两扇窗的进度差在容忍带内就不动手：50ms 以内肉眼看不出，来回纠正反而抖 */
     private val SYNC_TOLERANCE_MS = 50L
     /**
      * 速度校正幅度上限（只用它减速，从不提速，见 tickSyncGroups）。
-     * 【为什么从 0.10 收到 0.03】音频要保留（用户定调，叠化还做音量交叉），而 media3 1.2.1 的
+     * 【为什么从 0.10 收到 0.03】音频要保留（用户定调），而 media3 1.2.1 的
      * PlaybackParameters 只有速度、没有独立音高，变速即变调。±10% ≈ 一个全音，校正那两三秒里人耳
      * 听得出走调，按严格标准算 BUG。±3% 只在快窗往回收的时候打满，慢窗永远是 1.0x —— 全组最慢那扇
      * 就是基准，没人比它更慢，所以提速这条路整个删掉了（原 SYNC_CONVERGE_MS 随之删除）。
      */
     private val SYNC_SPEED_MAX = 0.03
     /**
-     * 不叠化的同步组：快窗离交接点只剩这么多毫秒还没等到基准，就把画面摁住等。
+     * 快窗离交接点只剩这么多毫秒还没等到基准，就把画面摁住等。
      * 150ms ≈ 一颗巡检（100ms）+ 余量；再小就可能一轮巡不到、白放它过界。
      */
     private val SYNC_FREEZE_MS = 150L
@@ -329,9 +317,7 @@ class MainActivity : AppCompatActivity() {
     // Kotlin 先报递归类型推断、显式标注类型后又报"必须初始化"。用 this 重投自己就绕开了属性初始化时序。
     private val playTick: Runnable = object : Runnable {
         override fun run() {
-            // 顺序不能反：先由同步组算出"谁最慢、该不该等"并放行摁住的窗，叠化那一轮才照着闸门起淡入
             tickSyncGroups()
-            tickPlaySettings()
             if (playTickNeeded()) mqttHandler.postDelayed(this, PLAY_TICK_MS) else playTickRunning = false
         }
     }
@@ -340,10 +326,6 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "XVJPlayer"
         /** 窗口容器内亮度遮罩视图的 tag 标识（实时更新时定位/增删遮罩） */
         const val DIM_TAG = "xvj_dim"
-        /** 叠化时长域：与云端 PLAY_DISSOLVE_MS_MIN/MAX/DEFAULT、前端 PS_DISSOLVE_MS_* 同一把尺 */
-        private const val DISSOLVE_MS_MIN = 100L
-        private const val DISSOLVE_MS_MAX = 3000L
-        private const val DISSOLVE_MS_DEFAULT = 400L
         const val APK_URL = "http://47.102.106.237"
         // 订阅用的通配符主题在 connectMQTT() 里按 deviceId 拼具体路径，不再用常量
         private const val AUTH_TOPIC = "xvj/auth/response"
@@ -2868,17 +2850,14 @@ class MainActivity : AppCompatActivity() {
         // 试播必须先于播放器释放前清账：这些窗口马上就要照新配置重建，
         // 留着旧快照只会让收尾回调对着已释放的实例写状态（见 abortAllPreviews）
         abortAllPreviews("场景配置重建")
-        // 叠化的第二路播放器不在 windowPlayers 里，得单独撤，否则重建后它还在后台解码一份没人看的画面
-        cancelAllWindowFades("场景配置重建")
 
         // 释放旧的窗口播放器
         windowPlayers.values.forEach { it.release() }
         windowPlayers.clear()
         videoSurfaces.clear()
-        // 同步组那三本账随窗口一起清：留着摁住记录，下一轮就会去放行一扇新起的、根本没被我们摁过的窗
+        // 同步组那几本账随窗口一起清：留着摁住记录，下一轮就会去放行一扇新起的、根本没被我们摁过的窗
         syncHolds.clear()
         syncAlignAt.clear()
-        folderGates.clear()
         folderAlignStrikes.clear()
         parkedFolders.clear()
 
@@ -3078,7 +3057,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 播放设置不在窗口 content 里，内容签名比不出它：只改叠化/顺序时必须判成结构变化回退重建，
+        // 播放设置不在窗口 content 里，内容签名比不出它：只改顺序（随机/顺序）时必须判成结构变化回退重建，
         // 否则轻路径改改几何就返回，playlist 不重排、设置看着保存了却永远不生效
         var structural = desiredIds != currentIds || playSettingsJson(scenes) != appliedPlaySettingsJson
         if (!structural) {
@@ -3135,7 +3114,7 @@ class MainActivity : AppCompatActivity() {
 
             // 布局稳定后重算截取/旋转/镜像矩阵（取景与 90°/270° 预缩放都依赖视图实际尺寸）；
             // 尺寸仍为 0 时由 applyTransformWhenReady 挂一次性布局监听补做。
-            // 叠化交接时第二路 TextureView 要照这份最新配置重算矩阵，所以窗口 JSON 也跟着更新
+            // 窗口 JSON 存进 surf 是为了后面重算矩阵时拿得到最新配置（换文件夹/更新几何后都一样）
             videoSurfaces[winId]?.winJson = w
             val cv = c.getChildAt(0)
             if (cv != null) c.post { applyTransformWhenReady(cv, w) }
@@ -3222,8 +3201,8 @@ class MainActivity : AppCompatActivity() {
         val crop = cropRect(w)
         val tvs = if (view is TextureView) listOf(view) else findTextureViews(view)
         if (tvs.isNotEmpty()) {
-            // 叠化期间容器里同时挂着两路 TextureView（正片 + 预卷的下一只），两路必须套同一份矩阵，
-            // 否则淡入到一半画面会突然错位/跳裁剪。它们都是 MATCH_PARENT，尺寸取第一路即可。
+            // 一个窗口框里可能套着多层视图（画面 + 亮度遮罩），变换只套在 TextureView 上；
+            // 它们都是 MATCH_PARENT，尺寸取第一路即可。
             val vw = tvs[0].width.toFloat()
             val vh = tvs[0].height.toFloat()
             if (vw <= 0f || vh <= 0f) return false
@@ -3278,7 +3257,7 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    /** 递归取窗口内全部 TextureView（叠化期间正片与预卷两路并存，变换必须一起套） */
+    /** 递归取窗口内全部 TextureView（画面层可能嵌在容器里，变换要一起套到每一块） */
     private fun findTextureViews(v: View): List<TextureView> {
         if (v is TextureView) return listOf(v)
         if (v is ViewGroup) return (0 until v.childCount).flatMap { findTextureViews(v.getChildAt(it)) }
@@ -3365,7 +3344,8 @@ class MainActivity : AppCompatActivity() {
     /** 视频播放窗口（每个窗口独立 ExoPlayer，TextureView 承载以支持旋转/镜像矩阵变换）*/
     private fun createVideoWindowView(winId: String, w: JSONObject, content: JSONObject): View {
         val container = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        val textureView = FadeTextureView(this)
+        // TextureView 而不是 SurfaceView：窗口要套旋转/镜像矩阵（见 applyTransformWhenReady）
+        val textureView = TextureView(this)
         container.addView(textureView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         val player = ExoPlayer.Builder(this).setLoadControl(localBufferLoadControl()).build().apply {
             repeatMode = Player.REPEAT_MODE_ALL
@@ -3423,7 +3403,7 @@ class MainActivity : AppCompatActivity() {
             })
         }
         windowPlayers[winId] = player
-        // 播放设置要等 playFolderInWindow 才知道播哪一格，这里先落默认值（不叠化 + 顺序）
+        // 播放设置要等 playFolderInWindow 才知道播哪一格，这里先落默认值（顺序循环）
         videoSurfaces[winId] = VideoSurface(container, textureView, w, PlaySettings())
 
         return container
@@ -3437,8 +3417,6 @@ class MainActivity : AppCompatActivity() {
      *                 先起播再赋值 appliedScenes 的，用默认值会查到上一份配置的设置。
      */
     private fun playFolderInWindow(winId: String, folderId: String, scenes: JSONObject? = appliedScenes) {
-        // 换文件夹 = 硬切（用户定调：切墙板/切幕不做特效），在飞的叠化连同第二路解码器一起撤掉
-        cancelWindowFade(winId, "换文件夹")
         logToFile("开始播放窗口: winId=$winId, folderId=$folderId", "INFO", "PLAYBACK", "START")
         val player = windowPlayers[winId] ?: run {
             Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
@@ -3476,9 +3454,8 @@ class MainActivity : AppCompatActivity() {
         folderAlignStrikes.remove(folderId)
         parkedFolders.remove(folderId)
         val listed = videos.map { MediaItem.fromUri(Uri.fromFile(it)) }
-        // 不用 ExoPlayer 自带的 shuffleModeEnabled：叠化那一路要照同一份顺序克隆 playlist，
-        // 内置洗牌的两路顺序对不上，交接时会跳到另一只片子。
-        // 顺序还必须是"每格一份"而不是"每窗一份"：各洗各的牌，两扇窗播的就是两套顺序。
+        // 不用 ExoPlayer 自带的 shuffleModeEnabled：它按播放器各自洗牌，同组两扇窗播的就是两套顺序。
+        // 自己洗一次并按格缓存（folderPlaylists）—— 洗牌只发生一次，成员拿到的永远是同一份清单。
         val cached = folderPlaylists[folderId]
         val playlist = if (cached != null && sameItems(cached, listed)) cached
             else (if (ps.shuffle && listed.size > 1) listed.shuffled() else listed)
@@ -3494,7 +3471,6 @@ class MainActivity : AppCompatActivity() {
         ensurePlayTicker()
         Log.d(TAG, "窗口 $winId 开始播放 $folderId -> ${physicalDir.absolutePath} (${videos.size}个视频)")
         logToFile("窗口 $winId 开始播放 $folderId (${videos.size}个视频，${if (ps.shuffle) "随机" else "顺序"}循环" +
-            (if (ps.dissolve) "，轮播交接叠化 ${ps.dissolveMs}ms" else "，硬切") +
             (if (clock != null) "，跟随组内基准 第${clock.index + 1}/${playlist.size}只 @${clock.positionMs}ms"
              else "，从头起播") + ")", "INFO", "PLAYBACK", "START")
     }
@@ -3514,8 +3490,8 @@ class MainActivity : AppCompatActivity() {
     )
 
     /**
-     * 同步组里一扇窗这一轮的读数。下标统一折算到基准那一路的清单空间（lap = 相对基准多走完了几只）：
-     * 叠化交接过的那一路 playlist 换了起点，直接比 currentMediaItemIndex 会把同一只片子读成差一只。
+     * 同步组里一扇窗这一轮的读数。下标统一折算到基准那一路的清单空间（lap = 相对基准多走完了几只），
+     * 这样"刚过交接点 0.3s"和"片尾还差 0.2s"才在一把尺子上可比。
      */
     private class SyncClock(
         val winId: String,
@@ -3527,9 +3503,6 @@ class MainActivity : AppCompatActivity() {
         val remainingMs: Long
     )
 
-    /** 一格的交接闸门：本轮组内最慢那扇离它自己的淡入点还剩多少毫秒、淡入点定在几毫秒 */
-    private class GroupGate(val refRemainingMs: Long, val waitMs: Long)
-
     /** 一只片子的落盘 URI（localConfiguration 在 1.2.1 是可空公开字段，离线/占位 item 取不到就当空串） */
     private fun itemUri(item: MediaItem): String = item.localConfiguration?.uri?.toString() ?: ""
 
@@ -3538,13 +3511,13 @@ class MainActivity : AppCompatActivity() {
         a.size == b.size && a.indices.all { itemUri(a[it]) == itemUri(b[it]) }
 
     /**
-     * 一份清单的内容指纹。为什么不像 sameItems 那样逐个比：叠化交接后那一路的 playlist 是同一份内容
-     * 从下一只重新排的（见 beginWindowFade 的 rotated），逐个比会把刚交接完的窗判成"另一组"，
-     * 于是它再也跟不上基准。排序后比的是内容集合，与从第几只起播无关。
+     * 一份清单的内容指纹。为什么不像 sameItems 那样逐个比：某一扇窗单独重建过（换了起播位置、
+     * 清单跟着重新排）时，逐个比会把同一份内容判成"另一组"，那扇窗就再也跟不上基准。
+     * 排序后比的是内容集合，与从第几只起播无关。
      */
     private fun playlistSig(items: List<MediaItem>): String = items.map { itemUri(it) }.sorted().joinToString("|")
 
-    /** 同一只片子在另一路播放器的清单里排第几（-1 = 不在那份清单里）：换过起点的两路下标不通用 */
+    /** 同一只片子在这一路的清单里排第几（-1 = 不在那份清单里）：拽回时按片子认，不按下标硬套 */
     private fun indexOfItem(player: ExoPlayer, uri: String): Int {
         for (i in 0 until player.mediaItemCount) if (itemUri(player.getMediaItemAt(i)) == uri) return i
         return -1
@@ -3591,8 +3564,8 @@ class MainActivity : AppCompatActivity() {
      * 三档力度按误差从小到大，一轮巡检只落在其中一档：
      *  1. **减速贴齐** —— 按"和基准同时到达交接点"要的倍速（remaining_我 / remaining_基准），幅度封顶
      *     -SYNC_SPEED_MAX。3% 以内听不出，也不会把整组节奏拖慢。
-     *  2. **摁住等待** —— 减速追不上（误差超过这一只剩余时长能吃下的量）就停在交接点前 SYNC_FREEZE_MS
-     *     （开了叠化的格子停在淡入点前），基准到了自然放行；最长等 SYNC_HOLD_MAX_MS，超时先放行 ——
+     *  2. **摁住等待** —— 减速追不上（误差超过这一只剩余时长能吃下的量）就停在交接点前 SYNC_FREEZE_MS，
+     *     基准到了自然放行；最长等 SYNC_HOLD_MAX_MS，超时先放行 ——
      *     一扇窗定在屏上比散这一次交接严重得多。
      *  3. **硬对齐** —— 已经抢跑过交接点（播到下一只去了）的，一次 seek 拽回基准正在播的那一帧；整组散过
      *     SYNC_ALIGN_MAX_MS 则反过来，全组一次 seek 跳到最前面那扇（落后几扇的片尾不播了，也好过屏上
@@ -3603,7 +3576,7 @@ class MainActivity : AppCompatActivity() {
      *     ID 取，免得这轮从一扇跳到另一扇反而把全组带偏；摁住的窗由超时放行兜底，不会一直停着。
      *  2. **只对齐同一份清单的窗** —— 素材刚变过、只重建了其中一扇时两路内容不同，拽过去会让它播到别的
      *     片子上，屏上看着对、内容已经错。
-     *  3. **成员在试播 / 淡入动画中 / 非 READY 时一律不动手** —— 交接正在进行，那一路归叠化自己收尾。
+     *  3. **成员在试播 / 非 READY 时一律不动手** —— 那一读瞬间它自己也在换片，拿它当基准会把整组带偏。
      *  4. **熔断** —— 同一格连着 SYNC_ALIGN_STRIKES 轮"整组散开并且真 seek 过"还拽不齐，这格就永久退出校正
      *     （parkedFolders），直到有窗口重新进这一格：那种差不是轮播攒的，是某一路天生追不动（同格混了
      *     4K 和 1080p），继续硬拽只是每 1.5s 全屏跳一次，比并排放两只片子更糟。
@@ -3621,24 +3594,19 @@ class MainActivity : AppCompatActivity() {
         val groups = videoSurfaces.entries
             .filter { (_, surf) -> surf.folderKey.isNotEmpty() }
             .groupBy { (_, surf) -> surf.folderKey }
-        // 闸门同理：这一轮算不出来的格子（散会了、只剩一扇、判据窗没落定）在下面各分支里逐个 remove，
-        // 这里先把这一轮压根不存在的格子清掉，别让淡入被一个陈旧读数拦住
-        for (folderKey in folderGates.keys.toList()) if (!groups.containsKey(folderKey)) folderGates.remove(folderKey)
         for ((folderKey, members) in groups) {
             val ordered = members.map { it.key }.sorted()
-            if (members.size < 2) { folderGates.remove(folderKey); continue }
-            // 熔断过的格子整轮跳过：连闸门也不写（写了就等于拦住淡入），这组照旧各走各的
-            if (parkedFolders.contains(folderKey)) { folderGates.remove(folderKey); continue }
+            if (members.size < 2) continue
+            // 熔断过的格子整轮跳过：这组照旧各走各的，直到有窗口重新进这一格
+            if (parkedFolders.contains(folderKey)) continue
             val anchorId = ordered.first()
-            // 规矩 1：判据窗（组内 ID 最小那扇，不是位置基准）没落定这轮不动手；闸门同时撤掉 = 放行，
-            // 别让开了叠化的那几扇干等到超时
-            val anchor = settledPlayer(anchorId)
-            if (anchor == null) { folderGates.remove(folderKey); continue }
+            // 规矩 1：判据窗（组内 ID 最小那扇，不是位置基准）没落定这轮不动手；摁住的窗另有超时放行兜底
+            val anchor = settledPlayer(anchorId) ?: continue
             val count = anchor.mediaItemCount
             val unit = anchor.duration
             val anchorSig = videoSurfaces[anchorId]?.playlistSig ?: ""
             // 时长未知（直播流/坏文件）算不出谁在前；指纹为空 = 这一路还没走过 playFolderInWindow，没有清单可比
-            if (count == 0 || unit <= 0 || anchorSig.isEmpty()) { folderGates.remove(folderKey); continue }
+            if (count == 0 || unit <= 0 || anchorSig.isEmpty()) continue
             val anchorIdx = anchor.currentMediaItemIndex
             // 规矩 2：只收清单一致、落在可比状态的窗
             val clocks = ordered.mapNotNull { winId ->
@@ -3654,7 +3622,7 @@ class MainActivity : AppCompatActivity() {
                     if (d > count / 2) d - count else if (d < -(count / 2)) d + count else d,
                     p.currentPosition, (p.duration - p.currentPosition).coerceAtLeast(0L))
             }
-            if (clocks.size < 2) { folderGates.remove(folderKey); continue }
+            if (clocks.size < 2) continue
             // 进度铺平成一把连续尺子：只比 currentMediaItemIndex 比不出"刚过界 0.3s"和"片尾还差 0.2s"
             // 谁在前，而这两个恰恰是交接那一瞬间要分的东西
             val sorted = clocks.sortedBy { syncProgress(it, unit) }
@@ -3682,20 +3650,16 @@ class MainActivity : AppCompatActivity() {
                             "WARN", "PLAYBACK", "SYNC")
                     }
                 }
-                folderGates.remove(folderKey)
                 continue
             }
             folderAlignStrikes.remove(folderKey)   // 本轮没散开 = 连续计数归零，熔断只认"连着拽不动"
-            val gs = videoSurfaces[ref.winId]?.settings ?: PlaySettings()
-            val waitMs = if (gs.dissolve) gs.dissolveMs else SYNC_FREEZE_MS
-            folderGates[folderKey] = GroupGate(ref.remainingMs, waitMs)
             for (c in clocks) {
                 if (c.winId == ref.winId) { releaseSyncHold(c.winId); setSyncSpeed(c.player, 1f); continue }
                 val ahead = syncProgress(c, unit) - syncProgress(ref, unit)
                 if (ahead <= SYNC_TOLERANCE_MS) { releaseSyncHold(c.winId); setSyncSpeed(c.player, 1f); continue }
                 if (c.lap > ref.lap) { hardAlign(c, ref, now, "抢跑 ${ahead}ms"); continue }
                 // 已经摁住的就继续摁着：等 ahead 自己归零放行，别在"减速一点点"和"停住"之间来回跳
-                if (c.remainingMs > waitMs) {
+                if (c.remainingMs > SYNC_FREEZE_MS) {
                     val need = (if (ref.remainingMs <= 0) 1f else c.remainingMs.toFloat() / ref.remainingMs.toFloat())
                         .coerceIn(0f, 1f)
                     setSyncSpeed(c.player, if (need >= 1f - SYNC_SPEED_MAX) need else 1f - SYNC_SPEED_MAX.toFloat())
@@ -3736,8 +3700,8 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 一次 seek 把某扇窗拽到目标窗正在播的那一帧附近（只在过交接点、或整组散开时用）。
-     * 目标下标靠 clipUri 翻译回自己那份清单：叠化交接过的那一路是从下一只重新排的，直接用目标的
-     * index 会落到另一只片子上 —— 内容看着同步了，其实各播各的。
+     * 目标下标靠 clipUri 翻译回自己那份清单：同组两扇窗手上的清单可能不是同一版（素材刚增删过、
+     * 只重建了其中一扇，位置整体漂移），直接用目标的 index 会落到另一只片子上 —— 内容看着同步了，其实各播各的。
      * 返回值 = 这一下是否真拽了：在冷却里、或目标片子根本不在这一路的清单里，都没动它，
      * 调用方（熔断计数）只认真正发生过的 seek。
      */
@@ -3757,49 +3721,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 这扇窗此刻是否停在"可比进度"的状态：播放器在屏上、READY、有清单，且没在试播、淡入也还没起跑。
-     * 淡入一旦起跑就归叠化自己收尾（两路在同一刻交接），不能再拿它的 currentPosition 当基准；
-     * 预卷还没起跑的那一路照读 —— 那正是"该不该等慢窗"要判定的时刻。
+     * 这扇窗此刻是否停在"可比进度"的状态：播放器在屏上、READY、有清单，且没在试播。
+     * 试播那一路播的不是正片，拿它的 currentPosition 当基准会把整组拽到试播素材上。
      */
     private fun settledPlayer(winId: String): ExoPlayer? {
         if (previews.containsKey(winId)) return null
-        windowFades[winId]?.let { if (it.fading) return null }
         val p = windowPlayers[winId] ?: return null
         return p.takeIf { it.playbackState == Player.STATE_READY && it.mediaItemCount > 0 }
     }
 
-    // 【A-12】 文件夹级播放设置：随机/顺序循环 + 只在轮播交接处叠化
-    // @tag: playSettingsOf 播放设置 叠化 随机循环
-    // @tag: beginWindowFade 叠化预卷 第二路播放器
-    // @tag: completeWindowFade 叠化交接 提升为正片
+    // 【A-12】 文件夹级播放设置：随机/顺序循环（交接一律硬切）
+    // @tag: playSettingsOf 播放设置 随机循环 顺序循环
     //
-    // 作用范围是用户定死的：**只有同一文件夹内素材轮播的交接**（含最后一只回到第一只）才叠化。
-    // 切墙板、切幕、试播接管/恢复一律硬切 —— 那些是内容操作，现场要的是"立刻看到那一格"，
-    // 而且每个都叠一次等于把第二路解码器常驻，这台盒子 4K60 单窗已吃到 99% CPU（见 startWindowPreview 规矩 1）。
+    // 2026-11-12 用户定调：「先删除叠化功能和叠化开关，先专注于普通切换」—— 叠化整条链路
+    // （第二路预卷播放器 + alpha 淡入 + 音量交叉 + 整组淡入闸门）连同 tickPlaySettings 一起删除，
+    // 需要特效另立项再做（同帧精度那条见任务 #157 的共享解码 + GL 合成）。
+    // 现在素材轮播的每一次交接都是硬切：切墙板、切幕、试播接管/恢复同样硬切。
     //
-    // 实现要点：
-    //  1. 提前 PREROLL_WARMUP_MS 起第二路播放器，playWhenReady=false —— 只解码首帧 + 缓冲，不走进度。
-    //     走进度观众就会错过下一只开头那一秒多（现网 1080p 首帧实测 203~589ms）。
-    //  2. 第二路直接持有"从下一只开始"的整份 playlist，交接完它就是正片，不用再 setMediaItems 重排
-    //     （重排要重新 prepare，画面会黑一下）。顺序照正片克隆，随机循环也不另洗一次牌。
-    //  3. 只淡入上面那一路（alpha 0→1），底下正片保持不透明 —— 这就是标准交叉叠化，省一半动画。
-    //  4. 收尾两条路谁先到谁说了算：动画跑完，或正片自己滚到下一只（onMediaItemTransition AUTO）。
-    //     **不用 STATE_ENDED**：REPEAT_MODE_ALL 下它根本不来，而且那个钩子是试播恢复专用的。
-    //  5. 起淡入的门槛是第二路**真画出首帧**（onRenderedFirstFrame），不是 STATE_READY：READY 只说缓冲够播，
-    //     上面那层没画面也是一整块不透明的黑，alpha 涨多少就黑多少 —— 观众看到的就是"闪黑"。
-    //  6. 热身没赶上 / 片长未知 / 播放器出错 → 撤掉第二路，硬切。宁可少一次特效，不能让大屏黑一下。
+    // 留下来的两件事：
+    //  1. 顺序与随机：清单按格缓存（folderPlaylists），随机只洗一次，同步组成员拿同一份清单。
+    //  2. 这颗 100ms 闹钟现在只为同步组服务（tickSyncGroups：快窗等慢窗 + 过界硬对齐，见【A-13】前的那一节）。
 
-    /** 一格的播放设置；全默认 = 不叠化 + 顺序循环（与云端 playSettingsValue 的"默认不落键"同口径） */
+    /** 一格的播放设置；全默认 = 顺序循环（与云端 playSettingsValue 的"默认不落键"同口径） */
     private class PlaySettings(
-        val dissolve: Boolean = false,
-        val dissolveMs: Long = DISSOLVE_MS_DEFAULT,
         val shuffle: Boolean = false
     )
 
     /**
-     * 一扇视频窗口的画面现场。播放器实例不在这儿（唯一真值是 windowPlayers），只放叠化要摸的东西。
+     * 一扇视频窗口的画面现场。播放器实例不在这儿（唯一真值是 windowPlayers），只放同步组要摸的东西。
      * folderKey = 这扇窗此刻在播哪一格（playFolderInWindow 落的），同步组就按它认成员；
-     * 叠化交接换新 VideoSurface 时必须把它带上，丢了这扇窗就从组里消失了。
      * playlistSig = 这一路正在播的那份清单的内容指纹，同组成员只有它相等才允许互相对齐（理由见那里）。
      */
     private class VideoSurface(
@@ -3810,32 +3760,6 @@ class MainActivity : AppCompatActivity() {
         var folderKey: String = "",
         var playlistSig: String = ""
     )
-
-    /** 一次在飞的叠化：预卷的第二路 + 它上面那块 TextureView + 正在淡出的正片那一路 */
-    private class WindowFade(
-        val incoming: ExoPlayer,
-        val incomingView: TextureView,
-        val outgoing: ExoPlayer,
-        val outgoingView: TextureView,
-        val bornAt: Long,
-        val listener: Player.Listener
-    ) {
-        var animator: ValueAnimator? = null
-        var fading = false
-        /**
-         * 第二路有没有真把一帧画进那块 TextureView。STATE_READY 只说明"缓冲够、能播"，
-         * 不保证画面已经落上来 —— 而淡入期间上面这层是不透明的，黑屏也算"一层"，alpha 一样会把它淡上来。
-         */
-        var firstFrameRendered = false
-    }
-
-    /**
-     * 叠化要逐帧改 alpha。TextureView 默认认为自己有重叠渲染，一改 alpha 就把整层离屏合成一遍，
-     * 1080p 下白吃一层 GPU；本工程的画面永远铺满窗口框、不需要与自身混合，声明无重叠即可省掉那层。
-     */
-    private class FadeTextureView(ctx: android.content.Context) : TextureView(ctx) {
-        override fun hasOverlappingRendering(): Boolean = false
-    }
 
     /**
      * 查这一格的播放设置（云端 scenes[X].play_settings）。
@@ -3853,8 +3777,6 @@ class MainActivity : AppCompatActivity() {
             val tbl = scenes.optJSONObject(k)?.optJSONObject("play_settings") ?: continue
             val cell = tbl.optJSONObject(folderId) ?: tbl.optJSONObject(bare) ?: continue
             return PlaySettings(
-                dissolve = cell.optBoolean("dissolve", false),
-                dissolveMs = cell.optLong("dissolve_ms", DISSOLVE_MS_DEFAULT).coerceIn(DISSOLVE_MS_MIN, DISSOLVE_MS_MAX),
                 shuffle = cell.optString("order", "seq") == "shuffle"
             )
         }
@@ -3867,13 +3789,12 @@ class MainActivity : AppCompatActivity() {
             canonicalJson(scenes.optJSONObject("B")?.opt("play_settings"))
 
     /**
-     * 有叠化要巡检、有同步组要校正、或还有窗子被摁着等慢窗时才需要这颗 100ms 闹钟；都没有就停掉，别白烧主线程。
+     * 有同步组要校正、或还有窗子被摁着等慢窗时才需要这颗 100ms 闹钟；都没有就停掉，别白烧主线程。
      * 注意这里"停"是暂时的：判据窗正在换片凝滞时 syncGroupsWithCorrection 判 false，闹钟跟着收摊，
      * 等它回到 READY 由播放器回调（createVideoWindowView 里的 onEvents）重新排上 —— 别把收摊理解成"这组不用管了"。
      */
     private fun playTickNeeded(): Boolean =
-        windowFades.isNotEmpty() || videoSurfaces.values.any { it.settings.dissolve } ||
-            syncGroupsWithCorrection() || syncHolds.isNotEmpty()
+        syncGroupsWithCorrection() || syncHolds.isNotEmpty()
 
     private fun ensurePlayTicker() {
         if (!playTickNeeded()) {
@@ -3887,197 +3808,6 @@ class MainActivity : AppCompatActivity() {
             playTickRunning = true
             mqttHandler.postDelayed(playTick, PLAY_TICK_MS)
         }
-    }
-
-    /** 巡检每扇开了叠化的窗：该预卷了没有、该起淡入了没有、预卷是不是已经没救了 */
-    private fun tickPlaySettings() {
-        val now = android.os.SystemClock.elapsedRealtime()
-        for ((winId, surf) in videoSurfaces.toList()) {
-            val ps = surf.settings
-            if (!ps.dissolve) {
-                cancelWindowFade(winId, "叠化已关")
-                continue
-            }
-            if (previews.containsKey(winId)) continue   // 试播接管时已撤，这里只是别再起新的一路
-            val player = windowPlayers[winId] ?: continue
-            val fade = windowFades[winId]
-            val dur = player.duration
-            if (dur <= 0) {
-                // 片长未知（直播流/损坏文件）算不出提前量：撤掉第二路，这一只硬切
-                if (fade != null) cancelWindowFade(winId, "片长未知")
-                continue
-            }
-            val remaining = dur - player.currentPosition
-            if (fade == null) {
-                if (remaining <= ps.dissolveMs + PREROLL_WARMUP_MS) beginWindowFade(winId, surf, player)
-            } else if (!fade.fading) {
-                // 第二路还没解码出首帧就起淡入 = 淡上来一块黑；宁可等正片滚过去再硬切。
-                // READY 挡不住这种黑：它只保证缓冲够播，不保证那块 TextureView 上已经有画面，
-                // 而叠化那层是不透明铺在正片上面的，alpha 涨多少就压多少黑下去。
-                if (remaining <= ps.dissolveMs && fade.firstFrameRendered &&
-                    fade.incoming.playbackState == Player.STATE_READY && groupFadeGateOpen(surf.folderKey)) {
-                    startWindowFade(winId, fade, ps, remaining)
-                } else if (now - fade.bornAt > PREROLL_MAX_MS) {
-                    cancelWindowFade(winId, "预卷超时")
-                }
-            }
-        }
-    }
-
-    /**
-     * 整组同时起淡入才叫同步交接：只要组内最慢那扇还没到自己的淡入点，已经到点的这几扇就先别淡。
-     * 没有闸门读数（单窗 / 基准窗没落定 / 清单不一致 / 整组散开正在硬对齐）一律放行 —— 拦人的代价是
-     * 一扇窗停在屏上，等不到基准自有 SYNC_HOLD_MAX_MS 兜底，绝不能让淡入被一个算不出来的读数卡死。
-     */
-    private fun groupFadeGateOpen(folderKey: String): Boolean {
-        val gate = folderGates[folderKey] ?: return true
-        return gate.refRemainingMs <= gate.waitMs + SYNC_TOLERANCE_MS
-    }
-
-    /** 起第二路：同一份 playlist 从下一只开始，挂在正片上面那块 TextureView 上，alpha=0 先藏着 */
-    private fun beginWindowFade(winId: String, surf: VideoSurface, player: ExoPlayer) {
-        val count = player.mediaItemCount
-        if (count == 0) return
-        val next = (player.currentMediaItemIndex + 1) % count
-        val items = (0 until count).map { player.getMediaItemAt(it) }
-        val rotated = items.subList(next, count) + items.subList(0, next)
-        val view = FadeTextureView(this).apply { alpha = 0f }
-        surf.container.addView(view, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        val listener = object : Player.Listener {
-            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                // 正片自己滚到下一只了：淡入没跑完也得收尾，否则底层已经换画面、上层还在淡入同一只。
-                // 只认 AUTO —— seek / setMediaItems 也会触发这个回调，那两种不是轮播交接。
-                if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-                    mqttHandler.post { completeWindowFade(winId, "正片已滚到下一只") }
-                }
-            }
-            override fun onPlayerError(error: PlaybackException) {
-                logToFile("窗口 $winId 正片播放器出错，撤掉叠化: ${error.errorCodeName}", "ERROR", "PLAYBACK", "DISSOLVE")
-                mqttHandler.post { cancelWindowFade(winId, "正片播放器出错") }
-            }
-        }
-        player.addListener(listener)
-        val incoming = ExoPlayer.Builder(this).setLoadControl(localBufferLoadControl()).build().apply {
-            repeatMode = Player.REPEAT_MODE_ALL
-            playWhenReady = false
-            volume = 0f
-            setVideoTextureView(view)
-            setMediaItems(rotated)
-        }
-        // 监听闭包只认这一个 fade 实例：交接成功后第二路升为正片、监听还挂在它身上，
-        // 之后每只片子的首帧不能再顺手点亮下一轮叠化的标记
-        var born: WindowFade? = null
-        incoming.addListener(object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) {
-                logToFile("窗口 $winId 叠化预卷失败: ${error.errorCodeName} ${error.message ?: ""}", "WARN", "PLAYBACK", "DISSOLVE")
-                mqttHandler.post { cancelWindowFade(winId, "预卷播放器出错") }
-            }
-            override fun onRenderedFirstFrame() {
-                born?.firstFrameRendered = true
-            }
-        })
-        val fade = WindowFade(incoming, view, player, surf.texture, android.os.SystemClock.elapsedRealtime(), listener)
-        windowFades[winId] = fade
-        born = fade
-        // prepare 放在监听之后：首帧回调只认已登记的监听，早一步 prepare 会把这一帧漏成"永远没首帧"，
-        // 那这扇窗从此每次都退化成硬切，还一行日志都不留
-        incoming.prepare()
-        // 新挂上来的这块也要套同一份截取/旋转/镜像，否则淡到一半画面会突然错位
-        applyTransformWhenReady(surf.container, surf.winJson)
-        logToFile("窗口 $winId 叠化预卷：下一只开始热身（留 ${PREROLL_WARMUP_MS}ms）", "INFO", "PLAYBACK", "DISSOLVE")
-    }
-
-    /**
-     * 起淡入：上面那路 alpha 0→1，音量同步交叉（底下正片保持不透明，这就是交叉叠化）。
-     * remainingMs = 起这一刻正片还剩多少，动画就按它定长：照 dissolve_ms 定长会被片尾抢先截断
-     * （巡检 100ms 一跳，淡入最多晚起 100ms，实测 188 次收尾里 159 次都是「正片已滚到下一只」），
-     * 最后一瞬从九成直接跳到满 —— 观众看到的不是 1 秒交叉，是 0.9 秒交叉加一次小闪跳。
-     */
-    private fun startWindowFade(winId: String, fade: WindowFade, ps: PlaySettings, remainingMs: Long) {
-        // 闸门放行 = 组里最慢那扇也到自己的淡入点了：把正片从"等慢窗"的停帧里放开，两路一起走完这段
-        releaseSyncHold(winId)
-        fade.fading = true
-        fade.incoming.playWhenReady = true
-        val anim = ValueAnimator.ofFloat(0f, 1f)
-        anim.duration = remainingMs.coerceAtLeast(1L)
-        // 线性：缓动会让中段两路都半透明，画面整体发灰
-        anim.interpolator = LinearInterpolator()
-        anim.addUpdateListener {
-            val f = it.animatedValue as Float
-            fade.incomingView.alpha = f
-            fade.incoming.volume = f
-            fade.outgoing.volume = 1f - f
-        }
-        anim.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) { completeWindowFade(winId, "淡入完成") }
-        })
-        fade.animator = anim
-        anim.start()
-        logToFile("窗口 $winId 叠化开始（实际 ${anim.duration}ms，设定 ${ps.dissolveMs}ms）", "INFO", "PLAYBACK", "DISSOLVE")
-    }
-
-    /**
-     * 交接：第二路升为正片，旧那路连同它的 TextureView 一起退场。
-     * 升不上去（窗口已重建 / 正片已被别的路径换掉 / 第二路还没出首帧）就撤掉第二路，画面留给正片。
-     * 动画收尾与正片自然滚动两条路都会调到这里，windowFades.remove 的返回值保证只生效一次。
-     */
-    private fun completeWindowFade(winId: String, reason: String) {
-        val fade = windowFades.remove(winId) ?: return
-        // 交接后换了播放器实例，"等慢窗"那本账必须在这一刻清干净：留着它，下一轮会去放行一个不相干的实例
-        releaseSyncHold(winId)
-        stopFadeAnimator(fade)
-        fade.outgoing.removeListener(fade.listener)
-        val surf = videoSurfaces[winId]
-        if (surf == null || windowPlayers[winId] !== fade.outgoing || fade.incoming.playbackState != Player.STATE_READY) {
-            fade.incoming.release()
-            surf?.container?.removeView(fade.incomingView)
-            fade.outgoing.volume = 1f
-            logToFile("窗口 $winId 叠化未交接（$reason）：保持正片画面", "INFO", "PLAYBACK", "DISSOLVE")
-            ensurePlayTicker()
-            return
-        }
-        surf.container.removeView(fade.outgoingView)
-        fade.outgoing.release()
-        fade.incomingView.alpha = 1f
-        fade.incoming.volume = 1f
-        // 正片抢在淡入之前自己滚了过去的场合，第二路还停在 playWhenReady=false（预卷时就是不动的），
-        // 提升后必须补一脚，否则窗口会定格在下一只的首帧。已在播时这句是空操作。
-        fade.incoming.playWhenReady = true
-        windowPlayers[winId] = fade.incoming
-        // 清单指纹原样带过去：交接后的那一路是同一份内容换了起点，指纹一丢这扇窗就从同步组里消失了
-        videoSurfaces[winId] = VideoSurface(surf.container, fade.incomingView, surf.winJson, surf.settings,
-            surf.folderKey, surf.playlistSig)
-        applyTransformWhenReady(surf.container, surf.winJson)
-        logToFile("窗口 $winId 叠化交接完成（$reason）", "INFO", "PLAYBACK", "DISSOLVE")
-        ensurePlayTicker()
-    }
-
-    /** 撤掉第二路，画面原样留给正片（换文件夹/试播接管/配置重建/预热失败都走这里） */
-    private fun cancelWindowFade(winId: String, reason: String) {
-        val fade = windowFades.remove(winId) ?: return
-        // 正片可能正被同步组摁着等慢窗；这一路的叠化不走了，就更不能让它停在画面上
-        releaseSyncHold(winId)
-        stopFadeAnimator(fade)
-        fade.outgoing.removeListener(fade.listener)
-        fade.outgoing.volume = 1f   // 淡入中途被撤时正片音量已经被压下去了，得还回来
-        fade.incoming.release()
-        videoSurfaces[winId]?.container?.removeView(fade.incomingView)
-        logToFile("窗口 $winId 叠化取消（$reason）", "INFO", "PLAYBACK", "DISSOLVE")
-        ensurePlayTicker()
-    }
-
-    /** 必须在释放正片播放器**之前**调：cancelWindowFade 要往正片上写音量、摘监听 */
-    private fun cancelAllWindowFades(reason: String) {
-        windowFades.keys.toList().forEach { cancelWindowFade(it, reason) }
-    }
-
-    /** 摘干净再 cancel：cancel 会触发 onAnimationEnd，不摘就会重入 completeWindowFade 白跑一趟 */
-    private fun stopFadeAnimator(fade: WindowFade) {
-        val a = fade.animator ?: return
-        fade.animator = null
-        a.removeAllUpdateListeners()
-        a.removeAllListeners()
-        a.cancel()
     }
 
     // 【A-13】 大屏试播（preview_material / preview_stop）
@@ -4179,9 +3909,6 @@ class MainActivity : AppCompatActivity() {
         // 不挂 debug_mode（2026-11-08 用户定调：单击素材卡即播，营业中也要能用）。试播是内容操作，
         // 与 stop / update_windows 同级；debug 只决定运维浮层（状态文字/进度条）上不上屏，见 applyDebugUi。
         val player = windowPlayers[winId] ?: return   // previewTargets 已筛过，这里只兜并发重建
-        // 试播接管 = 硬切（用户定调）：在飞的叠化先撤掉，快照才是在屏上那只正片，
-        // 否则试播播完恢复时第二路还在淡入，画面会被拽回一个谁也没打算播的中间态
-        cancelWindowFade(winId, "试播接管")
         // 快照之前先解除"等慢窗"的摁住：不然存进去的 playWhenReady=false 会跟着恢复正片一起回来，
         // 那扇窗播完试播就再也起不来了
         releaseSyncHold(winId)
@@ -4355,14 +4082,12 @@ class MainActivity : AppCompatActivity() {
     private fun releaseAllWindows() {
         // 同 applySceneConfigs：先清试播账，再放播放器（否则看门狗/回调会对着已释放实例恢复）
         abortAllPreviews("窗口全部释放")
-        cancelAllWindowFades("窗口全部释放")
         windowPlayers.values.forEach { it.release() }
         windowPlayers.clear()
         videoSurfaces.clear()
-        // 同步组那三本账随窗口一起清：留着摁住记录，下一轮就会去放行一扇新起的、根本没被我们摁过的窗
+        // 同步组那几本账随窗口一起清：留着摁住记录，下一轮就会去放行一扇新起的、根本没被我们摁过的窗
         syncHolds.clear()
         syncAlignAt.clear()
-        folderGates.clear()
         folderAlignStrikes.clear()
         parkedFolders.clear()
         windowViews.values.forEach { flSurface?.removeView(it) }
