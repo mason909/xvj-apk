@@ -23,8 +23,10 @@
  * 【A-13】大屏试播（startGroupPreview / previewTarget / armPreview / endPreview / endPreviewCovering /
  *         abortAllPreviews；账按**格子**记，接管那一刻的正片位置抄进 PreviewState）
  * 【A-14】墙板 485 链路（applyWallPanelEnabled / applyWallPanelFields / wallPanelPath / wallPanelBaud /
- *         handleWallPanelEvent / handleWallPanelNumber / effectivePanelNo / folderForPanelNo；
- *         收帧解析与 termios 在 serial/WallPanelLink.kt）
+ *         wallPanelSerialBits / handleWallPanelEvent / applyPanelSource / panelFolderFor /
+ *         startWallPanelLearn / publishFrameSnapshot；
+ *         收帧解析与 termios 在 serial/WallPanelLink.kt，帧台账与学习表在 serial/WallPanelFrames.kt，
+ *         帧族分帧在 serial/WallPanelParser.kt）
  * （A-05 已随"单播放器点播"旧链路一起删除，编号保留空位）
  * ─────────────────────────────────────────────────
  * 
@@ -114,6 +116,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
@@ -134,7 +137,12 @@ import android.net.Uri
 import android.view.TextureView
 import org.json.JSONArray
 import com.xvj.app.databinding.ActivityMainBinding
+import com.xvj.app.serial.PanelAction
+import com.xvj.app.serial.PanelSource
+import com.xvj.app.serial.WallPanelBindings
 import com.xvj.app.serial.WallPanelEvent
+import com.xvj.app.serial.WallPanelFrameLedger
+import com.xvj.app.serial.WallPanelHex
 import com.xvj.app.serial.WallPanelLink
 import org.eclipse.paho.client.mqttv3.*
 import org.json.JSONObject
@@ -176,15 +184,26 @@ class MainActivity : AppCompatActivity() {
 
     // ========== 多窗口系统 ==========
     // A/B 两幕的窗口本来就是合并渲染的，每个窗口播什么由自己的 content 决定（没有"当前幕"状态位）。
-    // 485 墙板走独立链路：WallPanelLink 收帧 → 编号事件 → 重排跟随墙板的窗口（见 handleWallPanelNumber）。
+    // 485 墙板走独立链路：WallPanelLink 收帧 → 帧指纹查学习表 → 重排跟随墙板的窗口
+    // （见 applyPanelSource）。两路都在同一根 485 上，中控把点歌机和墙板的流量合并进来，
+    // 所以"收到一帧"和"这一帧是什么意思"是两件事：前者进 frameLedger 上报，后者才动画面。
     private var wallPanelLink: WallPanelLink? = null
     /**
-     * 本机收到过的最后一个墙板编号；null = 这台机开机至今没人按过（跟随窗口改用房间默认编号）。
-     * 只在内存里，故意不落 prefs：重启后回到"没按过"，画面落在默认编号那一格 ——
+     * 本机最近一次**动了画面**的墙板触发源；null = 这台机开机至今没收到过学过的帧
+     * （跟随窗口退回各自的固定逻辑）。只有一种源：
+     *   [PanelSource.Frame] 学习来的帧指纹，各幕按自己的绑定表各自解析出该切的格子。
+     * 只在内存里，故意不落 prefs：重启后回到"没按过"，画面落在各窗自己的固定格 ——
      * 现场要的是可预测的开机画面，而不是上一次营业结束时的状态；也因此不用跟 rev 对账。
      * 读写都在主线程（墙板事件由 WallPanelLink post 到主线程，窗口应用也在主线程）。
      */
-    private var wallPanelNo: Int? = null
+    private var panelSource: PanelSource? = null
+    /** 收到的帧去重台账：心跳带回云端做排障可见，学习模式的候选列表也从它出（主线程读写） */
+    private val frameLedger = WallPanelFrameLedger()
+    /** 学习来的「帧 → 动作」表：房间 config.wallpanel_bindings 的内存视图，随载荷整体替换 */
+    private var wallPanelBindings: WallPanelBindings = WallPanelBindings.EMPTY
+    /** 学习窗截止时刻（elapsedRealtime）；> 现在 = 正在学习，帧快照额外单独上报，不等 30s 心跳 */
+    private var learnUntilMs = 0L
+    private var learnReportRunnable: Runnable? = null
     /** windowId -> ExoPlayer 实例（每个窗口独立播放器）*/
     private val windowPlayers = mutableMapOf<String, ExoPlayer>()
     /** windowId -> View 实例（窗口视图）*/
@@ -264,8 +283,8 @@ class MainActivity : AppCompatActivity() {
     private var appliedScenesFp: String? = null
     /**
      * 屏上画面所依据的那份 scenes（全量重建/实时更新最后应用的那份载荷，不是"最新收到的配置"）。
-     * 墙板按编号切窗要拿它查 panel_no 与 windows —— 现场高频操作，不在主线程重读 prefs 里那份 JSON。
-     * 只在应用成功后赋值（与 appliedScenesFp 同步），中途抛异常时它仍是旧的那份，编号切换照着旧画面走。
+     * 墙板按学习帧切窗要拿它查绑定表与 windows —— 现场高频操作，不在主线程重读 prefs 里那份 JSON。
+     * 只在应用成功后赋值（与 appliedScenesFp 同步），中途抛异常时它仍是旧的那份，墙板切换照着旧画面走。
      */
     private var appliedScenes: org.json.JSONObject? = null
     /** 本机已应用的房间配置 rev（心跳回传，服务端拿它和房间真值比对，落后就补发同步）；重启后仍以 prefs 为准 */
@@ -321,6 +340,10 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_MD5_PREFIX = "md5_"
         /** 串口节点白名单：与前端 WP_SERIAL_PATH_RE、服务端 isSafeSerialPath 同一把尺 */
         private val WALLPANEL_PATH_RE = Regex("^/dev/[A-Za-z0-9_-]{1,64}$")
+        /** 学习窗最长时长：页面给多少都不许超过它 —— 忘了关也不能让设备一直往 broker 灌快照 */
+        private const val LEARN_MAX_S = 60
+        /** 一次快照上报几种候选帧：与前端学习列表一屏看得下的量对齐（台账本身留 24 种） */
+        private const val LEARN_FRAME_LIMIT = 8
         /** 输出基准的缺省值 = 历史口径那份 1920×1080 设计稿（房间没设 config.output 时按它换算） */
         private const val DESIGN_W = 1920
         private const val DESIGN_H = 1080
@@ -716,7 +739,13 @@ class MainActivity : AppCompatActivity() {
         // 按 prefs 里的 debug_mode 刷一次运维层（启动即决定左下角文字/进度条是否可见）
         applyDebugUi()
 
-        // 485 墙板是本地硬件链路，离线也要能用：按 prefs 恢复开关，不等云端
+        // 485 墙板是本地硬件链路，离线也要能用：先恢复学习绑定表（不然冷启动按下的第一帧查不到东西），
+        // 再按 prefs 收放链路开关
+        wallPanelBindings = WallPanelBindings.parse(
+            prefs.getString("wallpanel_bindings", null)?.let {
+                try { JSONArray(it) } catch (e: Exception) { null }
+            }
+        )
         applyWallPanelEnabled(prefs.getBoolean("wallpanel_enabled", false))
     }
 
@@ -768,14 +797,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 【A-14】 墙板 485 链路：串口收帧 → 编号事件 → 跟随窗口切文件夹
+    // 【A-14】 墙板 485 链路：串口收帧 → 帧指纹查学习表 → 跟随窗口切文件夹
     // @tag: applyWallPanelEnabled 墙板总闸 串口收放
-    // @tag: handleWallPanelNumber 编号切换 跟随窗口
-    // @tag: folderForPanelNo panel_no 反查
+    // @tag: applyPanelSource 学习帧 跟随窗口
+    // @tag: startWallPanelLearn 学习窗 候选帧 frames 上报
     //
-    // 字段真值全在云端 config 顶层（wallpanel_enabled / wallpanel_default_no / wallpanel_serial_path /
-    // wallpanel_baud），本机只落 prefs + 按 prefs 收放链路；编号→文件夹的绑定表在 scenes[X].panel_no。
-    // 这几项都故意不进 rev（服务端 roomSceneDigest 只算 scenes），掉了那一跳靠重连或手工同步自愈。
+    // 一根 485 上跑着两路话（中控把点歌机和墙板的协议合并进来），所以这一段管三件事：
+    //   收 —— WallPanelParser 按帧族 profile 定长切帧，族认不出就靠空闲（2 个字符时间）兜底分帧；
+    //       每一帧的 hex 都进 frameLedger，随心跳和学习窗上报（xvj/device/{id}/frames）给人看分帧对不对；
+    //   判 —— 只认学习表（config.wallpanel_bindings，帧指纹→文件夹）：查不到就只留痕，不猜语义；
+    //   切 —— applyPanelSource 重排 content.follow 的窗口，格子归属一律问 resolveWindowFolder。
+    // 字段真值全在云端 config 顶层（wallpanel_enabled / wallpanel_serial_path /
+    // wallpanel_baud / wallpanel_data_bits / wallpanel_parity / wallpanel_stop_bits / wallpanel_bindings），
+    // 本机只落 prefs + 按 prefs 收放链路。这些都故意不进 rev（服务端 roomSceneDigest 只算 scenes），
+    // 掉了那一跳靠重连或手工同步自愈；改绑定也不该让整间房重排素材。
 
     /**
      * wallpanel_enabled 的唯一写入口：落 prefs + 收放串口链路（口径对齐 setDebugMode）。
@@ -787,15 +822,20 @@ class MainActivity : AppCompatActivity() {
     private fun applyWallPanelEnabled(enabled: Boolean) {
         prefs.edit().putBoolean("wallpanel_enabled", enabled).apply()
         if (!enabled) {
+            stopWallPanelLearn()
             wallPanelLink?.stop()
             wallPanelLink = null
             return
         }
         val path = wallPanelPath()
         val baud = wallPanelBaud()
+        val bits = wallPanelSerialBits()
         wallPanelLink?.let {
-            if (it.path == path && it.baud == baud) return
-            logToFile("墙板串口参数改为 $path${baud?.let { " @$it" } ?: "（驱动默认速率）"}，重开链路",
+            // 字符格式变了必须重开：断帧阈值是按它算的，旧 fd 带着上一套参数会继续用错阈值
+            if (it.path == path && it.baud == baud && it.dataBits == bits.first &&
+                it.parity == bits.second && it.stopBits == bits.third
+            ) return
+            logToFile("墙板串口参数改为 $path${baud?.let { " @$it" } ?: "（驱动默认速率）"} ${bitsFormat(bits)}，重开链路",
                 "INFO", "WALLPANEL", "CONFIG")
             it.stop()
             wallPanelLink = null
@@ -803,6 +843,9 @@ class MainActivity : AppCompatActivity() {
         wallPanelLink = WallPanelLink(
             path = path,
             baud = baud,
+            dataBits = bits.first,
+            parity = bits.second,
+            stopBits = bits.third,
             onEvent = ::handleWallPanelEvent,
             onError = { msg ->
                 Log.w(TAG, "墙板串口: $msg")
@@ -813,6 +856,18 @@ class MainActivity : AppCompatActivity() {
                 logToFile(msg, "INFO", "WALLPANEL", "LINK")
             },
         ).also { it.start() }
+    }
+
+    /** 日志里那串 8N1/8E2：与 WallPanelLink 里同一口径（越界值先回落默认档再显示，别报出一个设备实际没用的组合） */
+    private fun bitsFormat(bits: Triple<Int, String, Int>): String {
+        val letter = when (bits.second) {
+            WallPanelLink.PARITY_ODD -> "O"
+            WallPanelLink.PARITY_EVEN -> "E"
+            else -> "N"
+        }
+        val d = if (bits.first in 5..8) bits.first else 8
+        val stop = if (bits.third == 2) 2 else 1
+        return "$d$letter$stop"
     }
 
     /**
@@ -832,19 +887,25 @@ class MainActivity : AppCompatActivity() {
         prefs.getInt("wallpanel_baud", 0).takeIf { it in WallPanelLink.BAUDS }
 
     /**
-     * 墙板硬件字段（默认编号 / 串口节点 / 波特率）的唯一写入口：载荷真带了那个字段才覆盖本地值
+     * 本机等墙板的字符格式（数据位, 校验, 停止位）：没落 prefs 时用 8N1 —— 这是历史行为，
+     * 老房间一个字段都没配也必须照旧工作。档位白名单与服务端/前端同一份，越界当没设。
+     */
+    private fun wallPanelSerialBits(): Triple<Int, String, Int> {
+        val d = prefs.getInt("wallpanel_data_bits", 0).takeIf { it in WallPanelLink.DATA_BITS } ?: 8
+        val p = (prefs.getString("wallpanel_parity", "") ?: "").takeIf { it in WallPanelLink.PARITIES }
+            ?: WallPanelLink.PARITY_NONE
+        val s = prefs.getInt("wallpanel_stop_bits", 0).takeIf { it in WallPanelLink.STOP_BITS } ?: 1
+        return Triple(d, p, s)
+    }
+
+    /**
+     * 墙板硬件字段（串口节点 / 波特率 / 字符格式）与学习表的唯一写入口：载荷真带了那个字段才覆盖本地值
      * （update_windows 这类载荷本来不带墙板字段，optXxx 的兜底值会把本地设置抹掉）。
      * 三个来源同为服务端 roomWallpanelFields 一份口径：auth_result / sync_room_materials 载荷、set_wallpanel。
      * 只写 prefs，不碰链路：收放串口统一由 [applyWallPanelEnabled] 按当前 prefs 决定，
      * 所以调用方必须先调本函数再调它 —— 反过来的话同一跳里改的节点/波特率要等下一次载荷才生效。
      */
     private fun applyWallPanelFields(payload: JSONObject) {
-        if (payload.has("wallpanel_default_no")) {
-            // 服务端非法值一律下发 null；JSONObject 把 null 读成 optInt 的兜底 0，正好当"没默认编号"
-            val no = payload.optInt("wallpanel_default_no", 0)
-            prefs.edit().putInt("wallpanel_default_no", if (no > 0) no else 0).apply()
-            Log.d(TAG, "墙板默认编号: ${if (no > 0) no else "无"}")
-        }
         if (payload.has("wallpanel_serial_path")) {
             // 走 opt() 而不是 optString()：org.json 把 JSON null 读成字符串 "null"，那玩意儿存进 prefs
             // 只会让下一次判重、判白名单都多一个假值（服务端恒下发字符串，本机不赌它）
@@ -864,6 +925,108 @@ class MainActivity : AppCompatActivity() {
                 prefs.edit().putInt("wallpanel_baud", b).apply()
                 logToFile("墙板波特率下发为 ${if (b > 0) "$b" else "驱动默认"}", "INFO", "WALLPANEL", "CONFIG")
             }
+        }
+        // 数据位/校验/停止位：0 / "" 都当"没设"，wallPanelSerialBits 回落 8N1（= 历史行为）
+        if (payload.has("wallpanel_data_bits")) {
+            val d = payload.opt("wallpanel_data_bits").cellInt()
+            if (d != prefs.getInt("wallpanel_data_bits", 0)) {
+                prefs.edit().putInt("wallpanel_data_bits", d).apply()
+                logToFile("墙板数据位下发为 ${if (d > 0) "$d" else "默认 8"}", "INFO", "WALLPANEL", "CONFIG")
+            }
+        }
+        if (payload.has("wallpanel_parity")) {
+            val raw = payload.opt("wallpanel_parity")
+            val p = (if (raw == null || raw === JSONObject.NULL) "" else raw.toString().trim())
+                .takeIf { it in WallPanelLink.PARITIES } ?: ""
+            if (p != (prefs.getString("wallpanel_parity", "") ?: "")) {
+                prefs.edit().putString("wallpanel_parity", p).apply()
+                logToFile("墙板校验下发为 ${if (p.isEmpty()) "默认 none" else p}", "INFO", "WALLPANEL", "CONFIG")
+            }
+        }
+        if (payload.has("wallpanel_stop_bits")) {
+            val s = payload.opt("wallpanel_stop_bits").cellInt()
+            if (s != prefs.getInt("wallpanel_stop_bits", 0)) {
+                prefs.edit().putInt("wallpanel_stop_bits", s).apply()
+                logToFile("墙板停止位下发为 ${if (s > 0) "$s" else "默认 1"}", "INFO", "WALLPANEL", "CONFIG")
+            }
+        }
+        applyWallPanelBindings(payload)
+    }
+
+    /**
+     * 学习绑定表（config.wallpanel_bindings）的唯一写入口：载荷真带了这个键才整体替换，
+     * 没带保持本机现有那份 —— 与上面几个硬件字段同一个理由（不带键的载荷不能替本机改设置）。
+     * 表不进 rev、走 set_wallpanel 轻枪下发，改一条绑定不该让整间房重排素材。
+     */
+    private fun applyWallPanelBindings(payload: JSONObject) {
+        if (!payload.has("wallpanel_bindings")) return
+        val json = payload.optJSONArray("wallpanel_bindings")
+        val parsed = WallPanelBindings.parse(json)
+        val prev = wallPanelBindings.size()
+        wallPanelBindings = parsed
+        prefs.edit().putString("wallpanel_bindings", (json ?: JSONArray()).toString()).apply()
+        logToFile("墙板学习绑定已更新：$prev → ${parsed.size()} 条", "INFO", "WALLPANEL", "CONFIG")
+        // 上一次触发源如果是一条现在已经被解绑的帧，画面不该继续拿它当"当前状态"解析
+        val hex = (panelSource as? PanelSource.Frame)?.hex
+        if (hex != null && parsed.actionFor(hex) == null) {
+            panelSource = null
+            logToFile("当前触发帧 $hex 已从绑定表解掉，跟随窗回到各自固定逻辑", "INFO", "WALLPANEL", "CONFIG")
+        }
+    }
+
+    /** 载荷里的一个"档位整数"：null/脏值/小数都当 0（= 没设），别把 JSONException 抛到下发链路上 */
+    private fun Any?.cellInt(): Int {
+        if (this == null || this === JSONObject.NULL) return 0
+        val s = toString().trim()
+        val n = s.toDoubleOrNull() ?: return 0
+        return if (n == n.toLong().toDouble()) n.toInt() else 0
+    }
+
+    /**
+     * 开学习窗（云端【S-06f】下发的 wallpanel_learn）：先清台账，让页面看到的候选帧只有
+     * "按下学习之后"收到的那几种；每来一帧上报一次快照，到期自己关。
+     * 时长夹在 1~[LEARN_MAX_S]：页面刷新、忘了关、甚至有人手搓一条命令，都不能把设备留在长期上报状态。
+     * 只在主线程调（命令处理走 mqttHandler.post 进来）。
+     */
+    private fun startWallPanelLearn(seconds: Int) {
+        val ms = seconds.coerceIn(1, LEARN_MAX_S) * 1000L
+        learnReportRunnable?.let { mqttHandler.removeCallbacks(it) }
+        learnUntilMs = SystemClock.elapsedRealtime() + ms
+        frameLedger.clear()
+        learnReportRunnable = Runnable { stopWallPanelLearn() }.also { mqttHandler.postDelayed(it, ms) }
+        logToFile("墙板学习窗已开 ${ms / 1000}s：现在请依次按要学的按键", "INFO", "WALLPANEL", "LEARN")
+        publishFrameSnapshot()
+    }
+
+    /** 关学习窗（到期自动、关总闸、页面手工关都走这里）：补一次快照，把最后收到的那几帧交给页面 */
+    private fun stopWallPanelLearn() {
+        learnReportRunnable?.let { mqttHandler.removeCallbacks(it) }
+        learnReportRunnable = null
+        if (learnUntilMs == 0L) return
+        learnUntilMs = 0L
+        logToFile("墙板学习窗已关", "INFO", "WALLPANEL", "LEARN")
+        publishFrameSnapshot()
+    }
+
+    /**
+     * 帧快照上报（xvj/device/{id}/frames）：只在开/关学习窗和学习期间每来一帧时发，
+     * 平时靠心跳顺带（sendStatus 里那段 frames）。学习页要的是"按完键马上看到候选帧"，
+     * 等 30s 心跳等于没有。服务端把它记在内存（带 TTL，不进库、不进 rev）。
+     * 失败只记日志：这一路是给人看的排障辅助，不能因为一次发布失败拖垮收帧链路。
+     */
+    private fun publishFrameSnapshot() {
+        try {
+            val id = prefs.getString("device_id", null) ?: return
+            val client = mqttClient ?: return
+            if (!client.isConnected) return
+            val payload = JSONObject().apply {
+                put("learning", learnUntilMs > 0L)
+                put("frames", frameLedger.toJson(SystemClock.elapsedRealtime(), LEARN_FRAME_LIMIT))
+                put("timestamp", System.currentTimeMillis())
+            }
+            client.publish("xvj/device/$id/frames", payload.toString().toByteArray(), 1, false)
+        } catch (e: Exception) {
+            Log.w(TAG, "墙板帧快照上报失败: ${e.message}")
         }
     }
 
@@ -889,89 +1052,98 @@ class MainActivity : AppCompatActivity() {
         logToFile("输出基准: ${nw}×${nh}", "INFO", "WINDOW", "CONFIG")
     }
 
+    /**
+     * 一帧到达要做的三件事：记账、学习期上报、判义。
+     * 记账与判义是两回事 —— 485 上点歌机和墙板合并在同一根线，先无条件留痕，现场才看得清
+     * 分帧猜得对不对（帧长/断帧阈值错了，上报的 hex 一眼就能看出来）；判义才是动画面。
+     * 判义只认学习表（人工学过的那一条说了算）：没学过的帧一律只留痕 —— 语义随厂家变，
+     * 本机不猜协议，要切哪一格由人在配置页把这一帧学进那一格。
+     * 已在主线程（WallPanelLink 把事件 post 过来了）。
+     */
     private fun handleWallPanelEvent(event: WallPanelEvent) {
+        val nowMs = SystemClock.elapsedRealtime()
+        val hex = WallPanelHex.of(event.frame)
+        frameLedger.record(hex, nowMs)
+        if (nowMs < learnUntilMs) publishFrameSnapshot()
+        if (wallPanelBindings.actionFor(hex) != null) {
+            applyPanelSource(PanelSource.Frame(hex), hex)
+            return
+        }
         when (event) {
             is WallPanelEvent.NumberSelect ->
-                // 1~32 是编号的域（与前端 WP_PANEL_MAX、服务端 PANEL_NO_MAX 同一把尺）；
-                // 写成 1..30 会让 31/32 号绑了也按不到 —— 30 是文件夹的个数，不是编号的个数
-                if (event.number in 1..32) handleWallPanelNumber(event.number)
-                else logToFile("墙板发来越界编号 ${event.number}（有效域 1~32），已丢弃", "WARN", "WALLPANEL", "SKIP")
+                logToFile("墙板编号帧 $hex 未绑定只留痕（要切格请在配置页学进那一格）", "INFO", "WALLPANEL", "FRAME")
             is WallPanelEvent.Command ->
-                Log.d(TAG, "墙板功能帧: family=0x${Integer.toHexString(event.family)} key=0x${Integer.toHexString(event.key)}")
-            is WallPanelEvent.Raw -> Log.d(TAG, "墙板原始帧: " + event.bytes.joinToString(" ") { String.format("%02X", it) })
+                logToFile("墙板功能帧 $hex family=0x${Integer.toHexString(event.family)} key=0x${Integer.toHexString(event.key)}，未绑定只留痕",
+                    "INFO", "WALLPANEL", "FRAME")
+            is WallPanelEvent.Unknown ->
+                logToFile("未识别帧 $hex（${event.frame.size} 字节），未绑定只留痕", "INFO", "WALLPANEL", "FRAME")
         }
     }
 
     /**
-     * 编号事件的落点：先把这一号记下来，再把所有跟随墙板的窗口切到这一号绑定的那一格。
+     * 触发源的落点：先把这一源记下来，再把所有跟随墙板的窗口切到它对应的那一格。
      * 口径：
      *   只动 content.follow == true 的窗口 —— folderId 是人工钉死的，墙板不越权去改它；
      *   播哪一格一律交给 resolveWindowFolder，与全量重建同一个入口，两处不会各漂一份；
-     *   解析不出目标格（这一号没绑 / 那格不在映射里）→ 那扇窗保持原样，宁可停在旧画面也不切到黑屏；
-     *   正在试播的那一格先收尾再切 —— 不收的话试播播完的恢复回调会把画面拽回按号之前。
+     *   解析不出目标格（这一帧这一幕没绑 / 那格不在映射里）→ 那扇窗保持原样，宁可停在旧画面也不切到黑屏；
+     *   正在试播的那一格先收尾再切 —— 不收的话试播播完的恢复回调会把画面拽回按键之前。
      * 必须在主线程调用（换 playlist）；WallPanelLink 的事件已经 post 到主线程。
      */
-    private fun handleWallPanelNumber(number: Int) {
-        // 同一号连着按只认第一次：重播会把跟随窗口全拽回片头，现场看就是"突然跳帧"。
-        // 不怕漏掉后续变化 —— panel_no 表在 scenes 指纹里，改绑定必然触发一次全量重建重排。
-        if (wallPanelNo == number) {
-            Log.d(TAG, "墙板编号 $number 已是当前编号，跳过重播")
-            logToFile("墙板重复按同一号 $number，画面已在该号，跳过重播", "INFO", "WALLPANEL", "SKIP")
+    private fun applyPanelSource(source: PanelSource, hex: String) {
+        // 同一个源连着按只认第一次：重播会把跟随窗口全拽回片头，现场看就是"突然跳帧"。
+        // 不怕漏掉后续变化 —— 改绑定会走 applyWallPanelBindings 重新落地并触发重排，
+        // 画面不会停在旧源上。
+        if (panelSource == source) {
+            logToFile("墙板重复触发 ${describeSource(source)}，画面已在该位置，跳过重播", "INFO", "WALLPANEL", "SKIP")
             return
         }
-        Log.d(TAG, "墙板编号切换: $number")
-        logToFile("墙板编号切换: $number", "INFO", "WALLPANEL", "SWITCH")
-        wallPanelNo = number
+        logToFile("墙板触发 ${describeSource(source)}（$hex）", "INFO", "WALLPANEL", "SWITCH")
+        panelSource = source
         val scenes = appliedScenes
         if (scenes == null) {
-            logToFile("墙板编号 $number 未生效：本机还没应用过窗口配置", "WARN", "WALLPANEL", "SKIP")
+            logToFile("墙板触发 ${describeSource(source)} 未生效：本机还没应用过窗口配置", "WARN", "WALLPANEL", "SKIP")
             return
         }
         val allWindows = mergeSceneWindows(scenes)
         val follows = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }
             .map { Pair(it.optString("id"), it.optJSONObject("content") ?: JSONObject()) }
             .filter { it.second.optBoolean("follow", false) && isVideoContentType(it.second) }
-        // 共享组必须整组同格才成立：成员被编号分到不同格子（或某一格解析不出素材）时组的构成就变了，
+        // 共享组必须整组同格才成立：成员被墙板分到不同格子（或某一格解析不出素材）时组的构成就变了，
         // 原地重排做不到（解码路数跟着变），只能回全量重建。墙板切格本来就低频。
         if (shareGroups.isNotEmpty() && follows.isNotEmpty()) {
             val newFolder = follows.associate { (id, content) -> id to resolveWindowFolder(scenes, content, id) }
             val broken = shareGroups.values.any { grp -> grp.members.map { newFolder[it] }.distinct().size > 1 }
             if (broken) {
-                logToFile("墙板编号 $number 会让共享解码组的成员分家，回退全量重建", "INFO", "WALLPANEL", "REBUILD")
+                logToFile("墙板触发 ${describeSource(source)} 会让共享解码组的成员分家，回退全量重建", "INFO", "WALLPANEL", "REBUILD")
                 applySceneConfigs(scenes, force = true)
                 return
             }
         }
         for ((winId, content) in follows) {
-            endPreviewCovering(winId, "墙板编号切换")
+            endPreviewCovering(winId, "墙板切换")
             val folderId = resolveWindowFolder(scenes, content, winId)
             if (folderId == null) {
-                Log.w(TAG, "窗口 $winId 跟随墙板编号 $number 解析不到可播的文件夹，保持原画面")
-                logToFile("窗口 [$winId] 编号 $number 无可播文件夹，保持原画面", "WARN", "WALLPANEL", "SKIP")
+                Log.w(TAG, "窗口 $winId 跟随墙板 ${describeSource(source)} 解析不到可播的文件夹，保持原画面")
+                logToFile("窗口 [$winId] ${describeSource(source)} 无可播文件夹，保持原画面", "WARN", "WALLPANEL", "SKIP")
             } else {
                 playFolderInWindow(winId, folderId)
             }
         }
     }
 
-    /**
-     * 当前生效的墙板编号：按过的最后一号优先，没人按过才用房间默认编号（config.wallpanel_default_no，
-     * 随载荷落 prefs）。返回 null = 两者都没有，跟随窗口退回自己的 folderId / 自动选择逻辑。
-     */
-    private fun effectivePanelNo(): Int? =
-        wallPanelNo ?: prefs.getInt("wallpanel_default_no", 0).takeIf { it > 0 }
+    /** 日志里对触发源的唯一称呼 */
+    private fun describeSource(source: PanelSource): String = when (source) {
+        is PanelSource.Frame -> "学习帧 ${source.hex}"
+    }
 
     /**
-     * scenes[X].panel_no 反查：这一幕里编号 no 绑的是哪一格，返回不带幕前缀的文件夹编号（"12"）。
-     * 表是 {文件夹: 编号}，反查只能遍历；服务端 buildPrefixedScenes 出的键带幕前缀（"A01"），
-     * 老载荷可能没带，两种都认。值按字符串再转整数 —— org.json 里 3 可能是 Integer 也可能是 "3"，别赌。
+     * 当前触发源对应哪一格（跟随窗口在 resolveWindowFolder 里问这一句）：
+     *   学习帧 → 绑定表；没学过这一帧（或没按过）就返回 null，窗口退回自己的固定逻辑，不劫持。
+     * 一格一码、不分幕：A/B 两幕问出来是同一格。返回不带幕前缀的格子编号。
      */
-    private fun folderForPanelNo(scenes: JSONObject, sceneKey: String, no: Int): String? {
-        val table = scenes.optJSONObject(sceneKey)?.optJSONObject("panel_no") ?: return null
-        table.keys().forEach { fid ->
-            if (table.opt(fid).toString().trim().toIntOrNull() == no) return fid.removePrefix(sceneKey)
-        }
-        return null
+    private fun panelFolderFor(): String? {
+        val hex = (panelSource as? PanelSource.Frame)?.hex ?: return null
+        return (wallPanelBindings.actionFor(hex) as? PanelAction.Folder)?.folder
     }
 
     // 【A-02】 MQTT 连接
@@ -1120,10 +1292,11 @@ class MainActivity : AppCompatActivity() {
      *             服务端【S-06】reconcileDeviceRev 拿它和房间真值比对，落后就补发一次同步 ——
      *             这是 QoS 丢消息 / 设备离线期间改配置的唯一兜底收敛路径。
      *   syncing = 此刻是否有素材对账在飞；为 true 时服务端跳过对账，免得下载中途被再插一刀。
-     *   panel_no = 本机当前生效的墙板编号（按过的最后一号，没按过则是房间默认编号）；
-     *              两者都没有就不带这个字段，服务端据此清掉这台机的显示值。
      *   screen_w/screen_h = 本机 windowGeom 换算用的那对像素（displayMetrics，与落屏分母同源，不是 dp）；
      *              编辑器画布拿它当"取本机"的一键基准。内存里 90s 过期，不进库 —— 心跳 30s 一报，够新。
+     *   frames  = 最近 1 分钟内收到的 485 帧指纹（[{hex,n,age}]，最多 8 种）；一段都没收到就不带这个字段，
+     *              服务端据此清掉这台机的显示值。后台拿它判"分帧对不对"和学习模式的候选帧，
+     *              所以它是瞬时状态：只进内存台账，不进 rev，也不进库。
      * 服务端把 status 落到 devices.status、整段原文存 devices.status_data（该列没有读侧），
      * 并因带了 version/version_code 而 UPSERT device_versions —— 后台"版本管理"页看的正是这张表。
      * 未授权设备同样在上报，服务端不区分；心跳本身 30s 一次，不写 operation_logs。
@@ -1140,11 +1313,13 @@ class MainActivity : AppCompatActivity() {
                 put("version_code", VERSION_CODE)
                 put("syncing", syncing)
                 if (appliedRev.isNotEmpty()) put("rev", appliedRev)
-                effectivePanelNo()?.let { put("panel_no", it) }
                 // 与 windowGeom 同源的那对像素（本 Handler 挂在主 looper 上，读 Resources 不必绕线程）
                 val dm = resources.displayMetrics
                 put("screen_w", dm.widthPixels)
                 put("screen_h", dm.heightPixels)
+                // 台账为空（这一分钟没帧）就整段不带：服务端把"没带"当清掉显示值，留着上一轮的旧帧反而误导
+                val frames = frameLedger.toJson(SystemClock.elapsedRealtime())
+                if (frames.length() > 0) put("frames", frames)
                 put("timestamp", System.currentTimeMillis())
             }
             mqttClient?.publish(statusTopic, payload.toString().toByteArray(), 1, false)
@@ -1229,8 +1404,8 @@ class MainActivity : AppCompatActivity() {
                             binding.statusText?.text = "已授权至房间 $roomId"
                             // 停止欢迎视频等旧播放器
                             releasePlayer()
-                            // 墙板字段要先于 applySceneConfigs：跟随窗口第一次落屏就按房间的默认编号选格，
-                            // 排在后面建完窗才落 prefs，这一场同步里跟随窗口就先播别的格、等下次按号才归位。
+                            // 墙板字段要先于 applySceneConfigs：跟随窗口第一次落屏就要能查学习表，
+                            // 排在后面建完窗才落 prefs，这一场同步里跟随窗口就先播别的格、等下次按键才归位。
                             // 也要先于 applyWallPanelEnabled：节点/波特率这一跳可能一起变，先落 prefs 再开链路
                             // 才只开一次（反过来会拿旧参数开一遍、发现变了再重开，端口白闪断一轮）。
                             // auth_result 也带这几个字段（服务端 roomSyncFields 一处收口），
@@ -1410,8 +1585,10 @@ class MainActivity : AppCompatActivity() {
      *   update              OTA：带 url/version/md5 → downloadAndInstall
      *   set_debug           立即开关 debug_mode（前端没有入口，只能手工 POST /api/devices/:id/command；
      *                       正常途径是 sync_room_materials / auth_result 载荷里的 debug 字段）
-     *   set_wallpanel       立即开关 485 墙板串口链路 + 默认编号/串口节点/波特率（同 set_debug：临时值，
-     *                       房间 config.wallpanel_* 才是真相，下一次带这些字段的载荷会覆盖）
+     *   set_wallpanel       立即开关 485 墙板串口链路 + 串口节点/字符格式/学习表（同 set_debug：
+     *                       临时值，房间 config.wallpanel_* 才是真相，下一次带这些字段的载荷会覆盖）
+     *   wallpanel_learn     开/关学习窗：开窗清空帧台账并在每一帧到达时上报候选列表，
+     *                       页面据此让人选中格子后按键、把那一帧绑上去
      *   preview_material    在播这一格的所有窗口里同步试播一只本机素材，播完同步回到原画面
      *                       （目标窗口由设备按 folder_id 认，见 startGroupPreview）
      *   preview_stop        收掉试播、归还画面（按 folder_id 收那一格，不带则全收）
@@ -1589,10 +1766,18 @@ class MainActivity : AppCompatActivity() {
                     // wallpanel_enabled 同走 applyWallPanelEnabled。同 set_debug 一样是临时值：
                     // 房间 config.wallpanel_enabled 才是真相，下一次载荷会按它覆盖。
                     val enabled = cmd.optBoolean("wallpanel_enabled", false)
-                    applyWallPanelFields(cmd)   // 先落节点/波特率，再按新参数收放链路（同 auth_result 处口径）
+                    applyWallPanelFields(cmd)   // 先落节点/速率/字符格式/学习表，再按新参数收放链路（同 auth_result 处口径）
                     applyWallPanelEnabled(enabled)
                     Log.d(TAG, "set_wallpanel: enabled=$enabled")
-                    logToFile("墙板开关变更: enabled=$enabled 串口=${wallPanelPath()} 波特率=${wallPanelBaud() ?: "驱动默认"}")
+                    logToFile("墙板开关变更: enabled=$enabled 串口=${wallPanelPath()} 波特率=${wallPanelBaud() ?: "驱动默认"} ${bitsFormat(wallPanelSerialBits())}")
+                }
+                "wallpanel_learn" -> {
+                    // 学习窗（云端【S-06f】）：只控制"要不要把每一帧的候选列表即时上报"，
+                    // 不动链路、不动画面 —— 学习期间按下的键照常生效（已知帧族仍然切格），
+                    // 现场不会因为你正在配绑定而看到两套行为。
+                    val on = cmd.optBoolean("on", true)
+                    val seconds = cmd.optInt("seconds", 20)
+                    mqttHandler.post { if (on) startWallPanelLearn(seconds) else stopWallPanelLearn() }
                 }
                 "preview_material" -> {
                     // 大屏试播（云端【S-05p】POST /api/rooms/:id/preview）：带幕前缀的物理目录、落盘文件名
@@ -2234,6 +2419,10 @@ class MainActivity : AppCompatActivity() {
         // 撤销挂起的续装轮询（retryPendingInstall），Activity 没了再复查只会崩
         installRetryHandler.removeCallbacksAndMessages(null)
         // 485 墙板串口链路随 Activity 收摊（开关真值在 prefs，重启自恢复）
+        // 学习窗只撤定时器、不调 stopWallPanelLearn()：进程都要没了，再补一次"已关"快照是纯噪声
+        learnReportRunnable?.let { mqttHandler.removeCallbacks(it) }
+        learnReportRunnable = null
+        learnUntilMs = 0L
         wallPanelLink?.stop()
         wallPanelLink = null
         // mqttHandler 上挂着窗口启播、rev 记账、重连倒计时、进度条刷新，全部按"界面还在"写的，
@@ -2908,7 +3097,7 @@ class MainActivity : AppCompatActivity() {
         windowContentSigs.clear()
 
         // 收集所有场景的窗口，A 和 B 的 windows 合并后统一渲染
-        // 每个窗口播什么由自身 content 决定，不需要"当前幕"概念（485 墙板走独立链路，见 handleWallPanelNumber）
+        // 每个窗口播什么由自身 content 决定，不需要"当前幕"概念（485 墙板走独立链路，见 applyPanelSource）
         val allWindows = mergeSceneWindows(scenes)
 
         // 若所有场景均无窗口，为 Scene A 创建默认全屏窗口
@@ -2965,11 +3154,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 一扇窗在这幕里该播哪一格 —— 全量重建（applySceneConfigs）和墙板切换（handleWallPanelNumber）
+     * 一扇窗在这幕里该播哪一格 —— 全量重建（applySceneConfigs）和墙板切换（applyPanelSource）
      * 都走这一个入口：两处各写一份时口径必然漂（folderId 带不带幕前缀就漂过一次）。
      * 解析次序：
-     *   跟随墙板（content.follow）→ 生效编号反查 panel_no 拿到的那一格；反查不中（没按过、没默认编号、
-     *     这一号没绑）就退回下面的固定逻辑，不劫持；
+     *   跟随墙板（content.follow）→ 当前触发源对应的那一格（panelFolderFor：学习帧查绑定表）；
+     *     没按过 / 没学这一帧就退回下面的固定逻辑，不劫持；
      *   content.folderId 非空 → 只播指定那格，不在映射/那格空则 null（不偷偷换播别的格）；
      *   两者都空 → 本幕第一个有素材的文件夹（旧配置行为，也是没配映射时的兜底）。
      * @return 带幕前缀的物理目录 id（playFolderInWindow 的 folderId 入参口径），null = 这一窗不播
@@ -2987,13 +3176,16 @@ class MainActivity : AppCompatActivity() {
             .map { fid -> fid to (mappings.get(fid) as? org.json.JSONArray ?: org.json.JSONArray()) }
             .toList()
 
-        val panelNo = if (content.optBoolean("follow", false)) effectivePanelNo() else null
-        val panelFolder = panelNo?.let { folderForPanelNo(scenes, sceneKey, it) }
+        // 跟随的落点只看当前触发源（panelFolderFor：学习帧查绑定表，一格一码不分幕）。
+        // 全量重建和墙板切换必须同一个入口：各写一份时，重建会把人工学好的那一格忘掉，
+        // 只有墙板正好按下时才切得对。
+        val panelFolder = if (content.optBoolean("follow", false)) panelFolderFor() else null
         // 指定了文件夹（content.folderId，纯编号如 "02"）：只播指定目录，
         // 该目录无素材/未映射时告警跳过，不偷偷换播别的文件夹
         val requested = panelFolder ?: content.optString("folderId", "").trim()
         if (panelFolder != null) {
-            logToFile("窗口 [$type] 跟随墙板编号 $panelNo → 文件夹 $panelFolder", "INFO", "WALLPANEL", "SELECT")
+            val srcText = panelSource?.let { describeSource(it) } ?: "未触发"
+            logToFile("窗口 [$type] 跟随$srcText → 文件夹 $panelFolder", "INFO", "WALLPANEL", "SELECT")
         }
         if (requested.isEmpty()) {
             // 未指定：自动选场景中第一个有素材的文件夹（旧配置向后兼容）
@@ -3756,7 +3948,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 查这一格的播放设置（云端 scenes[X].play_settings）。
      * folderId 是物理目录 id（"A01"，见 resolveWindowFolder）；表键服务端 buildPrefixedScenes 已加幕前缀，
-     * 老载荷可能是裸 "01"，两种都认 —— 与 folderForPanelNo 同一套容忍。
+     * 老载荷可能是裸 "01"，两种都认。
      * A、B 是两套独立素材目录，所以带前缀时只查本幕，不跨幕兜底；裸 folderId 的老配置才两幕都试。
      */
     private fun playSettingsOf(scenes: JSONObject?, folderId: String): PlaySettings {

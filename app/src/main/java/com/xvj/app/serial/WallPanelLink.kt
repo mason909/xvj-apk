@@ -2,6 +2,7 @@ package com.xvj.app.serial
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
@@ -28,11 +29,26 @@ class WallPanelLink(
     val path: String = DEFAULT_PATH,
     /** 波特率：null = 不下发速率参数，端口保持它当前的速率。同 path，上层靠它判断要不要重开链路。 */
     val baud: Int? = null,
+    /** 数据位 5~8：各中控厂家的固件默认档不一样，8 是最常见的那一档，但不能当成永远成立。 */
+    val dataBits: Int = 8,
+    /** 校验 none/odd/even：'even' = 有校验位但不取反（stty 的 parenb -parodd）。 */
+    val parity: String = PARITY_NONE,
+    /** 停止位 1~2 */
+    val stopBits: Int = 1,
     private val onEvent: (WallPanelEvent) -> Unit,
     private val onError: (String) -> Unit = {},
     private val onNotice: (String) -> Unit = {},
 ) {
     private val main = Handler(Looper.getMainLooper())
+
+    // 越界值一律当默认档（云端写库前已 400 拦过，这里只是本机不被脏载荷带跑）。
+    // 必须排在 gapMs 之前：字符格式决定断帧阈值，属性按声明顺序初始化，反了就拿到 0。
+    private val safeDataBits = if (dataBits in 5..8) dataBits else 8
+    private val safeStopBits = if (stopBits == 2) 2 else 1
+    private val safeParity = if (parity == PARITY_ODD || parity == PARITY_EVEN) parity else PARITY_NONE
+
+    /** 空闲断帧阈值：由速率和字符格式算出来的"2 个字符时间"，未知厂家帧族全靠它切帧。 */
+    private val gapMs = WallPanelParser.gapMsOf(baud, safeDataBits, if (safeParity == PARITY_NONE) 0 else 1, safeStopBits)
 
     /** 这个 fd 的唯一持有者：close 只发生在 closePort 一处（老写法 input/output 各包同一个 fd，stop 时关两次）。 */
     private var input: FileInputStream? = null
@@ -79,7 +95,7 @@ class WallPanelLink(
         input = stream
         val gen = ++generation
         reading = true
-        val parser = WallPanelParser()
+        val parser = WallPanelParser(gapMs)
         Thread({ readLoop(gen, parser) }, THREAD_NAME).start()
         Log.i(TAG, "墙板串口已打开: $path")
         if (fails > 0) {
@@ -112,24 +128,49 @@ class WallPanelLink(
     }
 
     /**
-     * 收帧前把端口打成 raw：规范模式下 6 字节二进制帧会被行规程改写
+     * 收帧前把端口打成 raw：规范模式下二进制帧会被行规程改写
      * （攒到换行才返回、0x0D 转 0x0A、0x11/0x13 被当 XON/XOFF 启停流吃掉）。
      * toybox 的 raw 不含 -echo/cs8/-parenb/-crtscts，这几位得显式给：485 是半双工，
      * 回显会把收到的字节顶回总线撞上墙板自己的发送；两线制没有 CTS 可等。
+     * 数据位/校验/停止位按房间下发（各中控厂家的固件档位不同，8N1 只是最常见的那一档，不是恒等式），
+     * 这三位的形状还决定空闲断帧阈值，所以不能"猜一个"—— 见 [gapMs]。
      * 在读线程里跑 —— stty 是外部进程，放主线程会卡 UI。
      */
     private fun configurePort(gen: Int) {
-        val args = mutableListOf("stty", "-F", path,
-            "raw", "-echo", "cs8", "-parenb", "-cstopb", "-crtscts", "cread", "clocal")
+        val args = mutableListOf("stty", "-F", path, "raw", "-echo", "cs$safeDataBits")
+        args.addAll(parityFlags())
+        args.addAll(stopFlags())
+        args.addAll(listOf("-crtscts", "cread", "clocal"))
         baud?.let { args.add(it.toString()) }
         val err = runStty(args)
         if (gen != generation) return   // 配置期间端口已被关掉/重开：这条结果说的是上一个 fd，别报给现场
         val msg = if (err == null)
-            "墙板串口已设为 raw 8N1 ${baud?.let { "$it baud" } ?: "（本次未改速率）"}: $path"
+            "墙板串口已设为 raw $charFormat ${baud?.let { "$it baud" } ?: "（本次未改速率）"}, 断帧 ${gapMs}ms: $path"
         else "墙板串口参数未确认生效（$err），链路继续收帧: $path"
         if (err == null) Log.i(TAG, msg) else Log.w(TAG, msg)
         main.post { if (err == null) onNotice(msg) else onError(msg) }
     }
+
+    /** 8N1 / 8E1 / 7O2 那套写法：进日志给人看，也是现场对表的凭据 */
+    private fun charFormat(): String = "$safeDataBits$parityLetter$safeStopBits"
+
+    private val parityLetter: String = when (safeParity) {
+        PARITY_ODD -> "O"
+        PARITY_EVEN -> "E"
+        else -> "N"
+    }
+
+    /**
+     * stty 的校验位参数：无校验要显式 -parenb，odd = parenb + parodd，even = parenb + -parodd。
+     * 返回**多个** argv —— 合成一个带空格串的传法是无效的，stty 会把它当成一个看不懂的选项。
+     */
+    private fun parityFlags(): List<String> = when (safeParity) {
+        PARITY_ODD -> listOf("parenb", "parodd")
+        PARITY_EVEN -> listOf("parenb", "-parodd")
+        else -> listOf("-parenb")
+    }
+
+    private fun stopFlags(): List<String> = if (safeStopBits == 2) listOf("cstopb") else listOf("-cstopb")
 
     /** 跑一次 stty：null = 成功，否则是失败原因。看门狗兜底 —— 进程吊住也不能把读线程永远占着。 */
     private fun runStty(args: List<String>): String? {
@@ -169,13 +210,18 @@ class WallPanelLink(
             while (reading) {
                 val n = stream.available()
                 if (n <= 0) {
-                    Thread.sleep(POLL_MS)
+                    // 没有新字节 = 线路可能安静下来了，空闲断帧只在这个时机判（帧内的字节到达不给它机会切）
+                    parser.onIdle(SystemClock.elapsedRealtime())?.let { event -> main.post { onEvent(event) } }
+                    // 半帧还在攒时贴紧一点轮询：断帧阈值可能只有 1ms，慢轮询会把阈值糊过去
+                    Thread.sleep(if (parser.busy()) BUSY_POLL_MS else POLL_MS)
                     continue
                 }
                 val got = stream.read(chunk, 0, minOf(chunk.size, n))
                 if (got <= 0) break
+                // 一次 read 拿到的这批字节同属一个到达窗口，时间戳就取这一次；逐字节造时间是假精度
+                val nowMs = SystemClock.elapsedRealtime()
                 for (i in 0 until got) {
-                    parser.feed(chunk[i].toInt() and 0xFF)?.let { event ->
+                    parser.feed(chunk[i].toInt() and 0xFF, nowMs)?.let { event ->
                         main.post { onEvent(event) }
                     }
                 }
@@ -203,8 +249,22 @@ class WallPanelLink(
 
         /** 房间能下发的波特率档位（与服务端 WALLPANEL_BAUDS、前端 WP_SERIAL_BAUDS 同一份）；不在档内 = 不改速率 */
         val BAUDS = listOf(1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200)
+
+        /** 校验档位（与服务端 WALLPANEL_PARITIES、前端 WP_SERIAL_PARITIES 同一份） */
+        const val PARITY_NONE = "none"
+        const val PARITY_ODD = "odd"
+        const val PARITY_EVEN = "even"
+        val PARITIES = listOf(PARITY_NONE, PARITY_ODD, PARITY_EVEN)
+
+        /** 数据位与停止位档位（同服务端校验） */
+        val DATA_BITS = listOf(5, 6, 7, 8)
+        val STOP_BITS = listOf(1, 2)
+
         private const val STTY_TIMEOUT_MS = 3000L
         private const val POLL_MS = 20L
+
+        /** 半帧在攒时的轮询节奏：断帧阈值按 115200 算只有 0.17ms，20ms 一跳会把阈值糊成一整段 */
+        private const val BUSY_POLL_MS = 2L
         private const val RETRY_MIN_MS = 5000L
         private const val RETRY_MAX_MS = 30000L
         private const val THREAD_NAME = "wallpanel-serial"
