@@ -109,7 +109,7 @@ class WallPanelParser(private val gapMs: Long = WallPanelParser.DEFAULT_GAP_MS) 
         /** 速率不知道时的兜底静默间隔（按 9600 8N1 的 2 字符时间取整，宁大勿小） */
         const val DEFAULT_GAP_MS = 3L
 
-        private fun qi(v: Int) = v and 0xFF
+        private fun qi(v: Byte) = v.toInt() and 0xFF
 
         /**
          * 静默断帧阈值 = 2 个字符时间 = 2 ×(1 起始位 + 数据位 + 校验位 + 停止位) / 波特率。

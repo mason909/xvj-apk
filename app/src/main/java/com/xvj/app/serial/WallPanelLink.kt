@@ -145,7 +145,7 @@ class WallPanelLink(
         val err = runStty(args)
         if (gen != generation) return   // 配置期间端口已被关掉/重开：这条结果说的是上一个 fd，别报给现场
         val msg = if (err == null)
-            "墙板串口已设为 raw $charFormat ${baud?.let { "$it baud" } ?: "（本次未改速率）"}, 断帧 ${gapMs}ms: $path"
+            "墙板串口已设为 raw ${charFormat()} ${baud?.let { "$it baud" } ?: "（本次未改速率）"}, 断帧 ${gapMs}ms: $path"
         else "墙板串口参数未确认生效（$err），链路继续收帧: $path"
         if (err == null) Log.i(TAG, msg) else Log.w(TAG, msg)
         main.post { if (err == null) onNotice(msg) else onError(msg) }
