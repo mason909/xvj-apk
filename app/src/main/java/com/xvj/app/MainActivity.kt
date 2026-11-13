@@ -20,8 +20,8 @@
  * 【A-10】系统 UI（hideSystemUI）
  * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint / calculateMd5）
  * 【A-12】播放设置（playSettingsOf / playSettingsJson）
- * 【A-13】大屏试播（startGroupPreview / previewTargets / startWindowPreview / restorePreviewGroup /
- *         restoreWindowPreview / abortAllPreviews；接管那一刻的正片位置按 groupClock / folderPlaylists 记）
+ * 【A-13】大屏试播（startGroupPreview / previewTarget / armPreview / endPreview / endPreviewCovering /
+ *         abortAllPreviews；账按**格子**记，接管那一刻的正片位置抄进 PreviewState）
  * 【A-14】墙板 485 链路（applyWallPanelEnabled / applyWallPanelFields / wallPanelPath / wallPanelBaud /
  *         handleWallPanelEvent / handleWallPanelNumber / effectivePanelNo / folderForPanelNo；
  *         收帧解析与 termios 在 serial/WallPanelLink.kt）
@@ -45,7 +45,7 @@
  *   - 本机不自己算 rev（算不出服务端那套序列化口径），只负责"落地了哪一版就回传哪一版"
  *   - 【唯一的例外】试播 preview_material / preview_stop 完全不参与这套契约：它不改配置、不带 rev、
  *     不落 prefs，所以服务端也不会为它补发 —— 命令丢了就是没播。它的全部生命周期在内存里，
- *     设备重启或任何一次窗口重建都会把它抹掉，画面回到 config 说的样子（见 startWindowPreview）
+ *     设备重启或任何一次窗口重建都会把它抹掉，画面回到 config 说的样子（见 armPreview）
  * 
  * 房间调试模式（debug_mode）：
  *   - 写入只经 setDebugMode()，三个来源：auth_result 与 sync_room_materials 的 debug 字段、
@@ -192,7 +192,9 @@ class MainActivity : AppCompatActivity() {
     /** windowId -> 内容签名（type|folderId|color|inputIndex|follow），实时更新时判定结构变化用 */
     private val windowContentSigs = mutableMapOf<String, String>()
     /**
-     * windowId -> 进行中的大屏试播（见 startWindowPreview）。
+     * folderKey（格子）-> 进行中的大屏试播（见 armPreview）。
+     * 键是格子不是窗口：#175 之后一格只有一路解码，试播天然是"这一格"的事件，
+     * 按窗口记会让云端点名的那扇（zIndex 最高，多半是共享组成员、没有播放器）打不中账。
      * 只活在内存里：设备重启、窗口重建都会自然结束它，试播因此不需要任何持久化，
      * 也不可能反过来污染配置 —— 这正是它可以完全绕开 rev 对账的原因。
      */
@@ -203,8 +205,6 @@ class MainActivity : AppCompatActivity() {
      * 永远不可能成立。清单是否在效按 URI 逐个比（见 sameItems），同步增删过文件自然作废。
      */
     private val folderPlaylists = mutableMapOf<String, List<MediaItem>>()
-    /** folderId -> 试播接管那一刻的正片位置。全组一把，恢复时全组回到同一个点，顺序才不会再分家。 */
-    private val previewClocks = mutableMapOf<String, RotationClock>()
     /** 看门狗二次武装的上限：拿到真实片长后按 duration+15s 重排，最长不超过这个值（长片不该被一刀砍） */
     private val PREVIEW_HARD_CAP_MS = 30 * 60 * 1000L
     /**
@@ -400,7 +400,7 @@ class MainActivity : AppCompatActivity() {
             PrintWriter(FileWriter(logFile, true)).use { it.println(logLine) }
 
             // 只有debug_mode开启时才MQTT上报日志。试播（action=PREVIEW）例外：它不挂 debug（见
-            // startWindowPreview），而"本机没有这只素材"这类设备侧拒绝只有这一条回执 —— 跟着 debug
+            // armPreview），而"本机没有这只素材"这类设备侧拒绝只有这一条回执 —— 跟着 debug
             // 一起关掉，就等于单击之后屏上没动静、页面上也查不到原因。
             if (prefs.getBoolean("debug_mode", false) || action == "PREVIEW") {
                 // 身份统一用 deviceId：服务端 device_logs.device_id 取自 topic，前端按 devices.id 查询
@@ -908,7 +908,7 @@ class MainActivity : AppCompatActivity() {
      *   只动 content.follow == true 的窗口 —— folderId 是人工钉死的，墙板不越权去改它；
      *   播哪一格一律交给 resolveWindowFolder，与全量重建同一个入口，两处不会各漂一份；
      *   解析不出目标格（这一号没绑 / 那格不在映射里）→ 那扇窗保持原样，宁可停在旧画面也不切到黑屏；
-     *   正在试播的窗口先收尾再切 —— 不收的话试播播完的恢复回调会把画面拽回按号之前。
+     *   正在试播的那一格先收尾再切 —— 不收的话试播播完的恢复回调会把画面拽回按号之前。
      * 必须在主线程调用（换 playlist）；WallPanelLink 的事件已经 post 到主线程。
      */
     private fun handleWallPanelNumber(number: Int) {
@@ -943,7 +943,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         for ((winId, content) in follows) {
-            if (previews.containsKey(winId)) restorePreviewGroup(winId, "墙板编号切换")
+            endPreviewCovering(winId, "墙板编号切换")
             val folderId = resolveWindowFolder(scenes, content, winId)
             if (folderId == null) {
                 Log.w(TAG, "窗口 $winId 跟随墙板编号 $number 解析不到可播的文件夹，保持原画面")
@@ -1414,7 +1414,7 @@ class MainActivity : AppCompatActivity() {
      *                       房间 config.wallpanel_* 才是真相，下一次带这些字段的载荷会覆盖）
      *   preview_material    在播这一格的所有窗口里同步试播一只本机素材，播完同步回到原画面
      *                       （目标窗口由设备按 folder_id 认，见 startGroupPreview）
-     *   preview_stop        收掉试播、归还画面（带 win_id 收它那一整组，不带则全收）
+     *   preview_stop        收掉试播、归还画面（按 folder_id 收那一格，不带则全收）
      * ⚠️ 没有 "sync"：服务端的 action:'sync' 只是 HTTP 入参，publish 前已改写成 sync_room_materials
      */
     private fun handleCommand(json: String) {
@@ -1597,7 +1597,7 @@ class MainActivity : AppCompatActivity() {
                 "preview_material" -> {
                     // 大屏试播（云端【S-05p】POST /api/rooms/:id/preview）：带幕前缀的物理目录、落盘文件名
                     // 由服务端按房间当前配置算好。win_ids 只是兜底名单 —— 真正的目标窗口由设备按
-                    // "谁在播这一格" 定（见 previewTargets）：云端那版配置可能已经比设备旧一次下发。
+                    // "谁在播这一格" 定（见 previewTarget）：云端那版配置可能已经比设备旧一次下发。
                     // ⚠️ 必须 post 到主线程：播放器只能在创建它的主线程上换 playlist。
                     val arr = cmd.optJSONArray("win_ids")
                     val winIds = if (arr == null) emptyList() else (0 until arr.length()).map { arr.optString(it) }
@@ -1610,12 +1610,14 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 "preview_stop" -> {
-                    // 不带 win_id = 这台设备上所有在飞的试播全部收回（配置改动后那一格解析不出窗口时的兜底）
-                    // 带 win_id 也是整组收回：单扇归还会剩下那几扇继续挂着试播画面
-                    val winId = cmd.optString("win_id", "")
+                    // 试播的账按格子记，所以收回也按格子认：folder_id 是判据。
+                    // 云端点名的 win_id 是 zIndex 最高那扇，共享解码下它多半是没有播放器的成员，
+                    // 照 win_id 找会一声不响地找不到 —— 页面却已经清了状态条，看起来像"提前结束"按了没用。
+                    // 不带 folder_id = 这台设备上所有在飞的试播全部收回（配置改动后那一格解析不出窗口时的兜底）
+                    val folderId = cmd.optString("folder_id", "")
                     mqttHandler.post {
-                        if (winId.isEmpty()) previews.keys.toList().forEach { restorePreviewGroup(it, "手工停止") }
-                        else restorePreviewGroup(winId, "手工停止")
+                        if (folderId.isEmpty()) previews.keys.toList().forEach { endPreview(it, "手工停止") }
+                        else endPreview(folderId, "手工停止")
                     }
                 }
                 else -> {
@@ -3688,7 +3690,7 @@ class MainActivity : AppCompatActivity() {
     // 这里只剩两件事要收口：洗牌顺序（一份清单只洗一次）与起播位置（groupClock 跟随这一格已有的那一路）；
     // 试播那条见 startGroupPreview。
 
-    /** 一格的轮播位置基准：第几只 + 第几毫秒；items 是那一格的整份清单（恢复正片时要照着它回） */
+    /** 一格的轮播位置基准：第几只 + 第几毫秒；items 是那一格的整份清单（按它判这份基准还作不作数） */
     private class RotationClock(
         val items: List<MediaItem>,
         val index: Int,
@@ -3704,14 +3706,15 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 这一格此刻的正片位置。基准窗 = 组内 ID 最小、且真有播放器在跑的那扇 —— 固定次序，
-     * 不然每次取基准换一扇，基准自己就先漂了。正在试播的窗排除（它播的不是正片）。
+     * 不然每次取基准换一扇，基准自己就先漂了。
      * 以前还要排除"正要起播的那扇自己"（多路播放器时它是全新的，拿它当基准会把全组拽回开头）；
      * #175 后一格只有一路播放器，正片位置就长在那一路身上，排除它等于每次都从头播。
+     * 正在试播的那格排除（它播的不是正片）。
      */
     private fun groupClock(folderKey: String): RotationClock? {
-        if (folderKey.isEmpty()) return null
+        if (folderKey.isEmpty() || previews.containsKey(folderKey)) return null
         for ((winId, surf) in videoSurfaces.entries.sortedBy { it.key }) {
-            if (surf.folderKey != folderKey || previews.containsKey(winId)) continue
+            if (surf.folderKey != folderKey) continue
             val p = windowPlayers[winId] ?: continue
             if (p.mediaItemCount == 0) continue
             return RotationClock((0 until p.mediaItemCount).map { p.getMediaItemAt(it) },
@@ -3778,20 +3781,20 @@ class MainActivity : AppCompatActivity() {
             canonicalJson(scenes.optJSONObject("B")?.opt("play_settings"))
 
     // 【A-13】 大屏试播（preview_material / preview_stop）
-    // @tag: startGroupPreview 试播 整组同步接管 恢复画面
-    // @tag: restorePreviewGroup 试播结束 整组回到同一位置
-    // @tag: startWindowPreview 单扇接管 previewTargets 目标窗口
-    // @tag: restoreWindowPreview 恢复 playlist
+    // @tag: startGroupPreview 试播 整格同步接管 恢复画面
+    // @tag: armPreview 接管这一格 挂片装钩子 previewTarget 目标窗口
+    // @tag: endPreview 试播结束 整格回到正片
+    // @tag: endPreviewCovering 墙板切格 按基准窗找回这笔试播
     // @tag: abortAllPreviews 配置变更 试播让路
 
     /**
-     * 一条进行中的试播 = 回到试播前那格画面所需的全部现场。
+     * 一格进行中的试播 = 回到试播前那格画面所需的全部现场（账按格子记，见 previews 的声明）。
      * items 直接持有试播前那份 playlist（media3 的 MediaItem 是不可变描述），**不重新列目录**：
      * 试播期间那一格可能正被同步增删文件，重新列会播一份谁也没打算播的清单。
      * listener/watchdog 要能换（拿到真实片长后得重新武装看门狗），所以留成 var。
      */
     private class PreviewState(
-        val folderId: String,
+        val winId: String,              // 这一格唯一那一路解码：共享组的基准窗，或单窗自己
         var filename: String,
         val items: List<MediaItem>,
         val itemIndex: Int,
@@ -3805,20 +3808,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 一次试播的入口 = 把**这一格的所有窗口**同时换成那只素材，播完再同时换回来。
+     * 一次试播的入口 = 把**这一格**换成那只素材（同格的几扇窗本来就是同一张画布），播完再换回来。
      * 为什么不是云端算出的那一扇（2026-11-11 用户定调：任何情况下所有窗口的播放画面严格同步）：
      * 只接管一扇，屏上立刻变成"一扇在播别的"；播完它又回到自己被冻住的那个位置，而别的窗
      * 早滚到下一只去了 —— 这一格的轮播顺序从这一刻起永久错开，现场看到的就是"顺序乱了"。
      * 三条规矩，都是这条链路成立的前提：
      *  1. **只换 playlist，不开第二路播放器** —— 这台盒子 4K60 单窗已吃到 99% CPU，再叠一路解码
-     *     会把整屏拖花；而同一台 ExoPlayer、同一块 TextureView 才继承得到窗口的位置/尺寸/裁剪/亮度，
+     *     会把整屏拖花；而同一台 ExoPlayer、同一块画布才继承得到窗口的位置/尺寸/裁剪/亮度，
      *     现场要判断的正是"这只片子放进这扇窗好不好看"，不是片子本身好不好看。
-     *     整组接管不违反这条：屏上本来就有这几路解码器在跑，换的只是各自的内容。
      *  2. **不碰任何配置** —— scenes_json 缓存、windowContentSigs、appliedScenesFp、appliedRev 一律不动。
      *     试播因此不参与 rev 对账（对账也永远看不到它），不会留下一份"屏上没有"的配置。
      *  3. **一定会回去** —— 播完一遍 / 播放器出错 / 看门狗到点 / 收到 preview_stop / 配置变更，
      *     五路都通向收尾，其中配置变更优先级最高：大屏是营业资产，任何一次下发都比试播说了算。
-     *     （第六路是"换了一格试播"：上一组当场整组还回正片。）
+     *     （第六路是"换了一格试播"：上一格当场还回正片。）
      * 只能在主线程调用（碰播放器）。
      */
     private fun startGroupPreview(folderId: String, winIds: List<String>, filename: String, maxMs: Long) {
@@ -3827,7 +3829,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         // 素材同步在飞时不插队：那一轮正在按清单增删这个目录里的文件，而且它收尾必定 apply 一次场景配置，
-        // 真播了也马上会被 abortAllPreviews 抹掉 —— 白费一次解码，还白闪一下屏。整组判一次。
+        // 真播了也马上会被 abortAllPreviews 抹掉 —— 白费一次解码，还白闪一下屏。整格判一次。
         if (synchronized(syncLock) { syncInFlight.isNotEmpty() }) {
             logToFile("试播拒绝：素材同步进行中，稍后再点一次", "WARN", "PLAYBACK", "PREVIEW")
             previewStatusText("试播已拒绝：素材同步中")
@@ -3840,42 +3842,39 @@ class MainActivity : AppCompatActivity() {
             previewStatusText("试播失败：本机没有这只素材")
             return
         }
-        val targets = previewTargets(folderId, winIds)
-        if (targets.isEmpty()) {
+        val winId = previewTarget(folderId, winIds)
+        if (winId == null) {
             logToFile("试播失败：没有窗口在播 $folderId（配置刚改过？先同步一次）", "WARN", "PLAYBACK", "PREVIEW")
             previewStatusText("试播失败：这一格没有窗口在播")
             return
         }
-        // 换一格试播 = 上一组先正常收尾（回到它自己的正片），不是留着试播画面不管
-        previews.keys.filter { it !in targets }.forEach { restorePreviewGroup(it, "让位给新试播") }
-        // 接管前取一次正片位置，整组共用一把：恢复时全组回到同一个点，顺序才不会分家。
-        // 同一格连点第二次不重写 —— 这份快照说的是"正片在哪儿"，与中途换了几只试播无关。
-        if (!previewClocks.containsKey(folderId)) groupClock(folderId)?.let { previewClocks[folderId] = it }
-        targets.forEach { startWindowPreview(it, folderId, file, filename, maxMs) }
+        // 换一格试播 = 上一格先正常收尾（回到它自己的正片），不是留着试播画面不管
+        previews.keys.filter { it != folderId }.forEach { endPreview(it, "让位给新试播") }
+        armPreview(folderId, winId, file, filename, maxMs)
         // 共享解码的组里只有基准那一路在 previews 记账，但它一带 N 扇窗：日志与状态文字报真实扇数
-        val panels = targets.sumOf { winShareGroup[it]?.members?.size ?: 1 }
-        logToFile("试播接管: $folderId/$filename → $panels 扇窗同步（${targets.size} 路解码）",
-            "INFO", "PLAYBACK", "PREVIEW")
+        val panels = winShareGroup[winId]?.members?.size ?: 1
+        logToFile("试播接管: $folderId/$filename → $panels 扇窗同步", "INFO", "PLAYBACK", "PREVIEW")
         previewStatusText("试播中: $filename（$panels 扇窗同步）")
     }
 
     /**
-     * 这一格的试播落在哪些窗口 —— 认本机当前的 folderKey，不认云端算好的 win_ids：
+     * 这一格的试播落在哪一路解码 —— 认本机当前的 folderKey，不认云端点名的 win_ids：
      * 云端按库里那份配置算窗口，设备却可能刚应用过一版新的，那一刻"谁在播这一格"只有设备知道。
+     * #175 之后一格只有一路解码（共享组的基准窗，或单窗自己），成员窗没有播放器，
+     * 所以按 folderKey 筛出来的那一路就是答案；正因为它多半不是云端点名的第一扇，
+     * 试播的账必须按格子记，不然归还时按窗口名找会找不到。
      * folderKey 还没落上（默认窗口刚建、配置刚改过）才退回云端点名的那几扇兜底，
      * 但兜底也要按幕筛过（2026-11-12 用户定调）：一只片子只有一个物理目录、只属于一幕，
      * 另一幕那几扇窗跟这一格没关系，不该被接管 —— 曾经云端把两幕一起点进来，第二幕来源的窗
      * 也跟着播了第一幕的素材。
      */
-    private fun previewTargets(folderId: String, winIds: List<String>): List<String> {
-        val named = winIds.filter { windowPlayers.containsKey(it) }
-        if (folderId.isEmpty()) return named
-        val inGroup = videoSurfaces.keys.filter {
+    private fun previewTarget(folderId: String, winIds: List<String>): String? {
+        videoSurfaces.keys.firstOrNull {
             windowPlayers.containsKey(it) && videoSurfaces[it]?.folderKey == folderId
-        }
-        if (inGroup.isNotEmpty()) return inGroup
-        val scene = sceneOfFolder(folderId) ?: return named   // 无前缀的 id 认不出归属，不拦
-        return named.filter { sceneOfWindow(it) == scene }
+        }?.let { return it }
+        val named = winIds.filter { windowPlayers.containsKey(it) }
+        val scene = sceneOfFolder(folderId) ?: return named.firstOrNull()   // 无前缀的 id 认不出归属，不拦
+        return named.firstOrNull { sceneOfWindow(it) == scene }
     }
 
     /** "A02" → "A"；"02" 这类无前缀 id 与非法形态 → null（= 幕次未知，调用方按不拦处理） */
@@ -3902,36 +3901,27 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    /** 单扇窗的接管动作：全局校验已由 startGroupPreview 做完，这里只换这只窗自己的 playlist */
-    private fun startWindowPreview(winId: String, folderId: String, file: File, filename: String, maxMs: Long) {
-        // 不挂 debug_mode（2026-11-08 用户定调：单击素材卡即播，营业中也要能用）。试播是内容操作，
-        // 与 stop / update_windows 同级；debug 只决定运维浮层（状态文字/进度条）上不上屏，见 applyDebugUi。
-        val player = windowPlayers[winId] ?: return   // previewTargets 已筛过，这里只兜并发重建
-
-        val existing = previews[winId]
-        if (existing == null) {
-            previews[winId] = PreviewState(
-                folderId = folderId,
-                filename = filename,
-                items = (0 until player.mediaItemCount).map { player.getMediaItemAt(it) },
-                itemIndex = player.currentMediaItemIndex,
-                positionMs = player.currentPosition,
-                playWhenReady = player.playWhenReady,
-                repeatMode = player.repeatMode
-            )
-        } else {
-            // 连点第二次是"换一只片子"，不是"把上一只试播当成正片"：快照字段一个都不许重写，只改日志名
-            existing.filename = filename
-        }
-        armPreview(winId, player, file, maxMs)
-    }
-
-    /** 把这只片挂上播放器并装好两个收尾钩子（首次试播与"中途换一只"共用） */
-    private fun armPreview(winId: String, player: ExoPlayer, file: File, maxMs: Long) {
-        val st = previews[winId] ?: return
-        // 同一扇窗连点第二次复用的是**同一个** PreviewState（快照不许重写），所以"是否已按真片长重排过"
-        // 必须在这里归零：否则上一只留下的 true 会让这一只永远停在云端那个 5 分钟兜底上，
-        // 十分钟的片子播到五分钟就被看门狗掐回正片 —— 现场只会看到"后面那半截没播"。
+    /**
+     * 接管这一格：抄下正片现场 → 挂上那只试播片 → 装好两个收尾钩子（首次试播与"中途换一只"共用）。
+     * 不挂 debug_mode（2026-11-08 用户定调：单击素材卡即播，营业中也要能用）。试播是内容操作，
+     * 与 stop / update_windows 同级；debug 只决定运维浮层（状态文字/进度条）上不上屏，见 applyDebugUi。
+     */
+    private fun armPreview(folderKey: String, winId: String, file: File, filename: String, maxMs: Long) {
+        val player = windowPlayers[winId] ?: return   // previewTarget 已筛过，这里只兜并发重建
+        val st = previews[folderKey] ?: PreviewState(
+            winId = winId,
+            filename = filename,
+            items = (0 until player.mediaItemCount).map { player.getMediaItemAt(it) },
+            itemIndex = player.currentMediaItemIndex,
+            positionMs = player.currentPosition,
+            playWhenReady = player.playWhenReady,
+            repeatMode = player.repeatMode
+        ).also { previews[folderKey] = it }
+        // 连点第二次是"换一只片子"，不是"把上一只试播当成正片"：上面那份快照一个字段都不许重写，只改日志名
+        st.filename = filename
+        // 复用同一个 PreviewState 时"是否已按真片长重排过"必须归零：否则上一只留下的 true 会让这一只
+        // 永远停在云端那个 5 分钟兜底上，十分钟的片子播到五分钟就被看门狗掐回正片 ——
+        // 现场只会看到"后面那半截没播"。
         st.rearmed = false
         st.listener?.let { player.removeListener(it) }
         disarmPreviewWatchdog(st)
@@ -3946,11 +3936,11 @@ class MainActivity : AppCompatActivity() {
         val listener = object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 logToFile("试播出错: 窗口 $winId ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "PLAYBACK", "PREVIEW")
-                mqttHandler.post { restorePreviewGroup(winId, "播放器出错") }
+                mqttHandler.post { endPreview(folderKey, "播放器出错") }
             }
             override fun onPlaybackStateChanged(state: Int) {
-                // 整组一起结束：这一扇先跑到片尾就由它带头还回正片，晚几毫秒的那几扇同一把基准收回去
-                if (state == Player.STATE_ENDED) mqttHandler.post { restorePreviewGroup(winId, "播完一遍") }
+                // 跑到片尾就还回正片；共享组里那几扇成员窗跟着同一张画布一起回去
+                if (state == Player.STATE_ENDED) mqttHandler.post { endPreview(folderKey, "播完一遍") }
             }
             override fun onEvents(p: Player, events: Player.Events) {
                 // 刚 prepare 时 duration 还是 UNKNOWN，看门狗只能按云端给的 max_ms（5 分钟）兜底；
@@ -3959,26 +3949,26 @@ class MainActivity : AppCompatActivity() {
                 val d = (p as? ExoPlayer)?.duration ?: -1L
                 if (d > 0) {
                     st.rearmed = true
-                    armPreviewWatchdog(winId, minOf(d + 15_000, PREVIEW_HARD_CAP_MS))
+                    armPreviewWatchdog(folderKey, minOf(d + 15_000, PREVIEW_HARD_CAP_MS))
                 }
             }
         }
         player.addListener(listener)
         st.listener = listener
-        armPreviewWatchdog(winId, if (maxMs > 0) maxMs else 300_000L)
+        armPreviewWatchdog(folderKey, if (maxMs > 0) maxMs else 300_000L)
     }
 
     /**
      * 看门狗：片长未知、解码卡住、STATE_ENDED 没来 —— 任何一种情况到点都必须把大屏还给正片。
-     * 重复武装时先摘掉前一个，免得两只闹钟叠在同一扇窗上。
+     * 重复武装时先摘掉前一个，免得两只闹钟叠在同一格上。
      */
-    private fun armPreviewWatchdog(winId: String, ms: Long) {
-        val st = previews[winId] ?: return
+    private fun armPreviewWatchdog(folderKey: String, ms: Long) {
+        val st = previews[folderKey] ?: return
         disarmPreviewWatchdog(st)
         val r = Runnable {
-            if (previews.containsKey(winId)) {
-                logToFile("试播看门狗到点（${ms}ms），强制归还画面: 窗口 $winId", "WARN", "PLAYBACK", "PREVIEW")
-                restorePreviewGroup(winId, "看门狗超时")
+            if (previews.containsKey(folderKey)) {
+                logToFile("试播看门狗到点（${ms}ms），强制归还画面: 格子 $folderKey", "WARN", "PLAYBACK", "PREVIEW")
+                endPreview(folderKey, "看门狗超时")
             }
         }
         st.watchdog = r
@@ -3991,63 +3981,50 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 结束试播 = **整组**还回正片：只还一扇的话，其余那几扇还停在试播那只上，画面照样分裂。
-     * 全组用接管那一刻那把基准（previewClocks），所以还回去的位置完全相同 —— 顺序不会再分家。
-     * 只能在主线程调用。
+     * 收回"覆盖到这扇窗"的那笔试播（墙板切格用）。不能只按这扇窗当前的 folderKey 找账：
+     * 云端走 named 兜底时（本机还没落上 folderKey），账上的键是云端点名的格子，跟本机认的不是一回事，
+     * 找不到就等于没收回 —— 随后播完的那次恢复回调会把画面拽回按号之前。
+     * 所以按"这扇窗归哪一路解码"认：共享组找基准，单窗就是它自己。
      */
-    private fun restorePreviewGroup(winId: String, reason: String) {
-        val st = previews[winId] ?: run {
-            Log.d(TAG, "restorePreviewGroup: 窗口 $winId 没有在飞的试播（$reason）")
-            return
-        }
-        // 基准只取一次：第一次 remove 之后这组在 previews 里就空了
-        val clock = previewClocks.remove(st.folderId)
-        val group = previews.filterValues { it.folderId == st.folderId }.keys.toList()
-        val back = group.mapNotNull { restoreWindowPreview(it, reason, clock) }
-        if (back.isNotEmpty()) {
-            // 报的是"回到了哪儿"：第几只/共几只 + 毫秒。现场说"画面跳错了"时，这一行就是全部依据。
-            val (idx, total, pos) = back[0]
-            // 共享解码的组一路顶 N 扇窗，扇数按组成员算才不骗人
-            val panels = group.sumOf { winShareGroup[it]?.members?.size ?: 1 }
-            logToFile("试播结束（$reason）：$panels 扇窗同步回到正片 " +
-                (if (total == 0) "（这一格无素材可播）" else "第 $idx/$total 只 @${pos}ms") +
-                " → " + group.joinToString("、"), "INFO", "PLAYBACK", "PREVIEW")
-            previewStatusText("试播结束，$panels 扇窗已回到正片")
-        }
+    private fun endPreviewCovering(winId: String, reason: String) {
+        val leader = winShareGroup[winId]?.leaderId ?: winId
+        previews.entries.firstOrNull { it.value.winId == leader }?.let { endPreview(it.key, reason) }
     }
 
     /**
-     * 归还一扇窗的画面，返回它回到的位置（第几只/共几只/毫秒）；这扇窗本来就没在试播或播放器
-     * 已不在屏上就返回 null（调用方的组日志不该把它算进"同步回去"的窗数里）。
-     * clock = 接管那一刻整组共用那把基准；拿不到才退回这扇窗自己的快照。
+     * 结束一格试播 = 那一路解码还回正片，同格的其余窗跟着同一张画布一起回去（#175 后一格只有一路解码，
+     * "整格同步归还"按构造成立，不再需要一轮恢复循环去对齐各处快照）。
+     * 只能在主线程调用。
      */
-    private fun restoreWindowPreview(winId: String, reason: String, clock: RotationClock?): Triple<Int, Int, Long>? {
-        val st = previews.remove(winId) ?: run {
-            Log.d(TAG, "restoreWindowPreview: 窗口 $winId 没有在飞的试播（$reason）")
-            return null
+    private fun endPreview(folderKey: String, reason: String) {
+        val st = previews.remove(folderKey) ?: run {
+            Log.d(TAG, "endPreview: 格子 $folderKey 没有在飞的试播（$reason）")
+            return
         }
         disarmPreviewWatchdog(st)
-        val player = windowPlayers[winId]
+        val player = windowPlayers[st.winId]
         st.listener?.let { player?.removeListener(it) }
         if (player == null) {
             // 窗口已经没了（重建/切幕/废止）：新配置会自己起播，这里再恢复就是往释放过的播放器上写
-            logToFile("试播结束（$reason）：窗口 $winId 已不在屏上，画面交给新配置", "WARN", "PLAYBACK", "PREVIEW")
-            return null
+            logToFile("试播结束（$reason）：窗口 ${st.winId} 已不在屏上，画面交给新配置", "WARN", "PLAYBACK", "PREVIEW")
+            return
         }
-        // 全组照同一份清单、同一个点回去；clock 为 null 只可能是接管时这一格解析不出基准
-        val items = clock?.items?.takeIf { it.isNotEmpty() } ?: st.items
-        val index = (clock?.index ?: st.itemIndex).coerceIn(0, maxOf(items.size - 1, 0))
-        val position = clock?.positionMs ?: st.positionMs
-        if (items.isEmpty()) {
-            // 试播前这扇窗本来就没东西可播（空目录/未映射），那就如实还它一份空清单，别硬造进度
-            player.setMediaItems(items)
+        if (st.items.isEmpty()) {
+            // 试播前这一格本来就没东西可播（空目录/未映射），那就如实还它一份空清单，别硬造进度
+            player.setMediaItems(st.items)
         } else {
-            player.setMediaItems(items, index, position)
+            player.setMediaItems(st.items, st.itemIndex, st.positionMs)
         }
         player.repeatMode = st.repeatMode
         player.prepare()
         player.playWhenReady = st.playWhenReady
-        return Triple(index + 1, items.size, position)
+        // 报的是"回到了哪儿"：第几只/共几只 + 毫秒。现场说"画面跳错了"时，这一行就是全部依据。
+        val panels = winShareGroup[st.winId]?.members?.size ?: 1
+        logToFile("试播结束（$reason）：$panels 扇窗同步回到正片 " +
+            (if (st.items.isEmpty()) "（这一格无素材可播）"
+             else "第 ${st.itemIndex + 1}/${st.items.size} 只 @${st.positionMs}ms") +
+            " → 基准窗 ${st.winId}", "INFO", "PLAYBACK", "PREVIEW")
+        previewStatusText("试播结束，$panels 扇窗已回到正片")
     }
 
     /**
@@ -4060,8 +4037,7 @@ class MainActivity : AppCompatActivity() {
         val n = previews.size
         previews.values.forEach { disarmPreviewWatchdog(it) }
         previews.clear()
-        previewClocks.clear()   // 组基准跟着一起作废：新配置会自己起播，拿旧位置去对齐反而错位
-        logToFile("试播让路：$reason（收回 $n 扇窗）", "INFO", "PLAYBACK", "PREVIEW")
+        logToFile("试播让路：$reason（收回 $n 格）", "INFO", "PLAYBACK", "PREVIEW")
     }
 
     /** 试播的可见回执：debug 开着时大屏左下角就是这行字（运维层的显示闸门统一在 applyDebugUi） */
