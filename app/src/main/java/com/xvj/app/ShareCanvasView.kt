@@ -384,8 +384,13 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
     }
 
     /**
-     * 四角的内容归一化坐标（TL,TR,BR,BL）。矩阵与 MainActivity.applyWindowTransform 逐条同序，
+     * 四角的内容归一化坐标（TL,TR,BR,BL）。变换链与 MainActivity.applyWindowTransform 逐条同序，
      * 只是在归一化空间里做：那边 vw/vh 换掉后剩下的就是这份，两条链路才不会画出两种画面。
+     * 唯一不能照抄的是 90°/270° 的「按框宽高比预缩」：那是给像素空间的旋转补偏差的，
+     * 而像素旋转换算到归一化空间本身就带一个反向的框宽高比，两者正好抵消 ——
+     * 这里再乘一次就等于把采样推出纹理边界，被 CLAMP_TO_EDGE 拉成边缘拉丝且比例错。
+     * 末尾把 t 从「0=画面顶」换成外部纹理要求的「0=画面底」：着色器拿这份坐标还要乘
+     * SurfaceTexture 的变换矩阵，那一维翻转正是该矩阵负责做的事，少这一步整张画布就上下颠倒。
      * @return 8 个 float = 4 个角的 (s,t)
      */
     private fun cornerUv(m: Member): FloatArray {
@@ -393,14 +398,13 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
         val cm = Matrix()
         cm.setTranslate(-m.crop[0], -m.crop[1])
         cm.postScale(1f / m.crop[2], 1f / m.crop[3])
-        if (m.rotation == 90 || m.rotation == 270) {
-            cm.postScale(m.height.toFloat() / m.width, m.width.toFloat() / m.height, 0.5f, 0.5f)
-        }
         cm.postRotate(m.rotation.toFloat(), 0.5f, 0.5f)
         if (m.flip == "h") cm.postScale(-1f, 1f, 0.5f, 0.5f)
         if (m.flip == "v") cm.postScale(1f, -1f, 0.5f, 0.5f)
         val inv = Matrix()
         if (cm.invert(inv)) inv.mapPoints(corners)
+        var i = 1
+        while (i < corners.size) { corners[i] = 1f - corners[i]; i += 2 }
         return corners
     }
 
