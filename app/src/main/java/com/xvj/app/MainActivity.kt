@@ -197,6 +197,8 @@ class MainActivity : AppCompatActivity() {
      * 读写都在主线程（墙板事件由 WallPanelLink post 到主线程，窗口应用也在主线程）。
      */
     private var panelSource: PanelSource? = null
+    /** 上一次触发源落地时刻（elapsedRealtime）：同一帧在去抖窗口内只认一次，见 applyPanelSource */
+    private var panelSourceAtMs = 0L
     /** 收到的帧去重台账：心跳带回云端做排障可见，学习模式的候选列表也从它出（主线程读写） */
     private val frameLedger = WallPanelFrameLedger()
     /** 学习来的「帧 → 动作」表：房间 config.wallpanel_bindings 的内存视图，随载荷整体替换 */
@@ -344,6 +346,11 @@ class MainActivity : AppCompatActivity() {
         private const val LEARN_MAX_S = 60
         /** 一次快照上报几种候选帧：与前端学习列表一屏看得下的量对齐（台账本身留 24 种） */
         private const val LEARN_FRAME_LIMIT = 8
+        /**
+         * 同一帧重复的去抖窗口：墙上按键常见"按下/松开各发一帧"、中控也可能重发，
+         * 不挡的话一次按键会连跳两支；超出窗口的重复才按用户定的语义"播下一支"处理。
+         */
+        private const val WALLPANEL_REPEAT_DEBOUNCE_MS = 300L
         /** 输出基准的缺省值 = 历史口径那份 1920×1080 设计稿（房间没设 config.output 时按它换算） */
         private const val DESIGN_W = 1920
         private const val DESIGN_H = 1080
@@ -806,7 +813,8 @@ class MainActivity : AppCompatActivity() {
     //   收 —— WallPanelParser 按帧族 profile 定长切帧，族认不出就靠空闲（2 个字符时间）兜底分帧；
     //       每一帧的 hex 都进 frameLedger，随心跳和学习窗上报（xvj/device/{id}/frames）给人看分帧对不对；
     //   判 —— 只认学习表（config.wallpanel_bindings，帧指纹→文件夹）：查不到就只留痕，不猜语义；
-    //   切 —— applyPanelSource 重排 content.follow 的窗口，格子归属一律问 resolveWindowFolder。
+    //   切 —— applyPanelSource 重排 content.follow 的窗口，格子归属一律问 resolveWindowFolder；
+    //       同一帧再来一次 = 该格播下一支（按播放设置的次序），300ms 内的重复帧当按键去抖。
     // 字段真值全在云端 config 顶层（wallpanel_enabled / wallpanel_serial_path /
     // wallpanel_baud / wallpanel_data_bits / wallpanel_parity / wallpanel_stop_bits / wallpanel_bindings），
     // 本机只落 prefs + 按 prefs 收放链路。这些都故意不进 rev（服务端 roomSceneDigest 只算 scenes），
@@ -1081,54 +1089,89 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 触发源的落点：先把这一源记下来，再把所有跟随墙板的窗口切到它对应的那一格。
+     * 触发源的落点：先把这一源记下来，再把所有跟随墙板的窗口切到它对应的那一格；
+     * 同一帧再按一次 = 那一格播下一支（顺序/随机按播放设置，见 advancePanelFolder）。
      * 口径：
      *   只动 content.follow == true 的窗口 —— folderId 是人工钉死的，墙板不越权去改它；
      *   播哪一格一律交给 resolveWindowFolder，与全量重建同一个入口，两处不会各漂一份；
      *   解析不出目标格（这一帧这一幕没绑 / 那格不在映射里）→ 那扇窗保持原样，宁可停在旧画面也不切到黑屏；
-     *   正在试播的那一格先收尾再切 —— 不收的话试播播完的恢复回调会把画面拽回按键之前。
+     *   正在试播的那一格先收尾再切 —— 不收的话试播播完的恢复回调会把画面拽回按键之前；
+     *   重复帧 [WALLPANEL_REPEAT_DEBOUNCE_MS] 内只认一次（按下/松开的重复帧），超出窗口才算"下一支"。
      * 必须在主线程调用（换 playlist）；WallPanelLink 的事件已经 post 到主线程。
      */
     private fun applyPanelSource(source: PanelSource, hex: String) {
-        // 同一个源连着按只认第一次：重播会把跟随窗口全拽回片头，现场看就是"突然跳帧"。
-        // 不怕漏掉后续变化 —— 改绑定会走 applyWallPanelBindings 重新落地并触发重排，
-        // 画面不会停在旧源上。
-        if (panelSource == source) {
-            logToFile("墙板重复触发 ${describeSource(source)}，画面已在该位置，跳过重播", "INFO", "WALLPANEL", "SKIP")
+        val now = SystemClock.elapsedRealtime()
+        val repeat = panelSource == source
+        if (repeat && now - panelSourceAtMs < WALLPANEL_REPEAT_DEBOUNCE_MS) {
+            logToFile("墙板重复帧 ${describeSource(source)}（${now - panelSourceAtMs}ms 内），去抖跳过", "INFO", "WALLPANEL", "SKIP")
             return
         }
-        logToFile("墙板触发 ${describeSource(source)}（$hex）", "INFO", "WALLPANEL", "SWITCH")
-        panelSource = source
         val scenes = appliedScenes
         if (scenes == null) {
             logToFile("墙板触发 ${describeSource(source)} 未生效：本机还没应用过窗口配置", "WARN", "WALLPANEL", "SKIP")
             return
         }
+        if (repeat) {
+            logToFile("墙板重复触发 ${describeSource(source)}（$hex）", "INFO", "WALLPANEL", "REPEAT")
+        } else {
+            logToFile("墙板触发 ${describeSource(source)}（$hex）", "INFO", "WALLPANEL", "SWITCH")
+            panelSource = source
+        }
+        panelSourceAtMs = now
         val allWindows = mergeSceneWindows(scenes)
         val follows = (0 until allWindows.length()).map { allWindows.getJSONObject(it) }
             .map { Pair(it.optString("id"), it.optJSONObject("content") ?: JSONObject()) }
             .filter { it.second.optBoolean("follow", false) && isVideoContentType(it.second) }
+        val resolved = follows.associate { (id, content) -> id to resolveWindowFolder(scenes, content, id) }
+        val switching = resolved.any { (id, fid) -> fid != null && videoSurfaces[id]?.folderKey != fid }
         // 共享组必须整组同格才成立：成员被墙板分到不同格子（或某一格解析不出素材）时组的构成就变了，
-        // 原地重排做不到（解码路数跟着变），只能回全量重建。墙板切格本来就低频。
-        if (shareGroups.isNotEmpty() && follows.isNotEmpty()) {
-            val newFolder = follows.associate { (id, content) -> id to resolveWindowFolder(scenes, content, id) }
-            val broken = shareGroups.values.any { grp -> grp.members.map { newFolder[it] }.distinct().size > 1 }
+        // 原地重排做不到（解码路数跟着变），只能回全量重建。换格本来就低频；
+        // 重复按的"下一支"原地推进、不换格，所以不走这里。
+        if ((!repeat || switching) && shareGroups.isNotEmpty() && follows.isNotEmpty()) {
+            val broken = shareGroups.values.any { grp -> grp.members.map { resolved[it] }.distinct().size > 1 }
             if (broken) {
                 logToFile("墙板触发 ${describeSource(source)} 会让共享解码组的成员分家，回退全量重建", "INFO", "WALLPANEL", "REBUILD")
                 applySceneConfigs(scenes, force = true)
                 return
             }
         }
-        for ((winId, content) in follows) {
-            endPreviewCovering(winId, "墙板切换")
-            val folderId = resolveWindowFolder(scenes, content, winId)
+        // 一格一路解码（#175），同一组的成员窗口只让基准窗推一次，其余窗跟着同一张画布
+        val advanced = HashSet<String>()
+        for ((winId, _) in follows) {
+            endPreviewCovering(winId, if (repeat) "墙板重复触发" else "墙板切换")
+            val folderId = resolved[winId]
             if (folderId == null) {
                 Log.w(TAG, "窗口 $winId 跟随墙板 ${describeSource(source)} 解析不到可播的文件夹，保持原画面")
                 logToFile("窗口 [$winId] ${describeSource(source)} 无可播文件夹，保持原画面", "WARN", "WALLPANEL", "SKIP")
+                continue
+            }
+            // 判"下一支"只看落点是不是当前在播的那一格，不看这一帧和上一帧是否同一个码：
+            // 点歌机码与墙板码可能指向同一格，交替按也不该把画面拽回第一支。
+            val leader = winShareGroup[winId]?.leaderId ?: winId
+            if (videoSurfaces[winId]?.folderKey == folderId) {
+                if (advanced.add(leader)) advancePanelFolder(leader, folderId)
             } else {
                 playFolderInWindow(winId, folderId)
             }
         }
+    }
+
+    /**
+     * 同一帧再按一次 = 这一格往下一支走。用播放器自己的"下一支"，清单就是播放设置算好的那份
+     * （顺序=按文件名，随机=只洗一次后的固定次序），与自然播完完全同一条路，不另立一套次序。
+     * 一格一路解码，这里只动基准窗那一只；组内其余窗跟着同一张画布。
+     */
+    private fun advancePanelFolder(leaderWinId: String, folderId: String) {
+        val player = windowPlayers[leaderWinId]
+        if (player == null || player.mediaItemCount == 0) {
+            // 播放器不在了（正在重建/这一格没起来）：补一次起播，别让按键变成哑的
+            playFolderInWindow(leaderWinId, folderId)
+            return
+        }
+        val from = player.currentMediaItemIndex
+        player.seekToNextMediaItem()
+        logToFile("墙板触发 → 文件夹 $folderId 下一支：第 ${from + 1}/${player.mediaItemCount} 只 → 第 ${player.currentMediaItemIndex + 1} 只",
+            "INFO", "WALLPANEL", "NEXT")
     }
 
     /** 日志里对触发源的唯一称呼 */
