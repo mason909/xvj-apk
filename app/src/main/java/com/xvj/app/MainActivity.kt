@@ -358,6 +358,13 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "XVJPlayer"
         /** 窗口容器内亮度遮罩视图的 tag 标识（实时更新时定位/增删遮罩） */
         const val DIM_TAG = "xvj_dim"
+        /**
+         * 进程内当前活着的 MainActivity。系统在某些入口组合下会在同一个进程里起两个实例
+         * （实例在 standard 栈时按 HOME 键会在 home 栈再起一个），两个实例各连一次 MQTT，
+         * broker 认 clientId 不认人 ⇒ 每 10 秒互踢、还各建一套播放器（2026-11-16 台架实测）。
+         * 见 onCreate 的去重。
+         */
+        private var liveInstance: MainActivity? = null
         const val APK_URL = "http://47.102.106.237"
         // 订阅用的通配符主题在 connectMQTT() 里按 deviceId 拼具体路径，不再用常量
         private const val AUTH_TOPIC = "xvj/auth/response"
@@ -565,6 +572,19 @@ class MainActivity : AppCompatActivity() {
 
         // 加载本机配置（deviceId 等），不含窗口/scenes —— 窗口要等云端指令
         loadConfig()
+
+        // 一个进程只留一个实例在管画面与 MQTT：旧实例还活着说明系统把第二个 MainActivity 起进了
+        // 另一条任务栈（HOME 键 vs 桌面图标/am start），两边各连一次 MQTT 会被 broker 认成同一个
+        // clientId 反复互踢，播放器也会建两套。新实例是现在可见的那一个，所以让旧的先收摊。
+        val stale = liveInstance
+        if (stale !== null && stale !== this) {
+            logToFile("检测到第二个 MainActivity 实例：旧实例先收摊（防 MQTT 互踢与双播放器）",
+                "WARN", "APP", "DESKTOP")
+            stale.stopPlayback()
+            stale.releaseAllWindows()
+            stale.finish()
+        }
+        liveInstance = this
 
         // 上次是授权态就先按缓存开播，不等 MQTT 往返（见 restoreCachedScenes）
         restoreCachedScenes()
@@ -2518,6 +2538,8 @@ class MainActivity : AppCompatActivity() {
     /** 真销毁时才走：释放全部窗口 + 单播放器，停状态上报定时器，断开 MQTT，关闭下载线程池 */
     override fun onDestroy() {
         super.onDestroy()
+        // 交还"进程内唯一实例"的资格；被新实例顶掉的那一个在这里销毁时，槽位已经归新的，别误清
+        if (liveInstance === this) liveInstance = null
         // 撤销挂起的续装轮询（retryPendingInstall），Activity 没了再复查只会崩
         installRetryHandler.removeCallbacksAndMessages(null)
         // 485 墙板串口链路随 Activity 收摊（开关真值在 prefs，重启自恢复）
@@ -3231,8 +3253,12 @@ class MainActivity : AppCompatActivity() {
     private fun silentInstall(file: File): Boolean {
         val tmp = "/data/local/tmp/xvj-update.apk"
         // 开头先 rm：上一次失败留下的包不能被这次的 cp 追加/复用；rm -f 对不存在的文件也返回 0
+        // 自启那句带 MAIN+HOME 类目：不带类目会落进 standard 栈，之后按 HOME 键系统要在 home 栈
+        // 再起一个实例，两个实例共用同一个 MQTT clientId 互踢（理由见 bringSelfByRoot）
         val sh = "rm -f $tmp && cp ${file.absolutePath} $tmp && chmod 644 $tmp && " +
-            "pm install -r $tmp && rm -f $tmp && sleep 3 && am start -n $packageName/.MainActivity"
+            "pm install -r $tmp && rm -f $tmp && sleep 3 && " +
+            "am start -a android.intent.action.MAIN -c android.intent.category.HOME" +
+            " -n $packageName/.MainActivity"
         logToFile("OTA: 静默安装 ${file.name}（${file.length()} bytes），本机进程随后会被回收并自启")
         val done = execAsRoot(sh, 180000)
         val ok = done.first == 0
@@ -4641,7 +4667,11 @@ class MainActivity : AppCompatActivity() {
      */
     private fun bringSelfByRoot(): Boolean {
         if (!silentInstallReady()) return false
-        val r = execAsRoot("am start -n $packageName/.MainActivity", 8000)
+        // 带 MAIN+HOME 类目而不是裸 -n：显式组件只保证起的是我们，栈的归属看类目 ——
+        // 不带 HOME 类目会落进 standard 栈，之后现场按 HOME 键时系统要在 home 栈再起一个实例，
+        // 两个实例共用同一个 MQTT clientId 会每 10 秒互踢（2026-11-16 台架实测，见 onCreate 去重）。
+        val r = execAsRoot("am start -a android.intent.action.MAIN -c android.intent.category.HOME" +
+            " -n $packageName/.MainActivity", 8000)
         val ok = r.first == 0
         logToFile("唤回：am start ${if (ok) "已发出" else "失败(code=${r.first}) ${r.second}"}",
             if (ok) "INFO" else "WARN", "WINDOW", "DESKTOP")
