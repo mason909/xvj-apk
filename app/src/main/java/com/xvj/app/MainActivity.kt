@@ -372,11 +372,11 @@ class MainActivity : AppCompatActivity() {
         private var liveInstance: MainActivity? = null
         const val APK_URL = "http://47.102.106.237"
         // 【A-16】实时截图的三个上限：8K 全屏 PNG 是几 MB 量级，超 16MB 就不像"一帧画面"该有的体积；
-        // 回传宽度 1920 足够远程管理认出窗口内容与屏上文字，再大只是白带；超时给足 screencap
-        // 单线程编码整屏 PNG 的时间（台架 7680×2160 实测 1~2 秒级）。
+        // 回传只要"认得出窗口内容、看得清屏上文字"，1280 宽 + q55 就够（一帧几十 KB，现场带宽也轻），
+        // 再大只是白带；超时给足 screencap 单线程编码整屏 PNG 的时间（台架 7680×2160 实测 1~2 秒级）。
         private const val SHOT_MAX_PNG_BYTES = 16 * 1024 * 1024
-        private const val SHOT_MAX_WIDTH = 1920
-        private const val SHOT_JPEG_QUALITY = 70
+        private const val SHOT_MAX_WIDTH = 1280
+        private const val SHOT_JPEG_QUALITY = 55
         private const val SHOT_TIMEOUT_MS = 15000L
         // 订阅用的通配符主题在 connectMQTT() 里按 deviceId 拼具体路径，不再用常量
         private const val AUTH_TOPIC = "xvj/auth/response"
@@ -3345,6 +3345,9 @@ class MainActivity : AppCompatActivity() {
     // 后者要点授权框，无人值守的包厢机器弹不出来也没人点；screencap 和静默安装共用同一个 root 前提
     // （量产镜像由厂家带 root 刷全量镜像，2026-11-16 老板定调：关键节点加密码确认即可）。
     // 全程只读不写：不碰播放器、不改状态，失败只留一行日志 —— 管理台等不到图时，那行日志是唯一线索。
+    // 不看前台：命令从 MQTT 线程进来，抓屏由 su 起的独立进程做，抓的是整块屏的合成结果。
+    // 所以应用被 HOME 键最小化、或已退出到桌面时照样截得到，而且截到的正是当时屏上的原厂桌面 ——
+    // 现场要看的"那间房现在屏上是什么"包含这种情况。唯一前提是进程还活着（没被杀），否则命令收不到。
 
     /**
      * root screencap 出一张全屏 PNG，从 stdout 直接收（不落设备磁盘，省掉临时文件的归属与清理）。
