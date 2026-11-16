@@ -16,7 +16,8 @@
  *         同格 ≥2 扇共享一路解码那层见 enabledWindowsSorted / createShareGroup / refreshShareGroup / destroyShareGroups，
  *         GL 画布本体在 ShareCanvasView.kt，单窗与共享那一路的日志共用 armWindowLogger）
  * 【A-08】窗口释放（releaseAllWindows）
- * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall / installApk / retryPendingInstall）
+ * 【A-09】OTA 自更新（checkForUpdate / isTrustedApkUrl / isValidFilepath / verifyApkSignature / downloadAndInstall /
+ *         installApk → silentInstallReady + silentInstall + execAsRoot，或退到 installViaSystemInstaller / retryPendingInstall）
  * 【A-10】系统 UI（hideSystemUI）
  * 【A-11】工具方法（logToFile / sha256 / generateDeviceFingerprint / calculateMd5）
  * 【A-12】播放设置（playSettingsOf / playSettingsJson）
@@ -2749,6 +2750,11 @@ class MainActivity : AppCompatActivity() {
     // 安装分两条：探到 root（su 能变 uid 0）就 silentInstall 静默装完自启，无人值守；
     // 没有 root 才弹不可取消的确认框 → installApk → FileProvider 系统安装器，
     // 缺"安装未知应用"权限时先跳授权页，回来由 onResume 续装。
+    // 2026-11-16 CX3588 台架（userdebug + SELinux Permissive + 镜像带 su）实测：这条静默链原样跑通——
+    // root 把包从应用私有 cacheDir 抄到 /data/local/tmp → pm install -r → 同一条 shell 里 am start，
+    // 全程不出安装器界面，且 -r 保住 prefs 与素材缓存（重启后仍绑原房、不触发全量重下）。
+    // pm install -r 会拒装低 versionCode（INSTALL_FAILED_VERSION_DOWNGRADE），所以这条路只认向上的版本，
+    // 与 checkForUpdate 的"远端 > 本机"判定天然一致；链用 && 串，装不上时不会误自启。
 
     /**
      * 校验 APK 下载地址是否来自可信服务器。
