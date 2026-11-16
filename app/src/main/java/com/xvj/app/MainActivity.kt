@@ -1450,10 +1450,15 @@ class MainActivity : AppCompatActivity() {
                 if (frames.length() > 0) put("frames", frames)
                 // 内存水位（#226）：availableMem 是整机口径、PSS 是本进程口径，都进 status_data 原文，
                 // 后台据此画曲线/置红。dma-buf 只有 root 读得到，设备侧拿不到就整个字段不带。
-                val mi = android.app.ActivityManager.MemoryInfo()
-                (getSystemService(android.app.ActivityManager::class.java))?.getMemoryInfo(mi)
-                if (mi.availMem > 0) put("mem_avail_mb", (mi.availMem shr 20).toInt())
-                put("app_pss_mb", (android.os.Debug.getTotalPss() shr 10).toInt())
+                val am = getSystemService(android.app.ActivityManager::class.java)
+                if (am != null) {
+                    val mi = android.app.ActivityManager.MemoryInfo()
+                    am.getMemoryInfo(mi)
+                    if (mi.availMem > 0) put("mem_avail_mb", (mi.availMem shr 20).toInt())
+                    val pssKb = am.getProcessMemoryInfo(intArrayOf(android.os.Process.myPid()))
+                        ?.firstOrNull()?.totalPss ?: 0
+                    if (pssKb > 0) put("app_pss_mb", pssKb / 1024)
+                }
                 put("timestamp", System.currentTimeMillis())
             }
             mqttClient?.publish(statusTopic, payload.toString().toByteArray(), 1, false)
