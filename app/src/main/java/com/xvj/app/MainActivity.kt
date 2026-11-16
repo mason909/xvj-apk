@@ -472,6 +472,16 @@ class MainActivity : AppCompatActivity() {
     private fun logToFile(msg: String, level: String = "INFO", module: String = "APP", action: String = "LOG") {
         try {
             val logFile = File(filesDir, "xvj.log")
+            // 日志原先无上限：一行开一次 writer，长跑一年多能把板子的存储吃光。
+            // 2MB 一轮、留三份（xvj.log + .1 + .2），滚动只在写之前发生，不加锁 —— 多线程撞上
+            // 最多丢一份旧档，比让日志无限长下去强。
+            if (logFile.length() > 2L * 1024 * 1024) {
+                val bak1 = File(filesDir, "xvj.log.1")
+                val bak2 = File(filesDir, "xvj.log.2")
+                bak2.delete()
+                if (bak1.exists()) bak1.renameTo(bak2)
+                logFile.renameTo(bak1)
+            }
             val logLine = "${System.currentTimeMillis()} $level $module $action $msg"
             PrintWriter(FileWriter(logFile, true)).use { it.println(logLine) }
 
@@ -604,6 +614,12 @@ class MainActivity : AppCompatActivity() {
         // 连接MQTT（注册→授权回执里带 scenes 时才第一次 applySceneConfigs）
         connectMQTT()
         checkForUpdate() // 检查更新
+
+        // 画面真在跑了：清掉退出标记，碰一下心跳信标，再把命交给 :keepalive 进程盯着（见 KeepAliveService）。
+        // 主进程被 lmkd 收走后，MQTT 跟着没了，远程连 reopen_desktop 都发不进来 —— 只有那个进程能救。
+        markExitedFile(false)
+        touchAlive()
+        startKeepAliveService()
     }
 
     /**
@@ -1402,6 +1418,8 @@ class MainActivity : AppCompatActivity() {
      *   syncing = 此刻是否有素材对账在飞；为 true 时服务端跳过对账，免得下载中途被再插一刀。
      *   screen_w/screen_h = 本机 windowGeom 换算用的那对像素（screenPx = 屏真实像素，与落屏分母同源，不是 dp）；
      *              编辑器画布拿它当"取本机"的一键基准。内存里 90s 过期，不进库 —— 心跳 30s 一报，够新。
+     *   mem_avail_mb / app_pss_mb = 内存水位（#226）：整机可用内存与本进程 PSS 的 MB 数，只进 status_data
+     *              原文供后台画曲线；不进 rev、不触发任何对账。
      *   frames  = 最近 1 分钟内收到的 485 帧指纹（[{hex,n,age}]，最多 8 种）；一段都没收到就不带这个字段，
      *              服务端据此清掉这台机的显示值。后台拿它判"分帧对不对"和学习模式的候选帧，
      *              所以它是瞬时状态：只进内存台账，不进 rev，也不进库。
@@ -1415,6 +1433,8 @@ class MainActivity : AppCompatActivity() {
             val deviceId = prefs.getString("device_id", null) ?: return
             val statusTopic = "xvj/device/$deviceId/status"
             val syncing = synchronized(syncLock) { syncInFlight.isNotEmpty() }
+            // 心跳同时是保活进程的判活信标（见 KeepAliveService）：本进程活着就一直在碰它
+            touchAlive()
             val payload = JSONObject().apply {
                 put("status", status)
                 put("version", VERSION_NAME)
@@ -1428,6 +1448,12 @@ class MainActivity : AppCompatActivity() {
                 // 台账为空（这一分钟没帧）就整段不带：服务端把"没带"当清掉显示值，留着上一轮的旧帧反而误导
                 val frames = frameLedger.toJson(SystemClock.elapsedRealtime())
                 if (frames.length() > 0) put("frames", frames)
+                // 内存水位（#226）：availableMem 是整机口径、PSS 是本进程口径，都进 status_data 原文，
+                // 后台据此画曲线/置红。dma-buf 只有 root 读得到，设备侧拿不到就整个字段不带。
+                val mi = android.app.ActivityManager.MemoryInfo()
+                (getSystemService(android.app.ActivityManager::class.java))?.getMemoryInfo(mi)
+                if (mi.availMem > 0) put("mem_avail_mb", (mi.availMem shr 20).toInt())
+                put("app_pss_mb", (android.os.Debug.getTotalPss() shr 10).toInt())
                 put("timestamp", System.currentTimeMillis())
             }
             mqttClient?.publish(statusTopic, payload.toString().toByteArray(), 1, false)
@@ -1609,7 +1635,7 @@ class MainActivity : AppCompatActivity() {
                 releaseAllWindows()
 
                 // 创建新播放器播放欢迎视频
-                player = ExoPlayer.Builder(this@MainActivity).build().apply {
+                player = ExoPlayer.Builder(this@MainActivity).setLoadControl(localBufferLoadControl()).build().apply {
                     binding.playerView.player = this
                     // 使用 Android resource URI 访问 raw 资源
                     val uri = android.net.Uri.parse("android.resource://${packageName}/raw/welcome")
@@ -2543,6 +2569,7 @@ class MainActivity : AppCompatActivity() {
         // 比不按键的还摸不着头脑。
         if (exited) {
             exited = false
+            markExitedFile(false)
             hideBlackout()
             logToFile("退出态由回到前台结束（HOME 键或桌面图标）", "INFO", "WINDOW", "DESKTOP")
             rebuildOnResume = true
@@ -4863,6 +4890,46 @@ class MainActivity : AppCompatActivity() {
         return super.dispatchTouchEvent(ev)
     }
 
+    /**
+     * 把命交给 :keepalive 进程（见 KeepAliveService）。只是"叫它起来"，重复调用无副作用。
+     * Android 8+ 必须走 startForegroundService，服务端 5s 内自己前台化；前台化失败它仍以普通服务活着。
+     */
+    private fun startKeepAliveService() {
+        try {
+            val i = Intent(this, KeepAliveService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+        } catch (e: Exception) {
+            logToFile("保活服务启动失败: ${e.message}", "WARN", "APP", "KEEPALIVE")
+        }
+    }
+
+    /**
+     * 心跳信标：保活进程据此判断本进程是否还活着（30s 一拍，两拍没见才判死）。
+     * 写不进去不影响播放，所以失败不刷日志 —— 30s 一次会把日志撑爆。
+     */
+    private fun touchAlive() {
+        try {
+            val f = File(filesDir, KeepAliveService.ALIVE_FILE)
+            if (!f.exists()) f.createNewFile()
+            f.setLastModified(System.currentTimeMillis())
+        } catch (e: Exception) {
+            // 只影响保活判断，不影响播放：故意不刷日志
+        }
+    }
+
+    /**
+     * 退出到桌面期间让保活进程闭嘴：那是用户显式点的退出，不是崩溃；不标记的话两分钟后画面自己弹回来。
+     * 跨进程只能靠文件，SharedPreferences 的 MODE_MULTI_PROCESS 已废弃不可用。
+     */
+    private fun markExitedFile(on: Boolean) {
+        try {
+            val f = File(filesDir, KeepAliveService.EXIT_MARKER)
+            if (on) f.createNewFile() else f.delete()
+        } catch (e: Exception) {
+            logToFile("退出标记写入失败: ${e.message}", "WARN", "APP", "KEEPALIVE")
+        }
+    }
+
     private fun registerLeftClick() {
         val now = SystemClock.elapsedRealtime()
         tapChainCount = if (tapChainCount > 0 && now - tapChainAtMs <= TAP_GESTURE_GAP_MS) tapChainCount + 1 else 1
@@ -4883,6 +4950,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         exited = on
+        markExitedFile(on)
         if (on) {
             // 释放走的是 action:'stop' 那两下：停单播放器（欢迎视频）+ 放掉全部窗口。
             // 不释放的话桌面在身前、解码器还在后台跑，桌面滑成幻灯片，白占一档 CPU。
