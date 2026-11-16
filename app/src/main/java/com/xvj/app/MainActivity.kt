@@ -117,6 +117,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
@@ -266,6 +267,9 @@ class MainActivity : AppCompatActivity() {
 
     // 正在处理的 OTA 版本号：同一版本的下载/确认框只允许一条流程，避免启动+连接+重连三路触发刷屏
     private var otaBusyVersion: String? = null
+
+    // root 静默安装可用性三态缓存（null = 还没探过）：见 silentInstallReady()，一次进程只验一次
+    private var rootSuUsable: Boolean? = null
 
     // ========== 素材同步在飞去重 & 配置版本对账 ==========
     /** 一条同步请求：载荷 + 服务端配置指纹。见 requestRoomMaterialSync */
@@ -1335,7 +1339,7 @@ class MainActivity : AppCompatActivity() {
      *             服务端【S-06】reconcileDeviceRev 拿它和房间真值比对，落后就补发一次同步 ——
      *             这是 QoS 丢消息 / 设备离线期间改配置的唯一兜底收敛路径。
      *   syncing = 此刻是否有素材对账在飞；为 true 时服务端跳过对账，免得下载中途被再插一刀。
-     *   screen_w/screen_h = 本机 windowGeom 换算用的那对像素（displayMetrics，与落屏分母同源，不是 dp）；
+     *   screen_w/screen_h = 本机 windowGeom 换算用的那对像素（screenPx = 屏真实像素，与落屏分母同源，不是 dp）；
      *              编辑器画布拿它当"取本机"的一键基准。内存里 90s 过期，不进库 —— 心跳 30s 一报，够新。
      *   frames  = 最近 1 分钟内收到的 485 帧指纹（[{hex,n,age}]，最多 8 种）；一段都没收到就不带这个字段，
      *              服务端据此清掉这台机的显示值。后台拿它判"分帧对不对"和学习模式的候选帧，
@@ -1356,10 +1360,10 @@ class MainActivity : AppCompatActivity() {
                 put("version_code", VERSION_CODE)
                 put("syncing", syncing)
                 if (appliedRev.isNotEmpty()) put("rev", appliedRev)
-                // 与 windowGeom 同源的那对像素（本 Handler 挂在主 looper 上，读 Resources 不必绕线程）
-                val dm = resources.displayMetrics
-                put("screen_w", dm.widthPixels)
-                put("screen_h", dm.heightPixels)
+                // 与 windowGeom 同源的那对像素（本 Handler 挂在主 looper 上，取窗口度量不必绕线程）
+                val screen = screenPx()
+                put("screen_w", screen[0])
+                put("screen_h", screen[1])
                 // 台账为空（这一分钟没帧）就整段不带：服务端把"没带"当清掉显示值，留着上一轮的旧帧反而误导
                 val frames = frameLedger.toJson(SystemClock.elapsedRealtime())
                 if (frames.length() > 0) put("frames", frames)
@@ -2741,8 +2745,10 @@ class MainActivity : AppCompatActivity() {
     //   1) 设备自查：checkForUpdate()，启动/每次连上 MQTT/重连时各调度一次，拉 /api/version/latest
     //   2) 云端推送：handleCommand 的 action:'update'，命令体自带完整 url + version + version_code + md5
     // downloadAndInstall 的门禁顺序：
-    //   isTrustedApkUrl（IP 精确匹配）→ 下载 → 体积 >1MB → md5（云端给了才校）→ 签名证书指纹 → 用户确认 → installApk
-    // 安装不是静默的：走 FileProvider + 系统安装器，缺"安装未知应用"权限时先跳授权页，回来由 onResume 续装。
+    //   isTrustedApkUrl（IP 精确匹配）→ 下载 → 体积 >1MB → md5（云端给了才校）→ 签名证书指纹 → 安装
+    // 安装分两条：探到 root（su 能变 uid 0）就 silentInstall 静默装完自启，无人值守；
+    // 没有 root 才弹不可取消的确认框 → installApk → FileProvider 系统安装器，
+    // 缺"安装未知应用"权限时先跳授权页，回来由 onResume 续装。
 
     /**
      * 校验 APK 下载地址是否来自可信服务器。
@@ -2873,10 +2879,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 下载并（经用户确认后）安装 APK。apkUrl 必须是完整地址，不是相对路径。
+     * 下载并安装 APK（有 root 就静默装，没有才经用户确认）。apkUrl 必须是完整地址，不是相对路径。
      * 顺序：isTrustedApkUrl → 下到 cacheDir/xvj-update-<version>.apk（已下好则直接复用不重下）→
      *       体积 <1MB 视为下载失败 → 有 expectedMd5 才比对（不等则删包退出）→
-     *       verifyApkSignature 比对证书指纹 → 弹不可取消的确认框 → installApk。
+     *       verifyApkSignature 比对证书指纹 → silentInstall，装不上才弹不可取消的确认框 → installApk。
      * md5 为空时（老云端命令没带）就少一道校验，只剩签名指纹兜底。
      * Toast/对话框都 post 到 mqttHandler（主线程），下载本身在新起的 Thread 里。
      * otaBusyVersion：同一条流程只允许一个（启动/连接/重连/推送可能并发触发同一版本）。
@@ -2983,6 +2989,16 @@ class MainActivity : AppCompatActivity() {
                 }
                 logToFile("APK签名验证通过")
 
+                // 有 root 的机器（台架/长期测试盒子）直接进静默安装，不占用大屏等人点"确定"；
+                // 探不到 root 才落到下面这条人工路径，行为与改动前一致。
+                // otaBusyVersion 在这里**不解锁**：静默那条跑起来后本进程多半就被系统回收了，
+                // 留着锁可以让安装窗口期内的重连/再推送不再起第二条并发下载。
+                if (silentInstallReady()) {
+                    logToFile("OTA: 走静默安装（版本 $version）")
+                    installApk(finalApkFile)
+                    return@Thread
+                }
+
                 // 使用对话框让用户确认安装
                 val installFile = finalApkFile  // 传递文件引用到Dialog
                 mqttHandler.post {
@@ -3019,11 +3035,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 安装已下载的 APK（带"安装未知应用"权限闸门）。
-     * 无权限时跳系统授权页，授权回来自动续装（onResume）。
-     * 未来接入静默安装（root pm install / device-owner PackageInstaller）只需替换本函数实现。
+     * 安装已下载的 APK 的唯一入口，内部按环境分两条：
+     * 探到 root（长期测试机/盒子）→ 后台线程跑 silentInstall，装完自启，全程无人值守；
+     * 没有 root → installViaSystemInstaller（权限闸门 + 系统安装器，需要现场点一下）。
+     * pm install 会一直阻塞到系统装完，而本函数的调用点常在主线程（对话框按钮、onResume 续装），
+     * 所以静默那条必须自己起线程；失败再 post 回主线程走人工那条。
      */
     private fun installApk(file: File) {
+        if (!silentInstallReady()) {
+            installViaSystemInstaller(file)
+            return
+        }
+        Thread {
+            if (!silentInstall(file)) mqttHandler.post { installViaSystemInstaller(file) }
+        }.start()
+    }
+
+    /**
+     * 人工安装：先过"安装未知应用"权限闸门，无权限时跳系统授权页，授权回来自动续装（onResume）。
+     */
+    private fun installViaSystemInstaller(file: File) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             !packageManager.canRequestPackageInstalls()) {
             logToFile("缺少安装未知应用权限，跳转授权页")
@@ -3091,6 +3122,81 @@ class MainActivity : AppCompatActivity() {
             logToFile("安装APK失败: ${e.message}")
             android.widget.Toast.makeText(this, "安装失败: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
         }
+    }
+
+    /**
+     * 这台机器能不能静默安装。探一次就缓存，探不到一律判负（回退人工安装器），不抛错。
+     * 判据是"应用 uid 喊 su 真能变成 uid 0"，不是"su 文件存在"：
+     * CX3588 台架实测（userdebug + SELinux Permissive + sudaemon 型 su）对任意 uid 放行；
+     * 量产 user 版盒子多半没有 su，或要弹框等人授权。
+     */
+    private fun silentInstallReady(): Boolean {
+        rootSuUsable?.let { return it }
+        val ok = try {
+            if (!File("/system/bin/su").canExecute()) {
+                false
+            } else {
+                val probe = execAsRoot("id -u", 3000)
+                probe.first == 0 && probe.second.trim() == "0"
+            }
+        } catch (e: Exception) {
+            logToFile("OTA: root 探测异常: ${e.message}", "WARN")
+            false
+        }
+        rootSuUsable = ok
+        logToFile(if (ok) "OTA: 检测到 root，静默安装可用" else "OTA: 无 root，安装走系统安装器")
+        return ok
+    }
+
+    /**
+     * root 静默安装：su 把包搬到 /data/local/tmp（应用私有目录 installer 读不到）→ pm install -r → 拉回自己。
+     * **自启必须写在同一条 shell 里**：换包时系统会杀掉本应用的全部进程，调用方拿不到返回值；
+     * 而这条 su 子进程已经换成 uid 0、不在被杀的进程组里，"装完再启动"这半句只有它替得我们说。
+     * 因此成功路径上本函数通常不会返回（进程已经没了），下一条日志靠不到 —— 版本是否真装上，
+     * 以重启后心跳回报的 version_code 为准。失败（返回 false）才回退到人工安装器。
+     * 只在 silentInstallReady() 判真之后调用（见 installApk），这里不再重复探测。
+     */
+    private fun silentInstall(file: File): Boolean {
+        val tmp = "/data/local/tmp/xvj-update.apk"
+        // 开头先 rm：上一次失败留下的包不能被这次的 cp 追加/复用；rm -f 对不存在的文件也返回 0
+        val sh = "rm -f $tmp && cp ${file.absolutePath} $tmp && chmod 644 $tmp && " +
+            "pm install -r $tmp && rm -f $tmp && sleep 3 && am start -n $packageName/.MainActivity"
+        logToFile("OTA: 静默安装 ${file.name}（${file.length()} bytes），本机进程随后会被回收并自启")
+        val done = execAsRoot(sh, 180000)
+        val ok = done.first == 0
+        logToFile("OTA: 静默安装${if (ok) "完成" else "失败(code=${done.first})"}: ${done.second}",
+            if (ok) "INFO" else "WARN")
+        return ok
+    }
+
+    /**
+     * 以 root 跑一条 shell，超时即杀进程（遇到要弹框授权的那种 su，不能让它把 OTA 线程吊死）。
+     * 先起守护线程把 stdout 读空再等退出：子进程输出塞满管道缓冲区会卡在 write，waitFor 就永远不返回。
+     * @return (退出码, 用 "; " 拼起的输出)；超时或起不来时退出码为 -1。
+     */
+    private fun execAsRoot(sh: String, timeoutMs: Long): Pair<Int, String> {
+        val proc = try {
+            Runtime.getRuntime().exec(arrayOf("/system/bin/su", "-c", sh))
+        } catch (e: Exception) {
+            return Pair(-1, "su 启动失败: ${e.message}")
+        }
+        val out = StringBuilder()
+        val reader = Thread {
+            try {
+                proc.inputStream.bufferedReader().forEachLine { line -> out.append(line).append("; ") }
+            } catch (e: Exception) {}
+        }
+        reader.isDaemon = true
+        reader.start()
+        var code = -1
+        val waiter = Thread { code = try { proc.waitFor() } catch (e: Exception) { -1 } }
+        waiter.start()
+        waiter.join(timeoutMs)
+        if (waiter.isAlive) {
+            try { proc.destroy() } catch (e: Exception) {}
+            return Pair(-1, "超时 ${timeoutMs}ms: $out")
+        }
+        return Pair(code, out.toString().trim())
     }
 
     // ========== 多窗口系统实现 ==========
@@ -3692,6 +3798,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 落屏换算的分母 = 这块屏的真实像素，不是 resources.displayMetrics。
+     * 后者在带系统栏的盒子上报的是"扣掉栏之后"的高度（CX3588 实测 7680×2160 只给 2016），
+     * 用它当分母会把整幅画面纵向压到 93.3%，越靠下的窗口越偏。窗口本身是全屏沉浸的，画布就是物理屏。
+     */
+    @Suppress("DEPRECATION")
+    private fun screenPx(): IntArray {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val b = windowManager.currentWindowMetrics.bounds
+            intArrayOf(b.width(), b.height())
+        } else {
+            val dm = DisplayMetrics()
+            windowManager.defaultDisplay.getRealMetrics(dm)
+            intArrayOf(dm.widthPixels, dm.heightPixels)
+        }
+    }
+
+    /**
      * 窗口几何 [x, y, width, height]（设备 px）：编辑器画布与这里共用同一把尺（房间 config.output，
      * 没设时 [DESIGN_W]×[DESIGN_H] 设计稿），坐标与尺寸按 屏宽/基准宽、屏高/基准高 两个轴向分别换算 ——
      * 基准取这台屏的真实像素时两个分母相等，画布上的正方形落屏还是正方形；取设计稿铺到 20:9 的屏上则拉成 1.25:1。
@@ -3700,9 +3823,9 @@ class MainActivity : AppCompatActivity() {
      * 全量创建与 update_windows 轻量路径共用本函数，两边不会再夹出两套口径。
      */
     private fun windowGeom(w: JSONObject): IntArray {
-        val dm = resources.displayMetrics
-        val sx = dm.widthPixels.toFloat() / designW
-        val sy = dm.heightPixels.toFloat() / designH
+        val screen = screenPx()
+        val sx = screen[0].toFloat() / designW
+        val sy = screen[1].toFloat() / designH
         return intArrayOf(
             Math.round(w.optInt("x", 0).coerceIn(-designW, designW * 2) * sx),
             Math.round(w.optInt("y", 0).coerceIn(-designH, designH * 2) * sy),
