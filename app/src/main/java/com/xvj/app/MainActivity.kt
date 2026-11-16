@@ -2039,7 +2039,8 @@ class MainActivity : AppCompatActivity() {
      * 4) runDownloadPlan 按字节进度逐个下载（调试模式下底部进度条可见），串行、单线程，
      *    回来的是 PlanResult(written, failed)——"下成了几个、没下成几个"，不是"排了几个任务"。
      * 5) 回主线程 applySceneConfigs：优先用本次载荷的 scenes，没有才回落 prefs 缓存；
-     *    written>0 才 force 重建，纯对账交给结构指纹判重，同配置不会打断正在播的视频。
+     *    新素材落格由 applySceneChangesInPlace 逐窗比磁盘清单（playlistStale）原地换清单，
+     *    不再 force 整屏重建 —— 整屏重建一次内核侧净漏 ~97MB dma-buf（台架实测，见该函数注释）。
      * 6) rev 只在 failed==0（整轮真的落地）时才记账；有失败就留给心跳对账下一轮补发。
      */
     private fun doRoomMaterialSync(req: SyncRequest) {
@@ -2068,17 +2069,19 @@ class MainActivity : AppCompatActivity() {
             val complete = res.failed == 0
             hideSyncProgress(if (complete) "素材同步完成" else "素材同步未完成：${res.failed} 个未落地")
 
-            // force 只在真下载过东西时给：本地一个字节都没变（全部 304 / 计划为空）就没必要打断正在播的视频，
-            // 交给结构指纹判重跳过。以前这里写的是 plan.isNotEmpty()，"排了任务"被当成"下载成功"，
-            // 于是网络抖一下、十个文件全失败，也照样强制重建一轮窗口（画面白闪），还看不出出了问题。
-            val downloaded = res.written > 0
+            // 下载过东西不再当成"必须整屏重建"的理由：新素材落进哪一格，applySceneChangesInPlace 就
+            // 逐窗比一遍磁盘清单（playlistStale），只给那一格换清单，播放器和 surface 一个都不动。
+            // 以前这里写的是 force = plan.isNotEmpty()（排了任务就算下载成功），于是网络抖一下、
+            // 十个文件全失败也照样把 6 路解码器推倒重来（画面白闪）；后来改成 written>0 才 force，
+            // 白闪是不闪了，但每次推素材整屏重建一次 —— 台架实测每重建一次内核侧净漏 ~97MB dma-buf
+            // 且不归还，十几次就把 4GB 的板子顶到 lmkd 开杀（现场表现是"推素材时 APP 闪退"）。
             mqttHandler.post {
                 val scenesToApply = scenes ?: prefs.getString("scenes_json", null)?.let {
                     try { org.json.JSONObject(it) } catch (e: Exception) { null }
                 }
                 if (scenesToApply != null) {
                     try {
-                        applySceneConfigs(scenesToApply, force = downloaded)
+                        applySceneConfigs(scenesToApply)
                     } catch (e: Exception) {
                         Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
                     }
@@ -3484,10 +3487,13 @@ class MainActivity : AppCompatActivity() {
 
     // 【A-07】 窗口配置 & 渲染
     /**
-     * 全量重建窗口：release 掉全部旧播放器/视图，按 mergeSceneWindows 拿到的 A+B 窗口合集
-     * 依 zIndex 升序逐个 createWindowView + playFolderInWindow。
+     * 应用窗口配置。优先走【原地应用】（见 applySceneChangesInPlace）：窗口清单与共享组构成没动时，
+     * 换映射、改播放设置、新素材落地都只是"给那一格换一份清单"，播放器和它的 surface 一个都不释放。
+     * 只有原地做不到（窗口增删/启停/换序、视频↔纯色互转、组成员变化、试播中、force）才整屏推倒：
+     * release 掉全部旧播放器/视图，按 mergeSceneWindows 拿到的 A+B 窗口合集依 zIndex 升序逐个
+     * createWindowView + playFolderInWindow。
      * @param scenes 完整 scenes JSON（A、B 两套都在里面，不是"当前那一幕"）
-     * @param force  true = 结构指纹相同也照建（素材刚下载完，播放器得重新挑文件）；
+     * @param force  true = 一律整屏重建（墙板把共享组成员分到两格时，画布的构成必须重来，见 applyPanelSource）
      *               false（默认）= 与上次应用的是同一份配置就直接返回，不打断正在播的视频。
      *
      * 兜底：两幕一个窗口都没有时，才建 DEFAULT_WINDOW_ID 那个整屏（尺寸=output 基准）SCENE_A 窗口
@@ -3516,6 +3522,10 @@ class MainActivity : AppCompatActivity() {
             logToFile("scenes 与屏上一致（指纹 $fp），跳过全量重建", "INFO", "WINDOW", "SKIP")
             return
         }
+        // 差集闸门：能原地做的绝不推倒整屏。台架实测每整屏重建一次，内核侧净留约 97MB dma-buf 且永不归还
+        // （4GB 的板子，5 轮从 1.14GB 涨到 1.63GB，关窗也不降），十几轮就够 lmkd 开杀 —— 而日常那些"改了个映射"
+        // "推了新素材"根本不需要动播放器，把 6 路解码器全部重来一遍才是漏的源头。
+        if (!force && applySceneChangesInPlace(scenes, fp)) return
 
         // 试播必须先于播放器释放前清账：这些窗口马上就要照新配置重建，
         // 留着旧快照只会让收尾回调对着已释放的实例写状态（见 abortAllPreviews）
@@ -3588,6 +3598,90 @@ class MainActivity : AppCompatActivity() {
         appliedPlaySettingsJson = playSettingsJson(scenes)
         // 次序账与指纹同步落地（默认窗口那条兜底分支也要走到，否则实时更新会一直误判成结构变化）
         appliedWindowOrder = enabledWindowsSorted(scenes).map { it.first }
+    }
+
+    /**
+     * 原地应用一份新 scenes：只换清单、不换播放器。
+     *
+     * 判"要不要换清单"用三把尺，任一把响就只重排那一路播放器的清单：
+     *   1. 内容签名变了（换了格子 / 勾了跟随 / 改了映射指向的那一格）；
+     *   2. 播放设置变了且这一格的随机/顺序确实翻转（设置不在 content 里，签名字比不出来）；
+     *   3. 这一格磁盘上的文件和在播的清单对不上了 —— 新素材刚下载完、或同步时删过文件。
+     * 三把尺都不响而指纹仍不同，说明变的只是几何/透明度/亮度/取景，交给 applyLiveWindowUpdate 原地改视图。
+     *
+     * 原地做不到、必须回整屏重建的情况（一律 return false，让调用方走老路）：
+     *   - 屏上还没有按配置建起来的现场（appliedWindowOrder 空：冷启动、退出到桌面后）；
+     *   - 正在试播（清单归试播管，让路逻辑见 abortAllPreviews）；
+     *   - 生效窗口清单变了（增删 / enabled / 换序）；
+     *   - 共享解码组的成员构成变了（要拆要建的是那块 GL 画布，不是清单）；
+     *   - 视频↔纯色/HDMI 互转（换的是视图）；
+     *   - 某一扇窗在 windowContentSigs 里没有账（视图当初就没建起来）。
+     * 必须在主线程调用（摸 windowViews / windowPlayers / addView）。
+     *
+     * @param fp 本次 scenes 的结构指纹，调用方已算好，原地落地后照它记账
+     * @return true = 已全部原地应用并记好账，调用方可以直接返回
+     */
+    private fun applySceneChangesInPlace(scenes: JSONObject, fp: String): Boolean {
+        if (appliedWindowOrder.isEmpty() || previews.isNotEmpty()) return false
+        val desired = enabledWindowsSorted(scenes)
+        if (desired.map { it.first } != appliedWindowOrder) return false
+
+        val plan = desired.map { (winId, w) ->
+            val content = w.optJSONObject("content") ?: JSONObject()
+            PlanWindow(winId, w, content, resolveWindowFolder(scenes, content, winId))
+        }
+        // 同格 ≥2 扇才成组：按新配置算一遍组，成员表与屏上那份逐窗比对（不在组里两边都是 null）
+        val wantGroup = plan.filter { isVideoContentType(it.content) && it.folderId != null }
+            .groupBy { it.folderId!! }.filterValues { it.size >= 2 }
+            .flatMap { (folderKey, items) -> items.map { it.winId to folderKey } }.toMap()
+        if (plan.any { winShareGroup[it.winId]?.folderKey != wantGroup[it.winId] }) return false
+
+        val settingsChanged = playSettingsJson(scenes) != appliedPlaySettingsJson
+        val refresh = ArrayList<PlanWindow>()
+        for (p in plan) {
+            val oldSig = windowContentSigs[p.winId] ?: return false
+            val newSig = contentSignature(p.content)
+            if (oldSig != newSig) {
+                if (!isVideoContentSig(oldSig) || !isVideoContentSig(newSig)) return false
+                refresh.add(p)
+                continue
+            }
+            val folderId = p.folderId
+            if (!isVideoContentSig(newSig) || folderId == null) continue
+            val surf = videoSurfaces[p.winId] ?: return false
+            if ((settingsChanged && surf.settings.shuffle != playSettingsOf(scenes, folderId).shuffle) ||
+                playlistStale(folderId)) refresh.add(p)
+        }
+
+        // 换清单：播放器和它的 surface 全程不动（共享组的跟随窗在这里只记账，实际那一路由基准窗推）
+        for (p in refresh) p.folderId?.let { playFolderInWindow(p.winId, it, scenes) }
+        for (p in plan) windowContentSigs[p.winId] = contentSignature(p.content)
+        appliedScenes = scenes
+        appliedScenesFp = fp
+        appliedPlaySettingsJson = playSettingsJson(scenes)
+        // 次序与签名上面已对齐，这里判不出结构变化，只会原地改视图几何并把共享画布按并集重算一次
+        applyLiveWindowUpdate(scenes)
+        logToFile("配置原地应用：${plan.size} 扇窗只换 ${refresh.size} 路清单，播放器零释放（指纹 $fp）", "INFO", "WINDOW", "INPLACE")
+        return true
+    }
+
+    /**
+     * 这一格磁盘上的文件是不是已经跟在播的清单对不上了（新素材落地 / 同步删了文件）。
+     * 比较口径与 playFolderInWindow 用的完全一致（同一份清单缓存 + 同一个 sameItems），两处各写一份时
+     * 就会出现"这边认为变了、那边 setMediaItems 又判没变"的白工。
+     */
+    private fun playlistStale(folderId: String): Boolean {
+        val cached = folderPlaylists[folderId] ?: return true
+        val dir = materialDirOf(folderId) ?: return false
+        val listed = dir.listFiles()?.filter { it.extension.lowercase() in VIDEO_EXTS }
+            ?.sortedBy { it.name }?.map { MediaItem.fromUri(Uri.fromFile(it)) } ?: return false
+        return !sameItems(cached, listed)
+    }
+
+    /** 内容签名（type|folderId|…）里只看类型那一段是不是真素材 —— 纯色/HDMI 本来就没有播放器 */
+    private fun isVideoContentSig(sig: String): Boolean {
+        val type = sig.substringBefore('|')
+        return type != "HDMI" && type != "VIDEO_INPUT" && type != "COLOR"
     }
 
     /**
@@ -3894,11 +3988,9 @@ class MainActivity : AppCompatActivity() {
         val members: List<String>
     )
 
-    /** 这扇窗的内容是不是真素材轮播 —— 只有它谈得上共享解码（纯色/HDMI 本来就不起解码器） */
-    private fun isVideoContentType(content: JSONObject): Boolean {
-        val type = content.optString("type", "SCENE_A").uppercase()
-        return type != "HDMI" && type != "VIDEO_INPUT" && type != "COLOR"
-    }
+    /** 这扇窗的内容是不是真素材轮播 —— 只有它谈得上共享解码（纯色/HDMI 本来就不起解码器）。
+     *  口径与原地应用共用 isVideoContentSig：两处各判各的会漏掉 "VIDEO_INPUT" 这种别名 */
+    private fun isVideoContentType(content: JSONObject): Boolean = isVideoContentSig(contentSignature(content))
 
     /**
      * 建一个共享解码单元：同格 ≥2 扇窗只起一路播放器，其余窗口既不建 TextureView 也不建播放器。
