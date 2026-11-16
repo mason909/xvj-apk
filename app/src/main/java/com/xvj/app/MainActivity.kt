@@ -3567,6 +3567,10 @@ class MainActivity : AppCompatActivity() {
         // "推了新素材"根本不需要动播放器，把 6 路解码器全部重来一遍才是漏的源头。
         if (!force && applySceneChangesInPlace(scenes, fp)) return
 
+        // 走到这里才是真整屏重建（原地闸门没接住）。这一行是台架复测数"重建次数"的唯一锚点，
+        // 别在别处复用：播放设置翻转等在原地路径里完成，不应计入重建。
+        logToFile("回退全量重建：释放 ${windowPlayers.size} 路播放器，按新配置重排", "INFO", "WINDOW", "REBUILD")
+
         // 试播必须先于播放器释放前清账：这些窗口马上就要照新配置重建，
         // 留着旧快照只会让收尾回调对着已释放的实例写状态（见 abortAllPreviews）
         abortAllPreviews("场景配置重建")
@@ -3887,7 +3891,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (structural) {
-            logToFile("实时更新含结构变化，回退全量重建", "INFO", "WINDOW", "CONFIG")
+            // 只报"交给配置落地"，不报结果：播放设置翻转/换格这类在 applySceneConfigs 里会走原地换清单，
+            // 真正释放播放器的全量重建由那边自己打一条（否则复测按这行数重建次数会把原地算成重建）
+            logToFile("实时更新含结构变化，交给配置落地判定（原地优先）", "INFO", "WINDOW", "CONFIG")
             applySceneConfigs(scenes)
             return
         }
