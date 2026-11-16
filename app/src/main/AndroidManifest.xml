@@ -13,6 +13,17 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- 【A-15】退出到桌面要先找到"别的 HOME"。Android 11+ 的包可见性会把没声明的查询过滤成
+         只剩自己：targetSdk 34 又没 QUERY_ALL_PACKAGES 时，queryIntentActivities(MAIN/HOME)
+         返回空 ⇒ 台架明明装着 com.android.launcher3 却判成"没有桌面"，退出退化成黑屏（2026-11-16 真机实测）。
+         声明这条 intent filter 后，匹配 HOME 的应用才对本进程可见。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
