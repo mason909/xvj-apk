@@ -3138,19 +3138,23 @@ class MainActivity : AppCompatActivity() {
      */
     private fun silentInstallReady(): Boolean {
         rootSuUsable?.let { return it }
+        var why = "/system/bin/su 不可执行"
         val ok = try {
             if (!File("/system/bin/su").canExecute()) {
                 false
             } else {
                 val probe = execAsRoot("id -u", 3000)
-                probe.first == 0 && probe.second.trim() == "0"
+                why = "code=${probe.first} out=\"${probe.second}\""
+                // execAsRoot 按行以 "; " 拼接，stdout 的 "0" 到这里是 "0; "，整串比较永远不成立
+                probe.first == 0 && probe.second.substringBefore(";").trim() == "0"
             }
         } catch (e: Exception) {
-            logToFile("OTA: root 探测异常: ${e.message}", "WARN")
+            why = "异常 ${e.message}"
             false
         }
         rootSuUsable = ok
-        logToFile(if (ok) "OTA: 检测到 root，静默安装可用" else "OTA: 无 root，安装走系统安装器")
+        logToFile(if (ok) "OTA: 检测到 root，静默安装可用" else "OTA: 无 root（$why），安装走系统安装器",
+            if (ok) "INFO" else "WARN")
         return ok
     }
 
