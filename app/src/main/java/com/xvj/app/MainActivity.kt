@@ -2755,6 +2755,8 @@ class MainActivity : AppCompatActivity() {
     // 全程不出安装器界面，且 -r 保住 prefs 与素材缓存（重启后仍绑原房、不触发全量重下）。
     // pm install -r 会拒装低 versionCode（INSTALL_FAILED_VERSION_DOWNGRADE），所以这条路只认向上的版本，
     // 与 checkForUpdate 的"远端 > 本机"判定天然一致；链用 && 串，装不上时不会误自启。
+    // 另有一条推不掉的次序：**执行探测的是"当前已装的那一版"**，所以改探测口径的包自己证明不了自己，
+    // 要等下一版才见效（318/319 两次都因此仍弹了确认框，且 update 分支硬闸 serverCode > 本机，同版本重推也会被拒）。
 
     /**
      * 校验 APK 下载地址是否来自可信服务器。
