@@ -28,6 +28,8 @@
  *         startWallPanelLearn / publishFrameSnapshot；
  *         收帧解析与 termios 在 serial/WallPanelLink.kt，帧台账与学习表在 serial/WallPanelFrames.kt，
  *         帧族分帧在 serial/WallPanelParser.kt）
+ * 【A-15】待机与恢复（setStandby / showStandbyOverlay / hideStandbyOverlay / registerTapGesture + dispatchTouchEvent；
+ *         入口两条：云端 action:'standby' / 'resume'，本机鼠标左键连点 5 次）
  * （A-05 已随"单播放器点播"旧链路一起删除，编号保留空位）
  * ─────────────────────────────────────────────────
  * 
@@ -120,6 +122,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -240,6 +243,19 @@ class MainActivity : AppCompatActivity() {
     private val DEFAULT_WINDOW_ID = "win_1"
     /** 窗口容器 FrameLayout（根视图）*/
     private val flSurface: FrameLayout? get() = binding.root as? FrameLayout
+    /**
+     * 待机位：true = 屏已黑、窗口已释放，但进程、MQTT 订阅和心跳都还活着（见【A-15】）。
+     * 只在内存里，故意不落 prefs：待机是营业途中的一次 blackout，不是配置状态 ——
+     * 重启该回到开机画面，而不是回到"上次下班时黑着"。
+     * 读写都在主线程（命令由 mqttHandler post、手势由 dispatchTouchEvent 进来，两者都是主线程）。
+     */
+    private var standby = false
+    /** 待机时盖在最后一层的那块纯黑视图；非待机恒为 null */
+    private var standbyOverlay: View? = null
+    /** 左键连点手势：当前链已计到第几下 */
+    private var tapChainCount = 0
+    /** 上一次合格左键抬起的时刻（elapsedRealtime），超过间隔就重新起链 */
+    private var tapChainAtMs = 0L
     // ==============================
     private var mqttClient: MqttClient? = null
     private val mqttHandler = Handler(Looper.getMainLooper())
@@ -1105,6 +1121,12 @@ class MainActivity : AppCompatActivity() {
      * 必须在主线程调用（换 playlist）；WallPanelLink 的事件已经 post 到主线程。
      */
     private fun applyPanelSource(source: PanelSource, hex: String) {
+        if (standby) {
+            // 待机中屏是黑的，画面不该被 485 叫醒 —— 否则"待机"按不动，客人面前黑不住。
+            // 不更新 panelSource：出待机时按配置原样重建，那几帧不补播。
+            logToFile("墙板触发 ${describeSource(source)} 未生效：设备处于待机", "WARN", "WALLPANEL", "STANDBY")
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         val repeat = panelSource == source
         if (repeat && now - panelSourceAtMs < WALLPANEL_REPEAT_DEBOUNCE_MS) {
@@ -1626,6 +1648,8 @@ class MainActivity : AppCompatActivity() {
      * @param json 命令 JSON，必须含 action 字段
      * 实际支持的 action（与服务端发送方一一对应）：
      *   stop                停掉全部播放
+     *   standby             进待机：黑屏但进程/MQTT 全活着（与 stop 的差别见【A-15】）
+     *   resume              退待机：按 prefs 的 scenes_json 重排回原画面
      *   config              改 mqtt_server / loop（只影响单播放器 player，不影响窗口播放器）
      *   sync_room_materials 房间素材全量对账（服务端【S-07】/授权链路发出）
      *   update_windows      轻量窗口重排，不下素材（编辑器 live 实时预览）
@@ -1663,6 +1687,12 @@ class MainActivity : AppCompatActivity() {
                         stopPlayback()
                         releaseAllWindows()
                     }
+                }
+                "standby", "resume" -> {
+                    // 待机/恢复（云端【S-05e】+ 本机左键连点，见【A-15】）：和 stop 的区别是
+                    // 待机不打算让设备"停在停止态"，它是一次可逆的黑屏，所以恢复由同一条链自己完成，
+                    // 不需要云端重发配置。命令必须回显到 device_logs，否则现场只知道"黑了"不知道"谁让它黑的"。
+                    mqttHandler.post { setStandby(action == "standby", "云端命令") }
                 }
                 "config" -> {
                     // 更新配置
@@ -3229,6 +3259,13 @@ class MainActivity : AppCompatActivity() {
      * 必须在主线程调用（含 addView/removeView），所有调用点都已 post 到 mqttHandler。
      */
     private fun applySceneConfigs(scenes: JSONObject?, force: Boolean = false) {
+        if (standby) {
+            // 待机中任何配置落地都不许动画面：待机期间云端改了窗口、rev 对账补发 sync、
+            // update_windows 因屏上无窗口回落到全量重建 —— 三条都会把黑屏顶掉。
+            // 出待机只认 setStandby(false) 这一条路；配置本身已照常落 prefs，那份 scenes_json 到时长见【A-15】。
+            logToFile("待机中，场景配置落地已忽略（出待机后按最新配置重建）", "WARN", "WINDOW", "STANDBY")
+            return
+        }
         logToFile("开始应用场景配置", "INFO", "WINDOW", "CONFIG")
         if (scenes == null) {
             Log.w(TAG, "applySceneConfigs: scenes 为空")
@@ -4201,6 +4238,13 @@ class MainActivity : AppCompatActivity() {
             logToFile("试播拒绝：filename 为空", "WARN", "PLAYBACK", "PREVIEW")
             return
         }
+        if (standby) {
+            // 待机时窗口全放了，previewTarget 本来也认不出目标，但那条日志会写成"这一格没有窗口在播"，
+            // 现场据此去查配置就白跑一趟 —— 这里先把真话说出来。
+            logToFile("试播拒绝：设备处于待机", "WARN", "PLAYBACK", "STANDBY")
+            previewStatusText("试播已拒绝：设备处于待机")
+            return
+        }
         // 素材同步在飞时不插队：那一轮正在按清单增删这个目录里的文件，而且它收尾必定 apply 一次场景配置，
         // 真播了也马上会被 abortAllPreviews 抹掉 —— 白费一次解码，还白闪一下屏。整格判一次。
         if (synchronized(syncLock) { syncInFlight.isNotEmpty() }) {
@@ -4443,5 +4487,117 @@ class MainActivity : AppCompatActivity() {
         // 屏上次序账同理作废：留着它，stop 之后同一份配置的 update_windows 会被比成"没变"
         appliedWindowOrder = emptyList()
         Log.d(TAG, "释放所有窗口资源")
+    }
+
+    // 【A-15】 待机与恢复：黑屏，但进程、MQTT 订阅、心跳全部保持
+    // @tag: setStandby 待机 恢复 黑屏
+    // @tag: dispatchTouchEvent registerLeftClick 左键连点 5 下
+    //
+    // 为什么不是"真退出"：XVJ 现在是默认启动器（HOME），finishAffinity() 之后系统立刻把它再拉起来；
+    // 杀进程只剩 root/ADB 两条路，量产 user 版盒子上没有。所以现场要的"退出"落地成一个可逆的黑屏：
+    // 窗口播放器全释放 + 盖一层纯黑，配置、素材、prefs 一概不动，云端和心跳照常，随时唤得回来。
+    // 两个入口共用一套闸门：云端 action:'standby'/'resume'（管理台设备卡片的「待机」「恢复播放」），
+    // 以及本机鼠标左键连点 5 下（断网也能退，和现场用惯了的小麦手法对齐）。
+    // 待机期间所有会动画面的入口都在自己门口被挡掉：applySceneConfigs（含 update_windows 回落和墙板
+    // 回全量重建那条）、applyPanelSource、startGroupPreview —— 恢复只走 setStandby(false) 这一条路。
+    // 状态只在内存里：待机不是配置，重启回到开机画面，而不是回到"上次黑着"。
+
+    /** 连点判定：相邻两下的最大间隔（ms）。定 500 是为了"快点五下"，慢点不算手势 */
+    private val TAP_GESTURE_GAP_MS = 500L
+
+    /** 触发待机的左键次数 */
+    private val TAP_GESTURE_COUNT = 5
+
+    /** 左键已按下、正等它的抬起沿：一下点击数一次 */
+    private var primaryDownPending = false
+
+    /**
+     * 鼠标左键点击计数（Activity 级 dispatch 能看到全部触点，包括鼠标转成的 touch 事件）。
+     * 只认「按下时 buttonState 恰好等于 BUTTON_PRIMARY」这一对沿：手指和触摸笔的 buttonState 是 0，
+     * 右键或左右同按也不等于它，所以触摸屏上误点五下不会把营业中的大屏弄黑。
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> primaryDownPending = ev.buttonState == MotionEvent.BUTTON_PRIMARY
+            MotionEvent.ACTION_UP -> {
+                if (primaryDownPending) registerLeftClick()
+                primaryDownPending = false
+            }
+            // MOVE / CANCEL：按住左键拖动不是点击，作废这一沿
+            else -> primaryDownPending = false
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun registerLeftClick() {
+        val now = SystemClock.elapsedRealtime()
+        tapChainCount = if (tapChainCount > 0 && now - tapChainAtMs <= TAP_GESTURE_GAP_MS) tapChainCount + 1 else 1
+        tapChainAtMs = now
+        if (tapChainCount < TAP_GESTURE_COUNT) return
+        tapChainCount = 0
+        setStandby(!standby, "左键连点")
+    }
+
+    /**
+     * 待机/恢复的唯一入口（在主线程调用，命令侧由 mqttHandler post 进来）。
+     * 出待机的次序不能换：先把 standby 置回 false，再撤黑、重建 ——
+     * 反了的话那次 applySceneConfigs 会被它自己的待机闸门挡掉，屏就黑着起不来了。
+     */
+    private fun setStandby(on: Boolean, reason: String) {
+        if (standby == on) {
+            logToFile("待机状态未变化（$reason 请求${if (on) "进" else "出"}待机）", "INFO", "WINDOW", "STANDBY")
+            return
+        }
+        standby = on
+        if (on) {
+            // 释放走的是 action:'stop' 那两下：停单播放器（欢迎视频）+ 放掉全部窗口
+            stopPlayback()
+            releaseAllWindows()
+            showStandbyOverlay()
+            binding.statusText?.text = "待机中：连点 5 下左键或在管理台点「恢复播放」"
+            logToFile("进入待机（$reason）：画面已黑，进程与 MQTT 保持", "INFO", "WINDOW", "STANDBY")
+            return
+        }
+        hideStandbyOverlay()
+        // 和 restoreCachedScenes 用同一道授权闸门：待机期间被废止过就不该把缓存画面放回去
+        if (!prefs.getBoolean("last_authorized", false)) {
+            logToFile("退出待机（$reason）：本机已非授权态，改播欢迎视频", "WARN", "WINDOW", "STANDBY")
+            playWelcomeVideo()
+            return
+        }
+        val cached = prefs.getString("scenes_json", null)
+        if (cached == null) {
+            // 从没应用过配置（刚装机还没绑房就待机）：不猜画面。
+            // 待机闸门此刻已经放开，下一次 rev 对账或授权回执补发的配置会正常落地。
+            logToFile("退出待机（$reason）：本机没有 scenes 缓存，等云端下发配置", "WARN", "WINDOW", "STANDBY")
+            return
+        }
+        try {
+            applySceneConfigs(org.json.JSONObject(cached))
+            logToFile("退出待机（$reason）：按缓存配置重建画面", "INFO", "WINDOW", "STANDBY")
+        } catch (e: Exception) {
+            Log.e(TAG, "退出待机重建失败: ${e.message}")
+            logToFile("退出待机失败：scenes 缓存解析异常 ${e.message}", "ERROR", "WINDOW", "ERROR")
+        }
+    }
+
+    /** 黑布盖到根容器最后一层（覆盖顺序只能靠 bringToFront，窗口容器都是 addView 进来的） */
+    private fun showStandbyOverlay() {
+        val root = flSurface ?: return
+        if (standbyOverlay == null) {
+            val v = View(this)
+            v.setBackgroundColor(Color.BLACK)
+            root.addView(v, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            standbyOverlay = v
+        }
+        standbyOverlay?.bringToFront()
+        // 待机文字属于运维层：debug 开着时要压在黑布上面，关着时整层不见
+        applyDebugUi()
+    }
+
+    private fun hideStandbyOverlay() {
+        standbyOverlay?.let { flSurface?.removeView(it) }
+        standbyOverlay = null
+        applyDebugUi()
     }
 }
