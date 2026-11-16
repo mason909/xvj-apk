@@ -139,6 +139,8 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import android.view.Gravity
 import android.graphics.Color
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
 import android.view.TextureView
@@ -269,6 +271,9 @@ class MainActivity : AppCompatActivity() {
     // 单线程语义：submit 的是"整轮同步任务"，一轮只占 1 个线程；
     // 池给到 4 只是为了让 auth 触发的同步和手动 sync 不互相排队，文件夹内部仍是逐个串行下载。
     private val downloadExecutor = Executors.newFixedThreadPool(4)
+    // 实时截图单独一条线程：素材同步常把 4 个下载坑占满，管理台那一下不该排队排到超时；
+    // 单线程也顺带保证同一时刻只跑一张 screencap —— 两张 8K PNG 同时进内存没有意义。
+    private val shotExecutor = Executors.newSingleThreadExecutor()
     /** MQTT 重连的排程线程：刻意与主线程分开，见 reconnectMQTT() */
     private val reconnectScheduler = Executors.newSingleThreadScheduledExecutor()
     private var statusTimerRunnable: Runnable? = null
@@ -366,6 +371,13 @@ class MainActivity : AppCompatActivity() {
          */
         private var liveInstance: MainActivity? = null
         const val APK_URL = "http://47.102.106.237"
+        // 【A-16】实时截图的三个上限：8K 全屏 PNG 是几 MB 量级，超 16MB 就不像"一帧画面"该有的体积；
+        // 回传宽度 1920 足够远程管理认出窗口内容与屏上文字，再大只是白带；超时给足 screencap
+        // 单线程编码整屏 PNG 的时间（台架 7680×2160 实测 1~2 秒级）。
+        private const val SHOT_MAX_PNG_BYTES = 16 * 1024 * 1024
+        private const val SHOT_MAX_WIDTH = 1920
+        private const val SHOT_JPEG_QUALITY = 70
+        private const val SHOT_TIMEOUT_MS = 15000L
         // 订阅用的通配符主题在 connectMQTT() 里按 deviceId 拼具体路径，不再用常量
         private const val AUTH_TOPIC = "xvj/auth/response"
         // 素材缓存的 SharedPreferences key 前缀。三个前缀后面的键一律是
@@ -1720,6 +1732,21 @@ class MainActivity : AppCompatActivity() {
                     // 不需要云端重发配置。命令必须回显到 device_logs，否则现场只知道"桌面出来了"不知道是谁叫的。
                     mqttHandler.post { setExited(action == "exit_desktop", "云端命令") }
                 }
+                // 实时截图（见【A-16】）：管理台要一帧当前落屏的画面。载荷由服务端补齐
+                // （upload_url + 一次性 token，两者只进这台设备的私有主题），缺任一条就是命令没配好，
+                // 记一行日志走人 —— 不去猜地址，也不接受调用方自带 URL。
+                // 这里不吃 exited 闸门：退出态下屏上是原厂桌面，那正是远程管理要看的一种画面。
+                "screenshot" -> {
+                    val uploadUrl = cmd.optString("upload_url")
+                    val shotToken = cmd.optString("token")
+                    if (uploadUrl.isEmpty() || shotToken.isEmpty()) {
+                        logToFile("实时截图：命令缺 upload_url/token（服务端未补全），已忽略", "WARN", "SYNC", "SCREENSHOT")
+                    } else if (!isTrustedServerUrl(uploadUrl)) {
+                        logToFile("实时截图：上传地址不是本站，已拒绝: $uploadUrl", "ERROR", "SYNC", "SCREENSHOT")
+                    } else {
+                        shotExecutor.execute { captureAndUploadScreenshot(uploadUrl, shotToken) }
+                    }
+                }
                 "config" -> {
                     // 更新配置
                     if (cmd.has("mqtt_server")) {
@@ -2561,6 +2588,7 @@ class MainActivity : AppCompatActivity() {
             mqttClient?.close()
         } catch (e: Exception) {}
         downloadExecutor.shutdown()
+        shotExecutor.shutdownNow()
         // 排程线程不归主线程管，不收就会在 Activity 退场后继续 connect 一次
         reconnectScheduler.shutdownNow()
     }
@@ -2851,6 +2879,21 @@ class MainActivity : AppCompatActivity() {
             val host = uri.host ?: return false
             // 精确匹配IP
             host == "47.102.106.237" || host == "47.102.106.237."
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 回传类地址的可信判定：主机沿用 isTrustedApkUrl 的 IP 精确匹配，再钉住"就是截图回传口"这条路径。
+     * 为什么要多钉这一层：upload_url 是 MQTT 载荷里的字符串，拿到就直接往它 POST 二进制加令牌；
+     * 只判主机的话，同一台主机上的任意路径（带 query 的、会跳走的）也照收不误。
+     */
+    private fun isTrustedServerUrl(url: String): Boolean {
+        if (!isTrustedApkUrl(url)) return false
+        return try {
+            val path = java.net.URI(url).path ?: return false
+            path.startsWith("/api/device/") && path.endsWith("/screenshot") && !path.contains("..")
         } catch (e: Exception) {
             false
         }
@@ -3295,6 +3338,143 @@ class MainActivity : AppCompatActivity() {
             return Pair(-1, "超时 ${timeoutMs}ms: $out")
         }
         return Pair(code, out.toString().trim())
+    }
+
+    // ========== 【A-16】实时截图（云端【S-15】的设备侧） ==========
+    // 一帧当前落屏画面 → JPEG → POST 回服务端。为什么走 root screencap 而不是 MediaProjection：
+    // 后者要点授权框，无人值守的包厢机器弹不出来也没人点；screencap 和静默安装共用同一个 root 前提
+    // （量产镜像由厂家带 root 刷全量镜像，2026-11-16 老板定调：关键节点加密码确认即可）。
+    // 全程只读不写：不碰播放器、不改状态，失败只留一行日志 —— 管理台等不到图时，那行日志是唯一线索。
+
+    /**
+     * root screencap 出一张全屏 PNG，从 stdout 直接收（不落设备磁盘，省掉临时文件的归属与清理）。
+     * 判据用 PNG 魔数：su 或 screencap 不存在时会把错误文本吐到 stdout，那不是图。
+     * @return PNG 字节；拿不到就 null
+     */
+    private fun captureScreenPng(): ByteArray? {
+        val proc = try {
+            Runtime.getRuntime().exec(arrayOf("/system/bin/su", "-c", "screencap -p"))
+        } catch (e: Exception) {
+            logToFile("实时截图：su 起不来（${e.message}），这台机器大概没 root", "WARN", "SYNC", "SCREENSHOT")
+            return null
+        }
+        var png: ByteArray? = null
+        var overSize = false
+        val reader = Thread {
+            val buf = java.io.ByteArrayOutputStream()
+            try {
+                val inp = proc.inputStream
+                val chunk = ByteArray(64 * 1024)
+                while (true) {
+                    val n = inp.read(chunk)
+                    if (n < 0) break
+                    buf.write(chunk, 0, n)
+                    if (buf.size() > SHOT_MAX_PNG_BYTES) {
+                        overSize = true
+                        try { proc.destroy() } catch (e: Exception) {}
+                        break
+                    }
+                }
+                png = buf.toByteArray()
+            } catch (e: Exception) {
+                // 超时或超长被 destroy 时，读线程必然抛在这里；真正的判废在下面的 overSize/退出码
+            }
+        }
+        reader.isDaemon = true
+        reader.start()
+        var code = -1
+        val waiter = Thread { code = try { proc.waitFor() } catch (e: Exception) { -1 } }
+        waiter.start()
+        waiter.join(SHOT_TIMEOUT_MS)
+        if (waiter.isAlive) {
+            try { proc.destroy() } catch (e: Exception) {}
+            logToFile("实时截图：screencap 超过 ${SHOT_TIMEOUT_MS}ms 没出图，放弃", "WARN", "SYNC", "SCREENSHOT")
+            return null
+        }
+        reader.join(2000)
+        if (overSize) {
+            logToFile("实时截图：PNG 超过 ${SHOT_MAX_PNG_BYTES / 1024 / 1024}MB，判废", "WARN", "SYNC", "SCREENSHOT")
+            return null
+        }
+        val bytes = png
+        if (bytes == null || bytes.size < 1024 || code != 0) {
+            logToFile("实时截图：screencap 退出码 $code，收到 ${bytes?.size ?: 0}B", "WARN", "SYNC", "SCREENSHOT")
+            return null
+        }
+        if (!(bytes[0] == 0x89.toByte() && bytes[1] == 'P'.code.toByte() &&
+                bytes[2] == 'N'.code.toByte() && bytes[3] == 'G'.code.toByte())) {
+            logToFile("实时截图：stdout 不是 PNG（su 存在但跑不了 screencap？）", "WARN", "SYNC", "SCREENSHOT")
+            return null
+        }
+        return bytes
+    }
+
+    /**
+     * PNG → 宽不超过 SHOT_MAX_WIDTH 的 JPEG。两段缩放是必需的：8K 全屏解成 ARGB 接近 64MB，
+     * 直接解会顶到堆上限；先让解码器按 2 的幂采样，再精确缩到目标宽。
+     * 采样比取"缩完仍 ≥ 目标宽"的最大 2 的幂，所以最后一跳只会缩小、不会放大糊图。
+     */
+    private fun encodeShotJpeg(png: ByteArray): ByteArray? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(png, 0, png.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= SHOT_MAX_WIDTH) sample *= 2
+        val scaled = BitmapFactory.decodeByteArray(png, 0, png.size,
+            BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
+        return try {
+            val dst = if (scaled.width > SHOT_MAX_WIDTH) {
+                val h = (scaled.height.toLong() * SHOT_MAX_WIDTH / scaled.width).toInt().coerceAtLeast(1)
+                Bitmap.createScaledBitmap(scaled, SHOT_MAX_WIDTH, h, true)
+            } else scaled
+            val out = java.io.ByteArrayOutputStream()
+            try {
+                if (dst.compress(Bitmap.CompressFormat.JPEG, SHOT_JPEG_QUALITY, out)) out.toByteArray() else null
+            } finally {
+                if (dst !== scaled) dst.recycle()
+            }
+        } finally {
+            scaled.recycle()
+        }
+    }
+
+    /**
+     * 把 JPEG 送回服务端给的 upload_url，令牌放在 x-shot-token 头里（不进 URL：日志会打 URL，
+     * 令牌进了日志就等于进了任何能看到日志的人手里）。
+     * @return HTTP 状态码；连不上或抛异常都是 -1
+     */
+    private fun postScreenshot(url: String, token: String, jpeg: ByteArray): Int {
+        var conn: java.net.HttpURLConnection? = null
+        return try {
+            conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 8000
+            conn.readTimeout = 10000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "image/jpeg")
+            conn.setRequestProperty("x-shot-token", token)
+            conn.outputStream.use { it.write(jpeg) }
+            val code = conn.responseCode
+            try { conn.inputStream.readBytes() } catch (e: Exception) { /* 非 2xx 时正文在 errorStream，状态码够用 */ }
+            code
+        } catch (e: Exception) {
+            -1
+        } finally {
+            try { conn?.disconnect() } catch (e: Exception) {}
+        }
+    }
+
+    /** 截图一整个回合：拍 → 压 → 传。只在 shotExecutor 上跑（同一时刻最多一张，见【A-16】）。 */
+    private fun captureAndUploadScreenshot(url: String, token: String) {
+        val png = captureScreenPng() ?: return
+        val jpeg = encodeShotJpeg(png)
+        if (jpeg == null) {
+            logToFile("实时截图：${png.size / 1024}KB PNG 解不动或转 JPEG 失败", "WARN", "SYNC", "SCREENSHOT")
+            return
+        }
+        val code = postScreenshot(url, token, jpeg)
+        logToFile("实时截图：${png.size / 1024}KB PNG → ${jpeg.size / 1024}KB JPEG，服务端回 $code",
+            if (code in 200..299) "INFO" else "WARN", "SYNC", "SCREENSHOT")
     }
 
     // ========== 多窗口系统实现 ==========
