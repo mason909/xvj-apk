@@ -2112,7 +2112,9 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (scenesToApply != null) {
                     try {
-                        applySceneConfigs(scenesToApply)
+                        // refreshIfStale 与 written 无关：服务端删素材/清映射时本轮一个字节都不下，
+                        // 但清单同样过期。没变的那几格 playlistStale 不响，换来的是"只换 0 路"。
+                        applySceneConfigs(scenesToApply, refreshIfStale = true)
                     } catch (e: Exception) {
                         Log.e(TAG, "applySceneConfigs 失败: ${e.message}")
                     }
@@ -3527,12 +3529,14 @@ class MainActivity : AppCompatActivity() {
      * @param scenes 完整 scenes JSON（A、B 两套都在里面，不是"当前那一幕"）
      * @param force  true = 一律整屏重建（墙板把共享组成员分到两格时，画布的构成必须重来，见 applyPanelSource）
      *               false（默认）= 与上次应用的是同一份配置就直接返回，不打断正在播的视频。
+     * @param refreshIfStale true = 指纹没变也跑一遍原地换清单（素材对账专用）。指纹只比配置，
+     *               新素材落盘/服务端删素材时它看不出来；不跑这一遍，新文件要等下次改配置才进清单。
      *
      * 兜底：两幕一个窗口都没有时，才建 DEFAULT_WINDOW_ID 那个整屏（尺寸=output 基准）SCENE_A 窗口
      *      （不指定 folderId，于是播 A 幕第一个有素材的文件夹）。
      * 必须在主线程调用（含 addView/removeView），所有调用点都已 post 到 mqttHandler。
      */
-    private fun applySceneConfigs(scenes: JSONObject?, force: Boolean = false) {
+    private fun applySceneConfigs(scenes: JSONObject?, force: Boolean = false, refreshIfStale: Boolean = false) {
         if (exited) {
             // 退出期间任何配置落地都不许动画面：退出中云端改了窗口、rev 对账补发 sync、
             // update_windows 因屏上无窗口回落到全量重建 —— 三条都会在桌面身后把解码器拉起来。
@@ -3551,6 +3555,10 @@ class MainActivity : AppCompatActivity() {
         // 记在末尾：中途抛异常时不算"已应用"，下一份相同载荷还会重试。
         val fp = scenesFingerprint(scenes)
         if (!force && fp == appliedScenesFp) {
+            // 指纹只比配置：素材对账新落了文件/服务端删了素材时它一个字都不变，得让原地换清单
+            // 跑一遍（playlistStale 才看得到磁盘）。原地做不到（试播中/屏上没账）就保持现状 ——
+            // 一次同步绝不因此整屏重建，那正是【#224】94MB/轮的漏。
+            if (refreshIfStale && applySceneChangesInPlace(scenes, fp)) return
             logToFile("scenes 与屏上一致（指纹 $fp），跳过全量重建", "INFO", "WINDOW", "SKIP")
             return
         }
