@@ -28,8 +28,9 @@
  *         startWallPanelLearn / publishFrameSnapshot；
  *         收帧解析与 termios 在 serial/WallPanelLink.kt，帧台账与学习表在 serial/WallPanelFrames.kt，
  *         帧族分帧在 serial/WallPanelParser.kt）
- * 【A-15】待机与恢复（setStandby / showStandbyOverlay / hideStandbyOverlay / registerTapGesture + dispatchTouchEvent；
- *         入口两条：云端 action:'standby' / 'resume'，本机鼠标左键连点 5 次）
+ * 【A-15】退出到桌面与唤回（setExited / findDesktop / bringSelfByRoot / rebuildAfterExit +
+ *         dispatchTouchEvent 左键连点 5 次；入口两条：云端 action:'exit_desktop' / 'reopen_desktop'，
+ *         本机连点只管"退出"，回来靠桌面图标 / HOME 键 / 云端唤回）
  * （A-05 已随"单播放器点播"旧链路一起删除，编号保留空位）
  * ─────────────────────────────────────────────────
  * 
@@ -113,6 +114,7 @@
 package com.xvj.app
 
 
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.os.Build
@@ -244,14 +246,18 @@ class MainActivity : AppCompatActivity() {
     /** 窗口容器 FrameLayout（根视图）*/
     private val flSurface: FrameLayout? get() = binding.root as? FrameLayout
     /**
-     * 待机位：true = 屏已黑、窗口已释放，但进程、MQTT 订阅和心跳都还活着（见【A-15】）。
-     * 只在内存里，故意不落 prefs：待机是营业途中的一次 blackout，不是配置状态 ——
-     * 重启该回到开机画面，而不是回到"上次下班时黑着"。
+     * 退出位：true = 窗口已释放、原厂桌面顶在身前，但进程、MQTT 订阅和心跳都还活着（见【A-15】）。
+     * 只在内存里，故意不落 prefs：退出是营业途中的一次收摊，不是配置状态 ——
+     * 重启该回到开机画面，而不是回到"上次下班时停在桌面上"。
      * 读写都在主线程（命令由 mqttHandler post、手势由 dispatchTouchEvent 进来，两者都是主线程）。
      */
-    private var standby = false
-    /** 待机时盖在最后一层的那块纯黑视图；非待机恒为 null */
-    private var standbyOverlay: View? = null
+    private var exited = false
+    /** 找不到别的桌面（或拉起失败）时的退化黑布；正常退到桌面时恒为 null */
+    private var blackout: View? = null
+    /** 界面是否在前台（onResume 起、onPause 落）：云端「唤回」据此决定自己顶回来还是等现场按键 */
+    private var activityForeground = false
+    /** 还在桌面身后时收到的唤回：先记账，回到前台那次 onResume 补建画面 */
+    private var rebuildOnResume = false
     /** 左键连点手势：当前链已计到第几下 */
     private var tapChainCount = 0
     /** 上一次合格左键抬起的时刻（elapsedRealtime），超过间隔就重新起链 */
@@ -1121,10 +1127,10 @@ class MainActivity : AppCompatActivity() {
      * 必须在主线程调用（换 playlist）；WallPanelLink 的事件已经 post 到主线程。
      */
     private fun applyPanelSource(source: PanelSource, hex: String) {
-        if (standby) {
-            // 待机中屏是黑的，画面不该被 485 叫醒 —— 否则"待机"按不动，客人面前黑不住。
-            // 不更新 panelSource：出待机时按配置原样重建，那几帧不补播。
-            logToFile("墙板触发 ${describeSource(source)} 未生效：设备处于待机", "WARN", "WALLPANEL", "STANDBY")
+        if (exited) {
+            // 人已离场、桌面在身前，画面不该被 485 叫醒 —— 否则"退出"按不动，客人面前挡不住。
+            // 不更新 panelSource：唤回时按配置原样重建，那几帧不补播。
+            logToFile("墙板触发 ${describeSource(source)} 未生效：设备已退出到桌面", "WARN", "WALLPANEL", "DESKTOP")
             return
         }
         val now = SystemClock.elapsedRealtime()
@@ -1648,8 +1654,8 @@ class MainActivity : AppCompatActivity() {
      * @param json 命令 JSON，必须含 action 字段
      * 实际支持的 action（与服务端发送方一一对应）：
      *   stop                停掉全部播放
-     *   standby             进待机：黑屏但进程/MQTT 全活着（与 stop 的差别见【A-15】）
-     *   resume              退待机：按 prefs 的 scenes_json 重排回原画面
+     *   exit_desktop        退出到桌面：释放画面并把原厂桌面顶到身前，进程/MQTT 全活着（与 stop 的差别见【A-15】）
+     *   reopen_desktop      唤回画面：root 把自己顶回前台，回到前台那次按 prefs 的 scenes_json 重建
      *   config              改 mqtt_server / loop（只影响单播放器 player，不影响窗口播放器）
      *   sync_room_materials 房间素材全量对账（服务端【S-07】/授权链路发出）
      *   update_windows      轻量窗口重排，不下素材（编辑器 live 实时预览）
@@ -1688,11 +1694,11 @@ class MainActivity : AppCompatActivity() {
                         releaseAllWindows()
                     }
                 }
-                "standby", "resume" -> {
-                    // 待机/恢复（云端【S-05e】+ 本机左键连点，见【A-15】）：和 stop 的区别是
-                    // 待机不打算让设备"停在停止态"，它是一次可逆的黑屏，所以恢复由同一条链自己完成，
-                    // 不需要云端重发配置。命令必须回显到 device_logs，否则现场只知道"黑了"不知道"谁让它黑的"。
-                    mqttHandler.post { setStandby(action == "standby", "云端命令") }
+                "exit_desktop", "reopen_desktop" -> {
+                    // 退出到桌面/唤回（云端 + 本机左键连点，见【A-15】）：和 stop 的区别是
+                    // 退出不是"停在停止态"，它是一次可逆的离场，回到画面由同一条链自己完成，
+                    // 不需要云端重发配置。命令必须回显到 device_logs，否则现场只知道"桌面出来了"不知道是谁叫的。
+                    mqttHandler.post { setExited(action == "exit_desktop", "云端命令") }
                 }
                 "config" -> {
                     // 更新配置
@@ -2480,6 +2486,23 @@ class MainActivity : AppCompatActivity() {
             installRetryHandler.removeCallbacksAndMessages(null)
             retryPendingInstall(0)
         }
+        activityForeground = true
+        // 回到前台就等于"画面该回来了"：
+        // 云端唤回排在身后的那次重建在这里兑现；退出态还挂着而界面自己回到了身前
+        // （现场按 HOME 键或点桌面图标），也当作同一次唤回处理 —— 不然按键的人只看到一行提示，
+        // 比不按键的还摸不着头脑。
+        if (exited) {
+            exited = false
+            hideBlackout()
+            logToFile("退出态由回到前台结束（HOME 键或桌面图标）", "INFO", "WINDOW", "DESKTOP")
+            rebuildOnResume = true
+            pendingReopenReason = "回到前台"
+        }
+        if (rebuildOnResume) {
+            rebuildOnResume = false
+            rebuildAfterExit(pendingReopenReason ?: "回到前台")
+            pendingReopenReason = null
+        }
     }
 
     /**
@@ -2488,6 +2511,7 @@ class MainActivity : AppCompatActivity() {
      */
     override fun onPause() {
         super.onPause()
+        activityForeground = false
         player?.pause()
     }
 
@@ -2527,6 +2551,9 @@ class MainActivity : AppCompatActivity() {
 
     /** 用户按 Home / 手势离开时，用启动 Intent 把自己重新拉回前台（kiosk 防退出） */
     override fun onUserLeaveHint() {
+        // 退出到桌面那一步本身就是"主动离开前台"（见【A-15】）：exited 在拉桌面之前就已置真，
+        // 这里若照常自卫，桌面刚出来就被我们自己顶回去，屏上只剩一行提示。
+        if (exited) return
         val intent = packageManager.getLaunchIntentForPackage(packageName)
         intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         startActivity(intent)
@@ -3259,11 +3286,11 @@ class MainActivity : AppCompatActivity() {
      * 必须在主线程调用（含 addView/removeView），所有调用点都已 post 到 mqttHandler。
      */
     private fun applySceneConfigs(scenes: JSONObject?, force: Boolean = false) {
-        if (standby) {
-            // 待机中任何配置落地都不许动画面：待机期间云端改了窗口、rev 对账补发 sync、
-            // update_windows 因屏上无窗口回落到全量重建 —— 三条都会把黑屏顶掉。
-            // 出待机只认 setStandby(false) 这一条路；配置本身已照常落 prefs，那份 scenes_json 到时长见【A-15】。
-            logToFile("待机中，场景配置落地已忽略（出待机后按最新配置重建）", "WARN", "WINDOW", "STANDBY")
+        if (exited) {
+            // 退出期间任何配置落地都不许动画面：退出中云端改了窗口、rev 对账补发 sync、
+            // update_windows 因屏上无窗口回落到全量重建 —— 三条都会在桌面身后把解码器拉起来。
+            // 出退出只认 setExited(false) 这一条路；配置本身已照常落 prefs，那份 scenes_json 到时见【A-15】。
+            logToFile("已退出到桌面，场景配置落地已忽略（唤回后按最新配置重建）", "WARN", "WINDOW", "DESKTOP")
             return
         }
         logToFile("开始应用场景配置", "INFO", "WINDOW", "CONFIG")
@@ -4238,11 +4265,11 @@ class MainActivity : AppCompatActivity() {
             logToFile("试播拒绝：filename 为空", "WARN", "PLAYBACK", "PREVIEW")
             return
         }
-        if (standby) {
-            // 待机时窗口全放了，previewTarget 本来也认不出目标，但那条日志会写成"这一格没有窗口在播"，
+        if (exited) {
+            // 退出时窗口全放了，previewTarget 本来也认不出目标，但那条日志会写成"这一格没有窗口在播"，
             // 现场据此去查配置就白跑一趟 —— 这里先把真话说出来。
-            logToFile("试播拒绝：设备处于待机", "WARN", "PLAYBACK", "STANDBY")
-            previewStatusText("试播已拒绝：设备处于待机")
+            logToFile("试播拒绝：设备已退出到桌面", "WARN", "PLAYBACK", "DESKTOP")
+            previewStatusText("试播已拒绝：设备已退出到桌面")
             return
         }
         // 素材同步在飞时不插队：那一轮正在按清单增删这个目录里的文件，而且它收尾必定 apply 一次场景配置，
@@ -4489,32 +4516,38 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "释放所有窗口资源")
     }
 
-    // 【A-15】 待机与恢复：黑屏，但进程、MQTT 订阅、心跳全部保持
-    // @tag: setStandby 待机 恢复 黑屏
+    // 【A-15】 退出到桌面与唤回：画面交还给原厂桌面，进程、MQTT 订阅、心跳全部保持
+    // @tag: setExited findDesktop launchDesktop bringSelfByRoot rebuildAfterExit 退出到桌面 唤回
     // @tag: dispatchTouchEvent registerLeftClick 左键连点 5 下
     //
-    // 为什么不是"真退出"：XVJ 现在是默认启动器（HOME），finishAffinity() 之后系统立刻把它再拉起来；
-    // 杀进程只剩 root/ADB 两条路，量产 user 版盒子上没有。所以现场要的"退出"落地成一个可逆的黑屏：
-    // 窗口播放器全释放 + 盖一层纯黑，配置、素材、prefs 一概不动，云端和心跳照常，随时唤得回来。
-    // 两个入口共用一套闸门：云端 action:'standby'/'resume'（管理台设备卡片的「待机」「恢复播放」），
-    // 以及本机鼠标左键连点 5 下（断网也能退，和现场用惯了的小麦手法对齐）。
-    // 待机期间所有会动画面的入口都在自己门口被挡掉：applySceneConfigs（含 update_windows 回落和墙板
-    // 回全量重建那条）、applyPanelSource、startGroupPreview —— 恢复只走 setStandby(false) 这一条路。
-    // 状态只在内存里：待机不是配置，重启回到开机画面，而不是回到"上次黑着"。
+    // 为什么不是 finishAffinity()：XVJ 现在是默认启动器（HOME），自己 finish 会被系统立刻拉回来，
+    // 看着还是"没退"。所以"退出"做成显式把原厂桌面顶到身前 —— 本任务栈退到后面，进程不死，
+    // 心跳与 MQTT 照常，云端随时叫得回来。
+    // 回来三条路，全汇到 onResume 那一次补建：云端「唤回画面」（靠 root 把自己顶回前台）、
+    // 现场按 HOME 键（HOME 仍指向 XVJ）、桌面点 XVJ 图标。
+    // 镜像里没有别的桌面、或桌面拉起失败 ⇒ 退化成一层纯黑：语义不变，只是看不到桌面。
+    // 两个入口共用一套闸门：退出期间 applySceneConfigs（含 update_windows 回落和墙板回全量重建）、
+    // applyPanelSource、startGroupPreview 各自门口挡一下 —— 唤回只走 setExited(false) 这一条路。
+    // 状态只在内存里：退出不是配置，重启回到开机画面，而不是回到"上次下班时停在桌面上"。
 
     /** 连点判定：相邻两下的最大间隔（ms）。定 500 是为了"快点五下"，慢点不算手势 */
     private val TAP_GESTURE_GAP_MS = 500L
 
-    /** 触发待机的左键次数 */
+    /** 触发退出的左键次数 */
     private val TAP_GESTURE_COUNT = 5
 
     /** 左键已按下、正等它的抬起沿：一下点击数一次 */
     private var primaryDownPending = false
 
+    /** 已在桌面身后排上的唤回是谁叫的：补建时把原因一起写进日志，现场才查得到源头 */
+    private var pendingReopenReason: String? = null
+
     /**
      * 鼠标左键点击计数（Activity 级 dispatch 能看到全部触点，包括鼠标转成的 touch 事件）。
      * 只认「按下时 buttonState 恰好等于 BUTTON_PRIMARY」这一对沿：手指和触摸笔的 buttonState 是 0，
-     * 右键或左右同按也不等于它，所以触摸屏上误点五下不会把营业中的大屏弄黑。
+     * 右键或左右同按也不等于它，所以触摸屏上误点五下不会把营业中的大屏弄下场。
+     * 方向性：真退到桌面后鼠标归桌面，本 Activity 收不到事件 ⇒ 连点只管"退出"这一个方向，
+     * 回来用 HOME 键、桌面图标或云端唤回（退化黑屏态例外，那时还在前台，连点可以再翻回来）。
      */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         when (ev.actionMasked) {
@@ -4535,69 +4568,127 @@ class MainActivity : AppCompatActivity() {
         tapChainAtMs = now
         if (tapChainCount < TAP_GESTURE_COUNT) return
         tapChainCount = 0
-        setStandby(!standby, "左键连点")
+        setExited(!exited, "左键连点")
     }
 
     /**
-     * 待机/恢复的唯一入口（在主线程调用，命令侧由 mqttHandler post 进来）。
-     * 出待机的次序不能换：先把 standby 置回 false，再撤黑、重建 ——
-     * 反了的话那次 applySceneConfigs 会被它自己的待机闸门挡掉，屏就黑着起不来了。
+     * 退出/唤回的唯一入口（在主线程调用，命令侧由 mqttHandler post 进来）。
+     * 唤回侧的次序不能换：先把 exited 置回 false，再顶前台、重建 ——
+     * 反了的话那次 applySceneConfigs 会被它自己的退出闸门挡掉，画面就回不来了。
      */
-    private fun setStandby(on: Boolean, reason: String) {
-        if (standby == on) {
-            logToFile("待机状态未变化（$reason 请求${if (on) "进" else "出"}待机）", "INFO", "WINDOW", "STANDBY")
+    private fun setExited(on: Boolean, reason: String) {
+        if (exited == on) {
+            logToFile("退出状态未变化（$reason 请求${if (on) "退出到桌面" else "唤回画面"}）", "INFO", "WINDOW", "DESKTOP")
             return
         }
-        standby = on
+        exited = on
         if (on) {
-            // 释放走的是 action:'stop' 那两下：停单播放器（欢迎视频）+ 放掉全部窗口
+            // 释放走的是 action:'stop' 那两下：停单播放器（欢迎视频）+ 放掉全部窗口。
+            // 不释放的话桌面在身前、解码器还在后台跑，桌面滑成幻灯片，白占一档 CPU。
             stopPlayback()
             releaseAllWindows()
-            showStandbyOverlay()
-            binding.statusText?.text = "待机中：连点 5 下左键或在管理台点「恢复播放」"
-            logToFile("进入待机（$reason）：画面已黑，进程与 MQTT 保持", "INFO", "WINDOW", "STANDBY")
+            val desk = findDesktop()
+            val err = if (desk == null) null else launchDesktop(desk)
+            if (desk == null || err != null) {
+                showBlackout()
+                logToFile("退出到桌面（$reason）：${if (desk == null) "本机没有别的桌面" else "桌面 $desk 拉起失败（$err）"}，退化为黑屏",
+                    "WARN", "WINDOW", "DESKTOP")
+            } else {
+                logToFile("退出到桌面（$reason）：画面已交还给 $desk，进程与 MQTT 保持", "INFO", "WINDOW", "DESKTOP")
+            }
+            binding.statusText?.text = "已退出到桌面：管理台点「唤回画面」或按 HOME 键回来"
             return
         }
-        hideStandbyOverlay()
-        // 和 restoreCachedScenes 用同一道授权闸门：待机期间被废止过就不该把缓存画面放回去
+        hideBlackout()
+        if (activityForeground) {
+            // 退化黑屏态：一直都在前台，直接重建
+            rebuildAfterExit(reason)
+            return
+        }
+        rebuildOnResume = true
+        pendingReopenReason = reason
+        if (!bringSelfByRoot()) {
+            logToFile("唤回（$reason）：没顶回前台，等现场按 HOME 键或点桌面图标", "WARN", "WINDOW", "DESKTOP")
+        }
+    }
+
+    /**
+     * 找"不是我们自己的桌面"：XVJ 现在是默认 HOME，发一条 CATEGORY_HOME 隐式 Intent 只会把自己再叫一次，
+     * 所以查全部 HOME 候选、剔掉本包和系统兜底的 FallbackHome，剩下谁就显式拉谁。
+     * 一个都不剩（量产镜像没装 launcher）返回 null ⇒ 退化成黑屏。
+     */
+    private fun findDesktop(): ComponentName? {
+        val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        return packageManager.queryIntentActivities(home, 0).firstOrNull {
+            it.activityInfo.packageName != packageName &&
+                it.activityInfo.name != "com.android.settings.FallbackHome"
+        }?.let { ComponentName(it.activityInfo.packageName, it.activityInfo.name) }
+    }
+
+    /** 显式拉起桌面：NEW_TASK 让系统按正常桌面建/复用它的任务栈。成功返回 null，失败返回异常摘要 */
+    private fun launchDesktop(desk: ComponentName): String? = try {
+        startActivity(Intent().setComponent(desk).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        null
+    } catch (e: Exception) {
+        Log.e(TAG, "拉起桌面失败: ${e.message}")
+        e.message ?: e.javaClass.simpleName
+    }
+
+    /**
+     * root 把自己顶回前台：后台起 Activity 从 Android 10 起默认被拦，量产镜像带 su 才走得通。
+     * 探不到 root 就返回 false 交给现场按键，不弹框、不重试。
+     * 复用 silentInstallReady 的探测结果（同一条 su 通道，探两次浪费；它那句 OTA 措辞只在首次探测时出现）。
+     */
+    private fun bringSelfByRoot(): Boolean {
+        if (!silentInstallReady()) return false
+        val r = execAsRoot("am start -n $packageName/.MainActivity", 8000)
+        val ok = r.first == 0
+        logToFile("唤回：am start ${if (ok) "已发出" else "失败(code=${r.first}) ${r.second}"}",
+            if (ok) "INFO" else "WARN", "WINDOW", "DESKTOP")
+        return ok
+    }
+
+    /** 退出结束后按本机缓存把画面放回去：授权闸门与 restoreCachedScenes 同一口径 */
+    private fun rebuildAfterExit(reason: String) {
+        // 退出期间被废止过就不该把缓存画面放回去
         if (!prefs.getBoolean("last_authorized", false)) {
-            logToFile("退出待机（$reason）：本机已非授权态，改播欢迎视频", "WARN", "WINDOW", "STANDBY")
+            logToFile("唤回（$reason）：本机已非授权态，改播欢迎视频", "WARN", "WINDOW", "DESKTOP")
             playWelcomeVideo()
             return
         }
         val cached = prefs.getString("scenes_json", null)
         if (cached == null) {
-            // 从没应用过配置（刚装机还没绑房就待机）：不猜画面。
-            // 待机闸门此刻已经放开，下一次 rev 对账或授权回执补发的配置会正常落地。
-            logToFile("退出待机（$reason）：本机没有 scenes 缓存，等云端下发配置", "WARN", "WINDOW", "STANDBY")
+            // 从没应用过配置（刚装机还没绑房就退出）：不猜画面。
+            // 退出闸门此刻已经放开，下一次 rev 对账或授权回执补发的配置会正常落地。
+            logToFile("唤回（$reason）：本机没有 scenes 缓存，等云端下发配置", "WARN", "WINDOW", "DESKTOP")
             return
         }
         try {
             applySceneConfigs(org.json.JSONObject(cached))
-            logToFile("退出待机（$reason）：按缓存配置重建画面", "INFO", "WINDOW", "STANDBY")
+            logToFile("唤回（$reason）：按缓存配置重建画面", "INFO", "WINDOW", "DESKTOP")
         } catch (e: Exception) {
-            Log.e(TAG, "退出待机重建失败: ${e.message}")
-            logToFile("退出待机失败：scenes 缓存解析异常 ${e.message}", "ERROR", "WINDOW", "ERROR")
+            Log.e(TAG, "唤回重建失败: ${e.message}")
+            logToFile("唤回失败：scenes 缓存解析异常 ${e.message}", "ERROR", "WINDOW", "ERROR")
         }
     }
 
     /** 黑布盖到根容器最后一层（覆盖顺序只能靠 bringToFront，窗口容器都是 addView 进来的） */
-    private fun showStandbyOverlay() {
+    private fun showBlackout() {
         val root = flSurface ?: return
-        if (standbyOverlay == null) {
+        if (blackout == null) {
             val v = View(this)
             v.setBackgroundColor(Color.BLACK)
             root.addView(v, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-            standbyOverlay = v
+            blackout = v
         }
-        standbyOverlay?.bringToFront()
-        // 待机文字属于运维层：debug 开着时要压在黑布上面，关着时整层不见
+        blackout?.bringToFront()
+        // 提示文字属于运维层：debug 开着时要压在黑布上面，关着时整层不见
         applyDebugUi()
     }
 
-    private fun hideStandbyOverlay() {
-        standbyOverlay?.let { flSurface?.removeView(it) }
-        standbyOverlay = null
+    private fun hideBlackout() {
+        blackout?.let { flSurface?.removeView(it) }
+        blackout = null
         applyDebugUi()
     }
 }
