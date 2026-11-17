@@ -4403,10 +4403,27 @@ class MainActivity : AppCompatActivity() {
         // "打开下一只 + 解码器重配置 + 攒够 600ms 续播门槛"，跟网络无关。以前这段没有任何数，
         // 只有首次首帧有 —— 所以"切视频慢"到底是慢在攒缓冲还是慢在重开解码器，改之前先分清。
         var bufferingSince = 0L
+        // 解码级错误的自愈账：实测一条 AAC 音轨解不开（ERROR_CODE_DECODING_FAILED）会让这一路停在原地、
+        // 屏上定格到下次下发配置为止。本地清单里换下一只只要几百毫秒，不该整格陪着冻住。
+        // 连错 3 次就收手：坏的多半不是"某一只"而是整格素材或解码器本身，再跳只是刷日志空转。
+        var errorStreak = 0
         player.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 // 播放器级错误（文件损坏/编码不支持/源丢失）此前只进 logcat，后台完全黑盒
                 logToFile("窗口 $winId 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "PLAYBACK", "ERROR")
+                mqttHandler.post {
+                    // 全量重建会换掉这路播放器，迟到的监听别再碰旧实例
+                    if (windowPlayers[winId] !== player) return@post
+                    if (errorStreak >= 3) {
+                        logToFile("窗口 $winId 连续 $errorStreak 次播放器错误，停止自动跳片", "ERROR", "PLAYBACK", "ERROR")
+                        return@post
+                    }
+                    errorStreak++
+                    // REPEAT_MODE_ALL 下清单非空时 hasNext 恒为真，单只也回到自己重试，同样受连错上限约束
+                    if (player.hasNextMediaItem()) player.seekToNextMediaItem()
+                    player.prepare()
+                    logToFile("窗口 $winId 播放器错误，跳到下一只重试（第 $errorStreak 次）", "WARN", "PLAYBACK", "RECOVER")
+                }
             }
             override fun onEvents(p: Player, events: Player.Events) {
                 val now = android.os.SystemClock.elapsedRealtime()
@@ -4415,6 +4432,7 @@ class MainActivity : AppCompatActivity() {
                     Player.STATE_READY -> {
                         val since = bufferingSince
                         bufferingSince = 0L
+                        errorStreak = 0
                         if (readyLogged) {
                             // 首帧之后才有"换片"可言；不到 100ms 的凝滞人眼看不出来，别刷日志
                             if (since > 0 && now - since >= 100) {
