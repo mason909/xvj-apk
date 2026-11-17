@@ -114,6 +114,7 @@
 package com.xvj.app
 
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -144,7 +145,9 @@ import android.graphics.Color
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.graphics.SurfaceTexture
 import android.net.Uri
+import android.view.Surface
 import android.view.TextureView
 import org.json.JSONArray
 import com.xvj.app.databinding.ActivityMainBinding
@@ -223,6 +226,12 @@ class MainActivity : AppCompatActivity() {
     private val windowViews = mutableMapOf<String, View>()
     /** windowId -> 内容签名（type|folderId|color|inputIndex|follow），实时更新时判定结构变化用 */
     private val windowContentSigs = mutableMapOf<String, String>()
+    /** HDMI 窗口的占位文字（无信号/待授权提示），出流且有信号时隐藏；winId -> label */
+    private val hdmiLabels = mutableMapOf<String, TextView>()
+    /** HDMI IN 采集管线；第一次有 HDMI 窗口才建（没有 HDMI 的现场不占相机线程） */
+    private var hdmiCapture: HdmiCapture? = null
+    /** 相机权限只主动要一次：HOME 应用的系统弹窗会盖住整屏，能 root 静默授权就不弹 */
+    private var hdmiPermAsked = false
     /**
      * folderKey（格子）-> 进行中的大屏试播（见 armPreview）。
      * 键是格子不是窗口：#175 之后一格只有一路解码，试播天然是"这一格"的事件，
@@ -380,6 +389,8 @@ class MainActivity : AppCompatActivity() {
         private const val SHOT_MAX_WIDTH = 1280
         private const val SHOT_JPEG_QUALITY = 55
         private const val SHOT_TIMEOUT_MS = 15000L
+        /** HDMI IN 采集要相机权限：申请回调的请求码（见 ensureHdmiPermission / onRequestPermissionsResult） */
+        private const val REQ_HDMI_CAMERA = 0x4A31
         // 订阅用的通配符主题在 connectMQTT() 里按 deviceId 拼具体路径，不再用常量
         private const val AUTH_TOPIC = "xvj/auth/response"
         // 素材缓存的 SharedPreferences key 前缀。三个前缀后面的键一律是
@@ -2678,6 +2689,9 @@ class MainActivity : AppCompatActivity() {
         learnUntilMs = 0L
         wallPanelLink?.stop()
         wallPanelLink = null
+        // HDMI 采集管线随 Activity 收摊：相机会话不跨生命周期，下次重建时由窗口的 TextureView 重新挂接
+        hdmiCapture?.shutdown()
+        hdmiCapture = null
         // mqttHandler 上挂着窗口启播、rev 记账、重连倒计时、进度条刷新，全部按"界面还在"写的，
         // 必须在 releaseAllWindows 之前清空，否则播放器 release 后仍有 post 排队进来
         mqttHandler.removeCallbacksAndMessages(null)
@@ -3818,7 +3832,9 @@ class MainActivity : AppCompatActivity() {
      */
     private fun resolveWindowFolder(scenes: JSONObject, content: JSONObject, winId: String): String? {
         val type = content.optString("type", "").uppercase()
-        if (type == "HDMI" || type == "VIDEO_INPUT") return "01"   // HDMI 输入默认文件夹01
+        // HDMI 窗没有素材可播：画面来自 createHdmiView 的相机流。返回非 null 会让调用方
+        // 拿着一个不存在的播放器去启动，每次重建白打一条"找不到播放器"的 ERROR
+        if (type == "HDMI" || type == "VIDEO_INPUT") return null
         if (type != "SCENE_A" && type != "SCENE_B") return null
 
         // 场景 folder_mappings 的 key 已带场景前缀（A01/B01，见 buildPrefixedScenes）
@@ -4055,7 +4071,7 @@ class MainActivity : AppCompatActivity() {
 
         val view: View = when (type) {
             "COLOR" -> createColorView(w, content)
-            "HDMI"  -> createHdmiView(w, content)
+            "HDMI"  -> createHdmiView(winId, w, content)
             else    -> createVideoWindowView(winId, w, content)  // VIDEO / 默认
         }
 
@@ -4396,15 +4412,111 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** HDMI 输入占位窗口 */
-    private fun createHdmiView(w: JSONObject, content: JSONObject): View {
+    /**
+     * HDMI 输入窗口：一块 TextureView 直接吃 [HdmiCapture] 的相机流（取景/旋转/镜像与视频窗同一套矩阵），
+     * 外加一层占位文字 —— 没权限、没信号、正在接入时屏上看得见原因，而不是一片黑。
+     * 台架 CX3588 的 HDMI IN 在固件里被相机 HAL 报成外接相机，这一路就是走它，不需要厂商私有库。
+     */
+    private fun createHdmiView(winId: String, w: JSONObject, content: JSONObject): View {
         val inputIdx = content.optInt("inputIndex", 0)
-        return TextView(this).apply {
-            setBackgroundColor(Color.BLACK)
+        val container = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val textureView = TextureView(this)
+        container.addView(textureView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        val label = TextView(this).apply {
             text = "HDMI ${inputIdx + 1}"
             setTextColor(Color.WHITE)
+            textSize = 36f
             gravity = Gravity.CENTER
         }
+        container.addView(label, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+        hdmiLabels[winId] = label
+
+        // 这块窗自己的 Surface 引用：destroy 时带着它去 detach，采集侧据此分辨"这是不是当前挂的那块"
+        var attached: Surface? = null
+        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                // 采集流尺寸以 SurfaceTexture 默认缓冲为准（必须落在相机 HAL 支持的档位里）
+                st.setDefaultBufferSize(HdmiCapture.W, HdmiCapture.H)
+                val surf = Surface(st)
+                attached = surf
+                hdmi().attach(winId, surf)
+                ensureHdmiPermission()
+                refreshHdmiLabels()
+            }
+
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
+
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                attached?.let { hdmiCapture?.detach(winId, it) }
+                attached = null
+                if (hdmiLabels[winId] === label) hdmiLabels.remove(winId)
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
+        return container
+    }
+
+    private fun hdmi(): HdmiCapture = hdmiCapture ?: HdmiCapture(this) { msg, level ->
+        logToFile(msg, level, "WINDOW", "HDMI")
+    }.also { cap ->
+        cap.onStreamState = { refreshHdmiLabels() }
+        cap.onNeedPermission = { runOnUiThread { ensureHdmiPermission() } }
+        hdmiCapture = cap
+    }
+
+    /**
+     * 相机权限：门店镜像有 root，先 `su -c pm grant` 静默授权（HOME 应用的系统弹窗会盖住整屏，
+     * 无人值守现场也没人点）；没有 root 才退到系统弹窗。被拒就保持黑屏+提示文字，不再反复弹。
+     */
+    private fun ensureHdmiPermission() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            hdmi().retryNow()
+            return
+        }
+        if (hdmiPermAsked) return
+        hdmiPermAsked = true
+        Thread {
+            val grantedByRoot = execAsRoot("pm grant $packageName android.permission.CAMERA", 4000).first == 0 &&
+                checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+            runOnUiThread {
+                if (grantedByRoot) {
+                    logToFile("HDMI 输入：已借 root 静默授予相机权限", "INFO", "WINDOW", "HDMI")
+                    hdmi().retryNow()
+                } else {
+                    requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_HDMI_CAMERA)
+                }
+            }
+        }.start()
+    }
+
+    /** 占位文字随「权限 / 信号 / 出流」三态刷新；出流且有信号时整块藏掉，免得压在画面上 */
+    private fun refreshHdmiLabels() {
+        if (hdmiLabels.isEmpty()) return
+        val granted = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val cap = hdmiCapture
+        val streaming = cap?.streaming == true
+        val signal = cap?.signalPresent() ?: false
+        for (label in hdmiLabels.values) {
+            label.visibility = if (streaming && signal) View.GONE else View.VISIBLE
+            label.text = when {
+                !granted -> "HDMI 输入待授权（相机权限）"
+                !signal -> "HDMI 无信号（检查输入源与线）"
+                else -> "HDMI 接入中…"
+            }
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_HDMI_CAMERA) return
+        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        logToFile("HDMI 输入：相机权限" + if (granted) "已授予" else "被拒绝，HDMI 窗口保持黑屏（可在系统设置里补授）",
+            if (granted) "INFO" else "WARN", "WINDOW", "HDMI")
+        if (granted) hdmi().retryNow() else refreshHdmiLabels()
     }
 
     /**

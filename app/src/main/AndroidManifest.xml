@@ -13,6 +13,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- HDMI IN 采集：CX3588 的 HDMI IN（hdmirx）由 Rockchip 相机 HAL 暴露成 LENS_FACING_EXTERNAL 外接相机，
+         打开它需要 CAMERA。门店镜像有 root，应用用 su -c pm grant 静默授予；没有 root 才弹系统框。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
 
     <!-- 【A-15】退出到桌面要先找到"别的 HOME"。Android 11+ 的包可见性会把没声明的查询过滤成
          只剩自己：targetSdk 34 又没 QUERY_ALL_PACKAGES 时，queryIntentActivities(MAIN/HOME)
