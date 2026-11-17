@@ -1218,6 +1218,10 @@ class MainActivity : AppCompatActivity() {
         }
         // 一格一路解码（#175），同一组的成员窗口只让基准窗推一次，其余窗跟着同一张画布
         val advanced = HashSet<String>()
+        // 判"下一支"必须看按键前就在不在那格：切格会同步刷新整组成员的落点账，
+        // 边切边判的话，排在后面的成员会把刚到的新格误当成重复按，白白多推一支
+        // （起播瞬间 seek，现场看到就是一次凝滞/闪黑）。
+        val beforeFolders = follows.associate { (id, _) -> id to videoSurfaces[id]?.folderKey }
         for ((winId, _) in follows) {
             endPreviewCovering(winId, if (repeat) "墙板重复触发" else "墙板切换")
             val folderId = resolved[winId]
@@ -1226,10 +1230,10 @@ class MainActivity : AppCompatActivity() {
                 logToFile("窗口 [$winId] ${describeSource(source)} 无可播文件夹，保持原画面", "WARN", "WALLPANEL", "SKIP")
                 continue
             }
-            // 判"下一支"只看落点是不是当前在播的那一格，不看这一帧和上一帧是否同一个码：
+            // 判"下一支"只看落点是不是按键前就在播的那一格，不看这一帧和上一帧是否同一个码：
             // 点歌机码与墙板码可能指向同一格，交替按也不该把画面拽回第一支。
             val leader = winShareGroup[winId]?.leaderId ?: winId
-            if (videoSurfaces[winId]?.folderKey == folderId) {
+            if (beforeFolders[winId] == folderId) {
                 if (advanced.add(leader)) advancePanelFolder(leader, folderId)
             } else {
                 playFolderInWindow(winId, folderId)
