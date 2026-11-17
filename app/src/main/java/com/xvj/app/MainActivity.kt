@@ -136,6 +136,7 @@ import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.TextView
 import android.view.Gravity
 import android.graphics.Color
@@ -403,6 +404,10 @@ class MainActivity : AppCompatActivity() {
         /** 服务端 outputPx 的域：16~7680，越界或非整数服务端已 400，本机再挡一道写脏 prefs 的路 */
         private const val DESIGN_PX_MIN = 16
         private const val DESIGN_PX_MAX = 7680
+        // 测试背景图卡：原始 8000×4500，入包前压成 3840×2160 JPEG（全尺寸解码要 144MB）。
+        // 设备端再按 1/2 采样解，1920 宽 ≈ 8MB —— 台架 4GB 闲置内存只有几百 MB，这张图是共享位图不能省这一步。
+        private const val TEST_CARD_ASSET = "testcard.jpg"
+        private const val TEST_CARD_SAMPLE = 2
     }
 
     // 【A-11】 工具方法
@@ -4290,15 +4295,42 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(x, y, wd, ht)
     }
 
-    /** 纯色背景窗口 */
+    /** 测试背景窗口：固定图卡铺满（居中裁切），图卡读不到才退回 content.color 纯色 */
     private fun createColorView(w: JSONObject, content: JSONObject): View {
-        val color = content.optString("color", "#000000")
-        val name = w.optString("name", "")
+        testCardBitmap()?.let { bmp ->
+            return ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setBackgroundColor(Color.BLACK)
+                setImageBitmap(bmp)
+            }
+        }
         return TextView(this).apply {
-            setBackgroundColor(Color.parseColor(color))
-            text = name
+            setBackgroundColor(runCatching { Color.parseColor(content.optString("color", "#000000")) }.getOrDefault(Color.BLACK))
+            text = w.optString("name", "")
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
+        }
+    }
+
+    /** 测试背景图卡只解一次：所有测试背景窗口共享同一张位图（渲染时不再拷贝） */
+    private var testCardBmp: Bitmap? = null
+    private var testCardTried = false
+
+    private fun testCardBitmap(): Bitmap? {
+        testCardBmp?.let { return it }
+        if (testCardTried) return null   // 读失败过就不再每建一扇窗重试一遍
+        testCardTried = true
+        return try {
+            val opts = BitmapFactory.Options().apply { inSampleSize = TEST_CARD_SAMPLE }
+            assets.open(TEST_CARD_ASSET).use { BitmapFactory.decodeStream(it, null, opts) }
+                ?.also { testCardBmp = it }
+                ?: run {
+                    logToFile("测试背景：图卡解码失败，退回纯色", "WARN", "SYNC", "WINDOW")
+                    null
+                }
+        } catch (e: Exception) {
+            logToFile("测试背景：图卡读取失败 ${e.message}，退回纯色", "WARN", "SYNC", "WINDOW")
+            null
         }
     }
 
