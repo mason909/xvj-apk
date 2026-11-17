@@ -279,6 +279,10 @@ class MainActivity : AppCompatActivity() {
     private var tapChainCount = 0
     /** 上一次合格左键抬起的时刻（elapsedRealtime），超过间隔就重新起链 */
     private var tapChainAtMs = 0L
+    /** 冷启动低内存闸门：第一次发现内存不足的时刻（elapsedRealtime），0 = 闸门没在等 */
+    private var coldStartGateSince = 0L
+    /** 冷启动闸门挂着的重试；新配置到来时换掉旧的，保证落地的是最新一份 */
+    private var coldStartRetry: Runnable? = null
     // ==============================
     private var mqttClient: MqttClient? = null
     private val mqttHandler = Handler(Looper.getMainLooper())
@@ -3653,6 +3657,32 @@ class MainActivity : AppCompatActivity() {
         // "推了新素材"根本不需要动播放器，把 6 路解码器全部重来一遍才是漏的源头。
         if (!force && applySceneChangesInPlace(scenes, fp)) return
 
+        // 冷启动低内存闸门（#228）：进程刚起来就要一次性建齐所有窗口 surface + 解码器输出池，
+        // lmkd 正好在这个窗口开杀；杀了就重启、重启又倒在同一处，codec2 里没归还的 dma-buf
+        // 一轮叠一轮（现场 8 轮连杀后 2.25GB）。可用内存低于 [COLD_START_MIN_MB] 时先挪 3s，
+        // 最多等 [COLD_START_HOLD_MS]；等不到也得硬上，配置不能永远落不了地。
+        // 只拦冷启动（屏上无窗口），正常运行的配置变更不受影响。
+        if (appliedWindowOrder.isEmpty() && windowPlayers.isEmpty()) {
+            val avail = availableMemMb()
+            if (avail in 1 until COLD_START_MIN_MB) {
+                val now = SystemClock.elapsedRealtime()
+                if (coldStartGateSince == 0L) coldStartGateSince = now
+                if (now - coldStartGateSince < COLD_START_HOLD_MS) {
+                    // 等待期间可能又来一份更新的配置：换掉待跑的那份，落地永远用最新参数
+                    coldStartRetry?.let { mqttHandler.removeCallbacks(it) }
+                    val r = Runnable {
+                        coldStartRetry = null
+                        applySceneConfigs(scenes, force, refreshIfStale)
+                    }
+                    coldStartRetry = r
+                    logToFile("冷启动可用内存仅 ${avail}MB，延后 3s 建窗口（已等 ${(now - coldStartGateSince) / 1000}s，" +
+                        "上限 ${COLD_START_HOLD_MS / 1000}s）", "WARN", "WINDOW", "CONFIG")
+                    mqttHandler.postDelayed(r, COLD_START_RETRY_MS)
+                    return
+                }
+            }
+        }
+
         // 走到这里才是真整屏重建（原地闸门没接住）。这一行是台架复测数"重建次数"的唯一锚点，
         // 别在别处复用：播放设置翻转等在原地路径里完成，不应计入重建。
         logToFile("回退全量重建：释放 ${windowPlayers.size} 路播放器，按新配置重排", "INFO", "WINDOW", "REBUILD")
@@ -3722,13 +3752,32 @@ class MainActivity : AppCompatActivity() {
                 createWindowView(p.winId, p.win)
             }
             // 每个窗口根据自身 content.type 播放对应文件夹（共享组的跟随窗在 playFolderInWindow 里自己让路）
-            for (p in plan) p.folderId?.let { playFolderInWindow(p.winId, it, scenes) }
+            // 低内存分批起播（#228）：几路解码器的冷缓存尖峰不要挤在同一帧上；具体间隔见 startPacingMs()。
+            val pacingMs = startPacingMs()
+            if (pacingMs > 0) logToFile("低内存分批起播：每扇间隔 ${pacingMs}ms", "WARN", "PLAYBACK", "START")
+            var paced = 0
+            for (p in plan) {
+                val fk = p.folderId ?: continue
+                if (pacingMs > 0 && paced > 0) {
+                    val delay = minOf(paced * pacingMs, 3 * pacingMs)
+                    // 排上之后这段时间里可能退出到桌面或又被重建：别把解码器再点着一次
+                    mqttHandler.postDelayed({
+                        if (!exited && windowPlayers.containsKey(p.winId)) playFolderInWindow(p.winId, fk, scenes)
+                    }, delay.toLong())
+                } else {
+                    playFolderInWindow(p.winId, fk, scenes)
+                }
+                paced++
+            }
         }
         appliedScenes = scenes
         appliedScenesFp = fp
         appliedPlaySettingsJson = playSettingsJson(scenes)
         // 次序账与指纹同步落地（默认窗口那条兜底分支也要走到，否则实时更新会一直误判成结构变化）
         appliedWindowOrder = enabledWindowsSorted(scenes).map { it.first }
+        // 闸门收账：这次确实建起来了，下一次冷启动重新给满等待额度
+        coldStartGateSince = 0L
+        coldStartRetry = null
     }
 
     /**
@@ -4566,13 +4615,48 @@ class MainActivity : AppCompatActivity() {
      * 起播要等字节灌满，而停灌可能先按时长满足 —— 两个阈值不一致时永远等不齐，画面直接死住。
      * 时长口径下 2500ms 就是硬闸（20Mbps 素材约 6MB/路，6 路 36MB），起播只等 600ms。
      */
-    private fun localBufferLoadControl(): DefaultLoadControl = DefaultLoadControl.Builder()
-        // 1000/2500：攒够 1 秒才算"不缺粮"，最多攒到 2.5 秒（默认是 50 秒，内存根本装不下）
-        // 200/250：开播与换片后续播的等待门槛（默认 2500/5000 —— 现场那半秒多的凝滞就是它）。
-        // 墙板切格实测（#329，2026-11-17）：4K 换格时 READY 的缓冲恰好 24% = 600ms，卡的就是旧门槛；
-        // 本地文件不怕缺粮，降到 250ms 换开画速度，若 4K 起播抖再回调。
-        .setBufferDurationsMs(1000, 2500, 200, 250)
-        .build()
+    private fun localBufferLoadControl(): DefaultLoadControl {
+        val avail = availableMemMb()
+        // 内存紧时收紧缓冲（#228）：4K 素材一帧 NV12 就是 24MB，按 2.5s 攒满在 100Mbps 码率下
+        // 单路就吃掉 30MB+；解码器输出池一开池水位就直接见底，lmkd 随即开杀。
+        // 本地文件读盘没有网络抖动，短缓冲最多换来偶尔一次续播，远比被杀掉重启划算。
+        val (minMs, maxMs) = when {
+            avail in 1 until 400 -> 600 to 1200
+            avail in 400 until 700 -> 800 to 1800
+            else -> 1000 to 2500
+        }
+        if (avail in 1 until 700) {
+            logToFile("播放缓冲按内存收紧：可用 ${avail}MB → ${minMs}/${maxMs}ms（默认 1000/2500）",
+                "WARN", "PLAYBACK", "BUFFER")
+        }
+        return DefaultLoadControl.Builder()
+            // 1000/2500：攒够 1 秒才算"不缺粮"，最多攒到 2.5 秒（默认是 50 秒，内存根本装不下）
+            // 200/250：开播与换片后续播的等待门槛（默认 2500/5000 —— 现场那半秒多的凝滞就是它）。
+            // 墙板切格实测（#329，2026-11-17）：4K 换格时 READY 的缓冲恰好 24% = 600ms，卡的就是旧门槛；
+            // 本地文件不怕缺粮，降到 250ms 换开画速度，若 4K 起播抖再回调。
+            .setBufferDurationsMs(minMs, maxMs, 200, 250)
+            .build()
+    }
+
+    /** 整机可用内存（MB）：取不到返回 0（按"不知道自己穷"处理，走默认口径） */
+    private fun availableMemMb(): Int = try {
+        val am = getSystemService(android.app.ActivityManager::class.java)
+        val mi = android.app.ActivityManager.MemoryInfo()
+        am?.getMemoryInfo(mi)
+        (mi.availMem shr 20).toInt()
+    } catch (e: Exception) {
+        0
+    }
+
+    /**
+     * 低内存分批起播的间隔（毫秒），0 = 不分批（正常水位）。
+     * 见 applySceneConfigs 里的调用：几路解码器同时起，冷缓存尖峰挤在一帧上最容易触发 lmkd。
+     */
+    private fun startPacingMs(): Int = when (availableMemMb()) {
+        in 1 until 400 -> 600
+        in 400 until 700 -> 300
+        else -> 0
+    }
 
     /** 视频播放窗口（每个窗口独立 ExoPlayer，TextureView 承载以支持旋转/镜像矩阵变换）*/
     private fun createVideoWindowView(winId: String, w: JSONObject, content: JSONObject): View {
@@ -5164,6 +5248,15 @@ class MainActivity : AppCompatActivity() {
 
     /** 连点判定：相邻两下的最大间隔（ms）。定 500 是为了"快点五下"，慢点不算手势 */
     private val TAP_GESTURE_GAP_MS = 500L
+
+    /** 冷启动闸门：整机可用内存低于它就把建窗口往后挪（MB）。3.6GB 的板子，起播尖峰前留 400MB */
+    private val COLD_START_MIN_MB = 400
+
+    /** 冷启动闸门最多等这么久；等不到也得硬上，配置不能永远落不了地 */
+    private val COLD_START_HOLD_MS = 12_000L
+
+    /** 冷启动闸门的重试间隔 */
+    private val COLD_START_RETRY_MS = 3_000L
 
     /** 触发退出的左键次数 */
     private val TAP_GESTURE_COUNT = 5
