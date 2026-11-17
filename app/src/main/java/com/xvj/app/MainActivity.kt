@@ -4329,8 +4329,10 @@ class MainActivity : AppCompatActivity() {
      */
     private fun localBufferLoadControl(): DefaultLoadControl = DefaultLoadControl.Builder()
         // 1000/2500：攒够 1 秒才算"不缺粮"，最多攒到 2.5 秒（默认是 50 秒，内存根本装不下）
-        // 300/600：开播与换片后续播的等待门槛（默认 2500/5000 —— 现场那半秒多的凝滞就是它）
-        .setBufferDurationsMs(1000, 2500, 300, 600)
+        // 200/250：开播与换片后续播的等待门槛（默认 2500/5000 —— 现场那半秒多的凝滞就是它）。
+        // 墙板切格实测（#329，2026-11-17）：4K 换格时 READY 的缓冲恰好 24% = 600ms，卡的就是旧门槛；
+        // 本地文件不怕缺粮，降到 250ms 换开画速度，若 4K 起播抖再回调。
+        .setBufferDurationsMs(1000, 2500, 200, 250)
         .build()
 
     /** 视频播放窗口（每个窗口独立 ExoPlayer，TextureView 承载以支持旋转/镜像矩阵变换）*/
