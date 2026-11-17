@@ -4323,7 +4323,10 @@ class MainActivity : AppCompatActivity() {
         return try {
             val opts = BitmapFactory.Options().apply { inSampleSize = TEST_CARD_SAMPLE }
             assets.open(TEST_CARD_ASSET).use { BitmapFactory.decodeStream(it, null, opts) }
-                ?.also { testCardBmp = it }
+                ?.also {
+                    testCardBmp = it
+                    logToFile("测试背景：图卡 ${it.width}×${it.height} 就绪", "INFO", "WINDOW", "TESTCARD")
+                }
                 ?: run {
                     logToFile("测试背景：图卡解码失败，退回纯色", "WARN", "SYNC", "WINDOW")
                     null
