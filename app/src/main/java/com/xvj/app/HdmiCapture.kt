@@ -14,10 +14,11 @@ import android.view.Surface
 import java.io.File
 
 /**
- * HDMI IN 采集管线：RK3588 的 hdmirx 由 Rockchip 相机 HAL 暴露成 LENS_FACING_EXTERNAL 的外接相机。
+ * HDMI IN 采集管线：RK3588 的 hdmirx 由 Rockchip 相机 HAL 暴露成一台相机（台架报 ID 120）。
  *
  * 台架实测（2026-11-17）：HDMI IN 口收到 4K60 时 `/sys/class/hdmirx/hdmirx/status=connected`，
- * 相机 HAL 把同一个口报成外接相机，可出 640×360 / 1920×1080 / 3840×2160（PRIVATE，33ms 一帧）。
+ * 相机可出 640×360 / 1920×1080 / 3840×2160（PRIVATE，33ms 一帧）。注意这块 HAL 的
+ * lens.facing 报的是 BACK，只有 supportedHardwareLevel 是 EXTERNAL，识别见 findHdmiCameraId。
  * 我们取 1080p30：一片包厢屏够用；4K 采集只多占 dma-buf（台架吃过 dma-buf 泄漏被 lmkd 杀的亏）。
  *
  * 不走 v4l2 /dev/video20：裸 NV12 要 JNI + 自建 GL 上传；相机 HAL 已做好格式与节奏转换，
@@ -149,8 +150,9 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
             onNeedPermission?.invoke()
             return
         }
-        val id = findExternalId() ?: run {
-            log("HDMI 输入：系统里没有外接相机（本机没有 HDMI IN，或固件没把它给相机 HAL）", "WARN")
+        val id = findHdmiCameraId() ?: run {
+            log("HDMI 输入：系统里没有可用的采集相机（无 HDMI IN，或固件没把它接进相机 HAL），10 秒后重试", "WARN")
+            scheduleRetry()
             return
         }
         val gen = generation
@@ -282,15 +284,23 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         }, RETRY_MS)
     }
 
-    private fun findExternalId(): String? {
-        for (id in manager.cameraIdList) {
-            val facing = try {
-                manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)
-            } catch (e: Exception) {
-                null
-            }
-            if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL) return id
+    /**
+     * 找 HDMI IN 相机。camera2 契约是先看 lens.facing=EXTERNAL，但台架这块 Rockchip HAL
+     * 把它报成 BACK，只有 supportedHardwareLevel 是 EXTERNAL（2026-11-17 实测），所以分三级：
+     * 外接镜头 → 外接硬件等级 → 本机有 hdmirx 节点且只有一台相机时直接用它。
+     */
+    private fun findHdmiCameraId(): String? {
+        val ids = try { manager.cameraIdList.toList() } catch (e: Exception) { emptyList() }
+        var byLevel: String? = null
+        for (id in ids) {
+            val c = try { manager.getCameraCharacteristics(id) } catch (e: Exception) { null } ?: continue
+            if (c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_EXTERNAL) return id
+            if (c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ==
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL) byLevel = id
         }
+        if (byLevel != null) return byLevel
+        // 固件没按契约报 EXTERNAL 也要能用：hdmirx 节点在、只此一台相机，就是这口
+        if (ids.size == 1 && File("/sys/class/hdmirx/hdmirx/status").exists()) return ids[0]
         return null
     }
 
