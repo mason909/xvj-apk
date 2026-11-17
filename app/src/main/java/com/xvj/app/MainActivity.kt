@@ -117,6 +117,7 @@ package com.xvj.app
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -625,6 +626,28 @@ class MainActivity : AppCompatActivity() {
         markExitedFile(false)
         touchAlive()
         startKeepAliveService()
+        ensureDefaultHome()
+    }
+
+    /**
+     * 默认桌面自愈：XVJ 是本机的 HOME（[A-15] 的退出/唤回、OTA 自启都按这个前提写）。
+     * 2026-11-17 台架重启落在系统"选择主屏幕"上，查下来系统里根本没有默认桌面记录 ——
+     * 触屏机没有键鼠，这一下就是"开不了机"。这里每次进程启动确认一遍，不是自己就用 root 设回去；
+     * 量产的 root 盒子才改得动，没 root 就当装机流程负责，不弹框不重试。
+     */
+    private fun ensureDefaultHome() {
+        val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        val current = packageManager.resolveActivity(home, PackageManager.MATCH_DEFAULT_ONLY)
+        val currentPkg = current?.activityInfo?.packageName
+        if (currentPkg == packageName) return
+        // 只对 debuggable 盒子动手：零售机型的 su 会弹授权框，装在屏上正好挡住画面
+        if (Build.TYPE != "userdebug" && Build.TYPE != "eng") return
+        Thread {
+            if (!silentInstallReady()) return@Thread
+            val r = execAsRoot("cmd package set-home-activity $packageName/.MainActivity", 5000)
+            logToFile("默认桌面自愈：原为 ${currentPkg ?: "未设"}，${if (r.first == 0) "已设回 XVJ" else "设置失败 code=${r.first} ${r.second}"}",
+                if (r.first == 0) "INFO" else "WARN", "WINDOW", "HOME")
+        }.start()
     }
 
     /**
@@ -1194,6 +1217,21 @@ class MainActivity : AppCompatActivity() {
         }
         val scenes = appliedScenes
         if (scenes == null) {
+            // 停止（云端 action:'stop'）连"已应用配置"一起清掉。墙板按键是现场的开机键：
+            // 拿本地缓存整屏重建，并把这一帧当触发源一起落进去 —— 停止只是停播，不是改配置，
+            // 所以按任一学过的墙板键就该把画面唤回来（2026-11-17 老板定调）。
+            val cached = prefs.getString("scenes_json", null)
+            if (cached != null) {
+                panelSource = source
+                panelSourceAtMs = now
+                logToFile("墙板触发 ${describeSource(source)}：设备处于停止态，按缓存配置唤起画面", "INFO", "WALLPANEL", "WAKE")
+                try {
+                    applySceneConfigs(JSONObject(cached), force = true)
+                } catch (e: Exception) {
+                    logToFile("停止态唤起失败: ${e.message}", "ERROR", "WALLPANEL", "WAKE")
+                }
+                return
+            }
             logToFile("墙板触发 ${describeSource(source)} 未生效：本机还没应用过窗口配置", "WARN", "WALLPANEL", "SKIP")
             return
         }
@@ -3346,6 +3384,9 @@ class MainActivity : AppCompatActivity() {
         // 再起一个实例，两个实例共用同一个 MQTT clientId 互踢（理由见 bringSelfByRoot）
         val sh = "rm -f $tmp && cp ${file.absolutePath} $tmp && chmod 644 $tmp && " +
             "pm install -r $tmp && rm -f $tmp && sleep 3 && " +
+            // 覆盖安装后顺手把默认桌面钉回自己：量产的 root 盒子换包后若丢了 HOME 记录，
+            // 下次重启会停在系统"选择主屏幕"上（2026-11-17 台架实况），这一句就是开机落屏的保证
+            "cmd package set-home-activity $packageName/.MainActivity ; " +
             "am start -a android.intent.action.MAIN -c android.intent.category.HOME" +
             " -n $packageName/.MainActivity"
         logToFile("OTA: 静默安装 ${file.name}（${file.length()} bytes），本机进程随后会被回收并自启")
