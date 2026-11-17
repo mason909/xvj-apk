@@ -1766,6 +1766,7 @@ class MainActivity : AppCompatActivity() {
      *   stop                停掉全部播放
      *   exit_desktop        退出到桌面：释放画面并把原厂桌面顶到身前，进程/MQTT 全活着（与 stop 的差别见【A-15】）
      *   reopen_desktop      唤回画面：root 把自己顶回前台，回到前台那次按 prefs 的 scenes_json 重建
+     *   reboot              远程重启整台设备（管理台设备卡「重启设备」；root reboot，无 root 只记日志）
      *   config              改 mqtt_server / loop（只影响单播放器 player，不影响窗口播放器）
      *   sync_room_materials 房间素材全量对账（服务端【S-07】/授权链路发出）
      *   update_windows      轻量窗口重排，不下素材（编辑器 live 实时预览）
@@ -1809,6 +1810,23 @@ class MainActivity : AppCompatActivity() {
                     // 退出不是"停在停止态"，它是一次可逆的离场，回到画面由同一条链自己完成，
                     // 不需要云端重发配置。命令必须回显到 device_logs，否则现场只知道"桌面出来了"不知道是谁叫的。
                     mqttHandler.post { setExited(action == "exit_desktop", "云端命令") }
+                }
+                // 远程重启整台设备（设备卡「重启设备」）：不是重启 APK 进程，是 reboot 整机。
+                // 先落日志再动手 —— reboot 一下去进程就没了，device_logs 里这一行是唯一的回执。
+                // 与 OTA 共用 su 通道；没有 root 的机器只记一行拒绝，不去触发 su 授权框把线程吊住。
+                "reboot" -> {
+                    logToFile("收到重启命令：设备即将重启", "INFO", "MQTT", "REBOOT")
+                    Thread {
+                        if (!silentInstallReady()) {
+                            logToFile("重启命令放弃：本机没有 root，无法执行 reboot（请现场断电或按键重启）",
+                                "WARN", "MQTT", "REBOOT")
+                            return@Thread
+                        }
+                        val done = execAsRoot("reboot", 5000)
+                        if (done.first != 0) {
+                            logToFile("reboot 未生效（code=${done.first}）：${done.second}", "ERROR", "MQTT", "REBOOT")
+                        }
+                    }.start()
                 }
                 // 实时截图（见【A-16】）：管理台要一帧当前落屏的画面。载荷由服务端补齐
                 // （upload_url + 一次性 token，两者只进这台设备的私有主题），缺任一条就是命令没配好，
