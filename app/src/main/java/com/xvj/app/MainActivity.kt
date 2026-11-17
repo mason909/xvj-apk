@@ -226,6 +226,10 @@ class MainActivity : AppCompatActivity() {
     private val windowViews = mutableMapOf<String, View>()
     /** windowId -> 内容签名（type|folderId|color|inputIndex|follow），实时更新时判定结构变化用 */
     private val windowContentSigs = mutableMapOf<String, String>()
+    /** windowId -> 最近一次窗口配置：自动去边变了要拿它重算同一套取景/旋转矩阵 */
+    private val winJsonById = mutableMapOf<String, JSONObject>()
+    /** HDMI 源画面的真实内容框（自动去边，归一化 [x,y,w,h]）；null = 探针还没测出来 */
+    private var hdmiSourceCrop: FloatArray? = null
     /** HDMI 窗口的占位文字（无信号/待授权提示），出流且有信号时隐藏；winId -> label */
     private val hdmiLabels = mutableMapOf<String, TextView>()
     /** HDMI IN 采集管线；第一次有 HDMI 窗口才建（没有 HDMI 的现场不占相机线程） */
@@ -3668,6 +3672,7 @@ class MainActivity : AppCompatActivity() {
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
         windowContentSigs.clear()
+        winJsonById.clear()
 
         // 收集所有场景的窗口，A 和 B 的 windows 合并后统一渲染
         // 每个窗口播什么由自身 content 决定，不需要"当前幕"概念（485 墙板走独立链路，见 applyPanelSource）
@@ -3997,6 +4002,7 @@ class MainActivity : AppCompatActivity() {
             // 共享组成员的几何/透明度/亮度长在 GL 画布上（一块画布代表整组），这里一律跳过，
             // 组级重排放到循环后面做一次 —— 并集矩形要按全组最新的几何算，逐扇改会改出一半新一半旧
             videoSurfaces[winId]?.winJson = w
+            winJsonById[winId] = w
             if (winShareGroup.containsKey(winId)) continue
             val c = windowViews[winId] as? FrameLayout ?: continue
 
@@ -4102,9 +4108,10 @@ class MainActivity : AppCompatActivity() {
         flSurface?.addView(container, params)
         windowViews[winId] = container
         windowContentSigs[winId] = contentSignature(content)
+        winJsonById[winId] = w
         // 布局完成后应用截取/旋转/镜像（取景与矩阵中心都依赖实际视图尺寸），未就绪则等首次布局再补
         container.post { applyTransformWhenReady(view, w) }
-        val cr = cropRect(w)
+        val cr = effectiveCrop(w)
         Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y) opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)} crop=(${cr[0]},${cr[1]},${cr[2]},${cr[3]})")
     }
 
@@ -4251,7 +4258,7 @@ class MainActivity : AppCompatActivity() {
     private fun applyWindowTransform(view: View, w: JSONObject): Boolean {
         val rot = w.optInt("rotation", 0)
         val flip = w.optString("flip", "none")
-        val crop = cropRect(w)
+        val crop = effectiveCrop(w)
         val tvs = if (view is TextureView) listOf(view) else findTextureViews(view)
         if (tvs.isNotEmpty()) {
             // 一个窗口框里可能套着多层视图（画面 + 亮度遮罩），变换只套在 TextureView 上；
@@ -4370,6 +4377,23 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(x, y, wd, ht)
     }
 
+    /**
+     * 窗口最终取景 = 用户取景 ∩ 自动去边内容框，只对 HDMI 输入生效。
+     * 自动去边是设备侧渲染策略（源画面四周的黑边裁掉再铺满窗口），不写回房间配置；
+     * 两框不重叠（用户取景已全落在黑边里）时以用户取景为准。
+     */
+    private fun effectiveCrop(w: JSONObject): FloatArray {
+        val user = cropRect(w)
+        val auto = hdmiSourceCrop ?: return user
+        val type = (w.optJSONObject("content")?.optString("type") ?: "").uppercase()
+        if (type != "HDMI" && type != "VIDEO_INPUT") return user
+        val x0 = maxOf(user[0], auto[0])
+        val y0 = maxOf(user[1], auto[1])
+        val x1 = minOf(user[0] + user[2], auto[0] + auto[2])
+        val y1 = minOf(user[1] + user[3], auto[1] + auto[3])
+        return if (x1 - x0 >= 0.05f && y1 - y0 >= 0.05f) floatArrayOf(x0, y0, x1 - x0, y1 - y0) else user
+    }
+
     /** 测试背景窗口：固定图卡铺满（居中裁切），图卡读不到才退回 content.color 纯色 */
     private fun createColorView(w: JSONObject, content: JSONObject): View {
         testCardBitmap()?.let { bmp ->
@@ -4465,6 +4489,15 @@ class MainActivity : AppCompatActivity() {
     }.also { cap ->
         cap.onStreamState = { refreshHdmiLabels() }
         cap.onNeedPermission = { runOnUiThread { ensureHdmiPermission() } }
+        // 源画面黑边框变了：所有 HDMI 窗按新取景重套矩阵（回调已在主线程）
+        cap.onSourceCrop = { crop ->
+            hdmiSourceCrop = crop
+            for (winId in hdmiLabels.keys.toList()) {
+                val v = windowViews[winId] ?: continue
+                val w = winJsonById[winId] ?: continue
+                applyWindowTransform(v, w)
+            }
+        }
         hdmiCapture = cap
     }
 
@@ -5103,6 +5136,8 @@ class MainActivity : AppCompatActivity() {
         destroyShareGroups()
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
+        windowContentSigs.clear()
+        winJsonById.clear()
         // 屏上已经没有窗口了，"已应用配置"的指纹必须一起作废：
         // 否则下次拿同一份 scenes 来 apply 会被幂等闸门挡掉，画面停在欢迎视频上不去
         appliedScenesFp = null
