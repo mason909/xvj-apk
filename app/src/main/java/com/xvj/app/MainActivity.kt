@@ -3674,11 +3674,21 @@ class MainActivity : AppCompatActivity() {
             val content = w.optJSONObject("content") ?: JSONObject()
             PlanWindow(winId, w, content, resolveWindowFolder(scenes, content, winId))
         }
-        // 同格 ≥2 扇才成组：按新配置算一遍组，成员表与屏上那份逐窗比对（不在组里两边都是 null）
-        val wantGroup = plan.filter { isVideoContentType(it.content) && it.folderId != null }
+        // 同格 ≥2 扇才成组：组按"成员构成"比对，不按格子名 —— 墙板换格/勾了跟随是同一组人整组换到另一格，
+        // 解码路数与画布都不变，原地换清单就够；只有成员增删（含两组并到一格）才必须重建。
+        val desiredGroups = plan.filter { isVideoContentType(it.content) && it.folderId != null }
             .groupBy { it.folderId!! }.filterValues { it.size >= 2 }
-            .flatMap { (folderKey, items) -> items.map { it.winId to folderKey } }.toMap()
-        if (plan.any { winShareGroup[it.winId]?.folderKey != wantGroup[it.winId] }) return false
+            .mapValues { entry -> entry.value.map { it.winId }.toSet() }
+        if (shareGroups.values.map { it.members.toSet() }.toSet() != desiredGroups.values.toSet()) return false
+        // 构成相同但格子换了：先把组名对齐（目标格已被别组占着就回退，换名等于并组，画布合不了）
+        for ((folderKey, winIds) in desiredGroups) {
+            val grp = winShareGroup[winIds.first()] ?: continue
+            if (grp.folderKey == folderKey) continue
+            if (shareGroups.containsKey(folderKey)) return false
+            shareGroups.remove(grp.folderKey)
+            grp.folderKey = folderKey
+            shareGroups[folderKey] = grp
+        }
 
         val settingsChanged = playSettingsJson(scenes) != appliedPlaySettingsJson
         val refresh = ArrayList<PlanWindow>()
@@ -4027,7 +4037,7 @@ class MainActivity : AppCompatActivity() {
      * members 按 z 升序，画布照这个次序叠（后画的在上），与原来"后加入者在上层"的观感对齐。
      */
     private class ShareGroup(
-        val folderKey: String,
+        var folderKey: String,
         val leaderId: String,
         val container: FrameLayout,
         val canvas: ShareCanvasView,
@@ -4408,6 +4418,16 @@ class MainActivity : AppCompatActivity() {
                 it.folderKey = grp.folderKey
             }
             return
+        }
+        // 墙板整组换格（applyPanelSource 直接调这里，不经过原地闸门）：组是按格子键索引的，
+        // 组名不跟着换，下一次配置落地就会拿旧名跟新解析比，误判成结构变化 → 整屏重建（白漏一份 dma-buf）。
+        // 目标格已被另一组占着则维持原名（换名等于并组），留给下次配置落地按新分组重建。
+        if (grp != null && grp.folderKey != folderId && !shareGroups.containsKey(folderId)) {
+            val from = grp.folderKey
+            shareGroups.remove(from)
+            grp.folderKey = folderId
+            shareGroups[folderId] = grp
+            logToFile("共享解码组 ${grp.members.size} 扇窗整组换格：$from → $folderId", "INFO", "WINDOW", "SHARE")
         }
         val player = windowPlayers[winId] ?: run {
             Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
