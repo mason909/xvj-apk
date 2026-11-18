@@ -28,6 +28,9 @@
  *         startWallPanelLearn / publishFrameSnapshot；
  *         收帧解析与 termios 在 serial/WallPanelLink.kt，帧台账与学习表在 serial/WallPanelFrames.kt，
  *         帧族分帧在 serial/WallPanelParser.kt）
+ * 【A-14d】DMX512 副板链路（applyDmxEnabled / applyDmxFields / dmxPath / dmxBaud / handleDmxFrame；
+ *         通道 N ↔ 文件夹 NN，值变动即"按了一次"，与 485 共用 applyPanelSource；
+ *         收帧与 termios 在 serial/DmxLink.kt，帧头解析在 serial/DmxFrameParser.kt）
  * 【A-15】退出到桌面与唤回（setExited / findDesktop / bringSelfByRoot / rebuildAfterExit +
  *         dispatchTouchEvent 左键连点 5 次；入口两条：云端 action:'exit_desktop' / 'reopen_desktop'，
  *         本机连点只管"退出"，回来靠桌面图标 / HOME 键 / 云端唤回）
@@ -158,6 +161,8 @@ import android.view.Surface
 import android.view.TextureView
 import org.json.JSONArray
 import com.xvj.app.databinding.ActivityMainBinding
+import com.xvj.app.serial.DmxFrame
+import com.xvj.app.serial.DmxLink
 import com.xvj.app.serial.PanelAction
 import com.xvj.app.serial.PanelSource
 import com.xvj.app.serial.WallPanelBindings
@@ -210,16 +215,24 @@ class MainActivity : AppCompatActivity() {
     // 所以"收到一帧"和"这一帧是什么意思"是两件事：前者进 frameLedger 上报，后者才动画面。
     private var wallPanelLink: WallPanelLink? = null
     /**
-     * 本机最近一次**动了画面**的墙板触发源；null = 这台机开机至今没收到过学过的帧
-     * （跟随窗口退回各自的固定逻辑）。只有一种源：
-     *   [PanelSource.Frame] 学习来的帧指纹，各幕按自己的绑定表各自解析出该切的格子。
+     * 本机最近一次**动了画面**的墙板/DMX 触发源；null = 这台机开机至今没收到过学过的帧
+     * （跟随窗口退回各自的固定逻辑）。两种源：
+     *   [PanelSource.Frame] 学习来的帧指纹，各幕按自己的绑定表各自解析出该切的格子；
+     *   [PanelSource.Dmx]   副板通道变动，通道号直接就是格子号（A/B 各切各的物理目录）。
      * 只在内存里，故意不落 prefs：重启后回到"没按过"，画面落在各窗自己的固定格 ——
      * 现场要的是可预测的开机画面，而不是上一次营业结束时的状态；也因此不用跟 rev 对账。
-     * 读写都在主线程（墙板事件由 WallPanelLink post 到主线程，窗口应用也在主线程）。
+     * 读写都在主线程（墙板/DMX 事件由链路 post 到主线程，窗口应用也在主线程）。
      */
     private var panelSource: PanelSource? = null
     /** 上一次触发源落地时刻（elapsedRealtime）：同一帧在去抖窗口内只认一次，见 applyPanelSource */
     private var panelSourceAtMs = 0L
+    /** DMX512 副板链路：与 485 是两条物理线，总闸/节点/速率各自下发（config.dmx_*） */
+    private var dmxLink: DmxLink? = null
+    /**
+     * 上一帧 20 路通道值；null = 刚开链路还没收到过帧（首帧只当基线，不触发）。
+     * 值变动（且新值非零）才算"按了一次"，落到 [PanelSource.Dmx] 与 485 共用同一套切格逻辑。
+     */
+    private var dmxPrev: IntArray? = null
     /** 收到的帧去重台账：心跳带回云端做排障可见，学习模式的候选列表也从它出（主线程读写） */
     private val frameLedger = WallPanelFrameLedger()
     /** 学习来的「帧 → 动作」表：房间 config.wallpanel_bindings 的内存视图，随载荷整体替换 */
@@ -255,6 +268,17 @@ class MainActivity : AppCompatActivity() {
     private val folderPlaylists = mutableMapOf<String, List<MediaItem>>()
     /** 看门狗二次武装的上限：拿到真实片长后按 duration+15s 重排，最长不超过这个值（长片不该被一刀砍） */
     private val PREVIEW_HARD_CAP_MS = 30 * 60 * 1000L
+    /**
+     * 连点合并窗口：试播每换一只 4K↔1080p 素材都要重配一套解码缓冲，HAL 的缓冲池跨进程不还；
+     * 短窗口内的后几次点击只留最后一次 —— 前几次本来也会被下一次 setMediaItems 打断，一帧都看不到。
+     */
+    private val PREVIEW_MERGE_MS = 500L
+    /** 可用内存低于这条线（与冷启动闸门同一把尺）就别再开新试播：屏上如实说原因，比整机被 lmkd 连杀好 */
+    private val PREVIEW_MIN_AVAIL_MB = 400
+    /** 上一次真正接管的时间（uptime 毫秒），连点合并用 */
+    private var lastPreviewArmAt = 0L
+    /** 被合并窗口推到后面的那一次试播（同一时刻最多一个，后到替先到） */
+    private var pendingPreview: Runnable? = null
     /**
      * 设备播放链认的视频扩展名 —— 三端那份表的设备侧（云端 server.js 的 VIDEO_EXT 同源，前端 _pvDevExtRe 同源）。
      * 同步比对、清空目录、播放列表、试播定位四处共用：写两份就会分裂成"同目录里一只算素材、一只算杂项"，
@@ -895,6 +919,8 @@ class MainActivity : AppCompatActivity() {
             }
         )
         applyWallPanelEnabled(prefs.getBoolean("wallpanel_enabled", false))
+        // DMX512 副板同口径：本地硬件，离线也要能用，按 prefs 收放（通道表由 play_settings.dmx 决定）
+        applyDmxEnabled(prefs.getBoolean("dmx_enabled", false))
     }
 
     /**
@@ -1338,6 +1364,80 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * dmx_enabled 的唯一写入口：落 prefs + 收放副板串口链路（口径对齐 applyWallPanelEnabled）。
+     * 三个来源同为服务端 roomDmxFields 一份口径：auth_result / sync_room_materials 载荷、set_dmx，
+     * 以及 loadConfig 的 prefs 恢复。串口节点/速率变了必须重开（旧 fd 还锁着上一套参数），
+     * 重开时清通道基线：新链路的首帧只当"当前值"，不当一次按键。
+     */
+    @Synchronized
+    private fun applyDmxEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("dmx_enabled", enabled).apply()
+        if (!enabled) {
+            dmxLink?.stop()
+            dmxLink = null
+            dmxPrev = null
+            return
+        }
+        val path = dmxPath()
+        val baud = dmxBaud()
+        dmxLink?.let {
+            if (it.path == path && it.baud == baud) return
+            logToFile("DMX 串口参数改为 $path @$baud，重开链路", "INFO", "DMX", "CONFIG")
+            it.stop()
+            dmxLink = null
+        }
+        dmxPrev = null
+        dmxLink = DmxLink(
+            path = path,
+            baud = baud,
+            onFrame = ::handleDmxFrame,
+            onError = { msg ->
+                Log.w(TAG, "DMX 串口: $msg")
+                logToFile("DMX 串口错误: $msg", "WARN", "DMX", "ERROR")
+            },
+            onNotice = { msg ->
+                Log.i(TAG, "DMX 串口: $msg")
+                logToFile(msg, "INFO", "DMX", "LINK")
+            },
+        ).also { it.start() }
+    }
+
+    /** 本机等 DMX 副板的串口节点：与墙板同一把尺，默认 /dev/ttyS4（小麦 x9/x10 机型的副板口） */
+    private fun dmxPath(): String {
+        val p = (prefs.getString("dmx_serial_path", "") ?: "").trim()
+        return if (WALLPANEL_PATH_RE.matches(p)) p else DmxLink.DEFAULT_PATH
+    }
+
+    /** 本机等 DMX 副板的波特率：prefs 0/档外 = 出厂档 115200（与服务端 roomDmxFields 默认一致） */
+    private fun dmxBaud(): Int? =
+        prefs.getInt("dmx_baud", 0).takeIf { it in DmxLink.BAUDS } ?: DmxLink.DEFAULT_BAUD
+
+    /**
+     * DMX 硬件字段的唯一写入口：载荷真带了那个键才覆盖（与 applyWallPanelFields 同一理由，
+     * update_windows 这类载荷不带，optXxx 兜底会把本地设置抹掉）。
+     * 只写 prefs，收放链路随后由 [applyDmxEnabled] 按 prefs 决定 —— 调用方必须先调本函数。
+     */
+    private fun applyDmxFields(payload: JSONObject) {
+        if (payload.has("dmx_serial_path")) {
+            val raw = payload.opt("dmx_serial_path")
+            val p = (if (raw == null || raw === JSONObject.NULL) "" else raw.toString()).trim()
+            if (p != (prefs.getString("dmx_serial_path", "") ?: "").trim()) {
+                prefs.edit().putString("dmx_serial_path", p).apply()
+                logToFile("DMX 串口节点下发为 ${if (p.isEmpty()) "默认" else p}", "INFO", "DMX", "CONFIG")
+            }
+        }
+        if (payload.has("dmx_baud")) {
+            val raw = payload.opt("dmx_baud")
+            val n = (if (raw == null || raw === JSONObject.NULL) 0 else raw.toString().toIntOrNull() ?: 0)
+            val b = if (n in DmxLink.BAUDS) n else 0
+            if (b != prefs.getInt("dmx_baud", 0)) {
+                prefs.edit().putInt("dmx_baud", b).apply()
+                logToFile("DMX 波特率下发为 ${if (b > 0) "$b" else "出厂默认 115200"}", "INFO", "DMX", "CONFIG")
+            }
+        }
+    }
+
     /** 载荷里的一个"档位整数"：null/脏值/小数都当 0（= 没设），别把 JSONException 抛到下发链路上 */
     private fun Any?.cellInt(): Int {
         if (this == null || this === JSONObject.NULL) return 0
@@ -1445,53 +1545,128 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * DMX512 一帧到达：值变动（且新值非零）就算"按了一次"，通道号 N 直接落到文件夹 NN，
+     * 与 485 学过的帧共用 [applyPanelSource]。口径：
+     *   首帧只当基线 —— 开机时副板已经在报当前值，那不是一次按键，不能无故切格；
+     *   归零只当松手，不触发（推子/按钮回落都会经过 0）；
+     *   同一帧里多路变动各算一次（推子联动两路时两格都该动）；
+     *   这一格没在任何一幕开 DMX512 控制 → 只记日志，链路照常收帧（别的格可能开着）。
+     * 已在主线程（DmxLink 把帧 post 过来了）。
+     */
+    private fun handleDmxFrame(frame: DmxFrame) {
+        val prev = dmxPrev
+        dmxPrev = frame.channels.copyOf()
+        if (prev == null) {
+            logToFile("DMX 首帧已收（基线不触发）: ${frame.summary()}", "INFO", "DMX", "FRAME")
+            return
+        }
+        for (i in frame.channels.indices) {
+            val v = frame.channels[i]
+            if (v == 0 || v == prev.getOrElse(i) { -1 }) continue
+            val fid = (if (i + 1 < 10) "0" else "") + (i + 1)
+            onDmxTrigger(fid, v)
+        }
+    }
+
+    /** 一路通道变动 → 一次墙板式按键（同格再按 = 下一支，见 applyPanelSource） */
+    private fun onDmxTrigger(fid: String, value: Int) {
+        // 停止态也要能当开机键用（与 485 同一口径）：内存里没配置时拿缓存配置判这一格的闸
+        val scenes = appliedScenes ?: prefs.getString("scenes_json", null)?.let { raw ->
+            try {
+                JSONObject(raw)
+            } catch (e: Exception) {
+                null
+            }
+        }
+        if (scenes == null) {
+            logToFile("DMX 通道 $fid 变动（值 $value）：本机还没应用过窗口配置，忽略", "WARN", "DMX", "SKIP")
+            return
+        }
+        if (!dmxFolderEnabled(scenes, fid)) {
+            logToFile("DMX 通道 $fid 变动（值 $value）：A/B 两幕里这一格都没开 DMX512 控制，忽略", "INFO", "DMX", "SKIP")
+            return
+        }
+        applyPanelSource(PanelSource.Dmx(fid), "值 $value")
+    }
+
+    /** 这一格在任一幕开了 DMX512 控制没有（物理键 A01/B01 与老载荷的裸键都认） */
+    private fun dmxFolderEnabled(scenes: JSONObject, fid: String): Boolean {
+        for (k in listOf("A", "B")) {
+            val tbl = scenes.optJSONObject(k)?.optJSONObject("play_settings") ?: continue
+            val cell = tbl.optJSONObject(k + fid) ?: tbl.optJSONObject(fid) ?: continue
+            if (cell.optBoolean("dmx", false)) return true
+        }
+        return false
+    }
+
+    /**
+     * DMX 源在这扇窗所在的幕里有没有资格动它（resolveWindowFolder 与 applyPanelSource 共用）：
+     * play_settings 的键是物理目录 id（A01/B01），与 applySceneConfigs 的落点口径一致。
+     */
+    private fun dmxAllowedFor(scenes: JSONObject, prefixedFolder: String, content: JSONObject): Boolean {
+        val type = content.optString("type", "").uppercase()
+        val key = when (type) {
+            "SCENE_A" -> "A"
+            "SCENE_B" -> "B"
+            else -> return false
+        }
+        val physical = if (prefixedFolder.startsWith(key)) prefixedFolder else key + prefixedFolder
+        return playSettingsOf(scenes, physical).dmx
+    }
+
+    /**
      * 触发源的落点：先把这一源记下来，再把所有跟随墙板的窗口切到它对应的那一格；
      * 同一帧再按一次 = 那一格播下一支（顺序/随机按播放设置，见 advancePanelFolder）。
      * 口径：
      *   只动 content.follow == true 的窗口 —— folderId 是人工钉死的，墙板不越权去改它；
      *   播哪一格一律交给 resolveWindowFolder，与全量重建同一个入口，两处不会各漂一份；
      *   解析不出目标格（这一帧这一幕没绑 / 那格不在映射里）→ 那扇窗保持原样，宁可停在旧画面也不切到黑屏；
+     *   DMX 源还要过该格 play_settings.dmx 的闸（A/B 各判各的）；
      *   正在试播的那一格先收尾再切 —— 不收的话试播播完的恢复回调会把画面拽回按键之前；
      *   重复帧 [WALLPANEL_REPEAT_DEBOUNCE_MS] 内只认一次（按下/松开的重复帧），超出窗口才算"下一支"。
-     * 必须在主线程调用（换 playlist）；WallPanelLink 的事件已经 post 到主线程。
+     * 必须在主线程调用（换 playlist）；WallPanelLink / DmxLink 的事件已经 post 到主线程。
      */
     private fun applyPanelSource(source: PanelSource, hex: String) {
+        // 两个源共用这一套切格逻辑，日志里得说清是墙板还是 DMX（类别分开才好按来源筛日志）
+        val dmx = source is PanelSource.Dmx
+        val noun = if (dmx) "DMX" else "墙板"
+        val cat = if (dmx) "DMX" else "WALLPANEL"
         if (exited) {
-            // 人已离场、桌面在身前，画面不该被 485 叫醒 —— 否则"退出"按不动，客人面前挡不住。
+            // 人已离场、桌面在身前，画面不该被 485/DMX 叫醒 —— 否则"退出"按不动，客人面前挡不住。
             // 不更新 panelSource：唤回时按配置原样重建，那几帧不补播。
-            logToFile("墙板触发 ${describeSource(source)} 未生效：设备已退出到桌面", "WARN", "WALLPANEL", "DESKTOP")
+            logToFile("${noun}触发 ${describeSource(source)} 未生效：设备已退出到桌面", "WARN", cat, "DESKTOP")
             return
         }
         val now = SystemClock.elapsedRealtime()
         val repeat = panelSource == source
         if (repeat && now - panelSourceAtMs < WALLPANEL_REPEAT_DEBOUNCE_MS) {
-            logToFile("墙板重复帧 ${describeSource(source)}（${now - panelSourceAtMs}ms 内），去抖跳过", "INFO", "WALLPANEL", "SKIP")
+            logToFile("${noun}重复帧 ${describeSource(source)}（${now - panelSourceAtMs}ms 内），去抖跳过", "INFO", cat, "SKIP")
             return
         }
         val scenes = appliedScenes
         if (scenes == null) {
             // 停止（云端 action:'stop'）连"已应用配置"一起清掉。墙板按键是现场的开机键：
             // 拿本地缓存整屏重建，并把这一帧当触发源一起落进去 —— 停止只是停播，不是改配置，
-            // 所以按任一学过的墙板键就该把画面唤回来（2026-11-17 老板定调）。
+            // 所以按任一学过的墙板键（或开了 DMX 的那一路）就该把画面唤回来（2026-11-17 老板定调）。
             val cached = prefs.getString("scenes_json", null)
             if (cached != null) {
                 panelSource = source
                 panelSourceAtMs = now
-                logToFile("墙板触发 ${describeSource(source)}：设备处于停止态，按缓存配置唤起画面", "INFO", "WALLPANEL", "WAKE")
+                logToFile("${noun}触发 ${describeSource(source)}：设备处于停止态，按缓存配置唤起画面", "INFO", cat, "WAKE")
                 try {
                     applySceneConfigs(JSONObject(cached), force = true)
                 } catch (e: Exception) {
-                    logToFile("停止态唤起失败: ${e.message}", "ERROR", "WALLPANEL", "WAKE")
+                    logToFile("停止态唤起失败: ${e.message}", "ERROR", cat, "WAKE")
                 }
                 return
             }
-            logToFile("墙板触发 ${describeSource(source)} 未生效：本机还没应用过窗口配置", "WARN", "WALLPANEL", "SKIP")
+            logToFile("${noun}触发 ${describeSource(source)} 未生效：本机还没应用过窗口配置", "WARN", cat, "SKIP")
             return
         }
         if (repeat) {
-            logToFile("墙板重复触发 ${describeSource(source)}（$hex）", "INFO", "WALLPANEL", "REPEAT")
+            logToFile("${noun}重复触发 ${describeSource(source)}（$hex）", "INFO", cat, "REPEAT")
         } else {
-            logToFile("墙板触发 ${describeSource(source)}（$hex）", "INFO", "WALLPANEL", "SWITCH")
+            logToFile("${noun}触发 ${describeSource(source)}（$hex）", "INFO", cat, "SWITCH")
             panelSource = source
         }
         panelSourceAtMs = now
@@ -1507,7 +1682,7 @@ class MainActivity : AppCompatActivity() {
         if ((!repeat || switching) && shareGroups.isNotEmpty() && follows.isNotEmpty()) {
             val broken = shareGroups.values.any { grp -> grp.members.map { resolved[it] }.distinct().size > 1 }
             if (broken) {
-                logToFile("墙板触发 ${describeSource(source)} 会让共享解码组的成员分家，回退全量重建", "INFO", "WALLPANEL", "REBUILD")
+                logToFile("${noun}触发 ${describeSource(source)} 会让共享解码组的成员分家，回退全量重建", "INFO", cat, "REBUILD")
                 applySceneConfigs(scenes, force = true)
                 return
             }
@@ -1518,19 +1693,25 @@ class MainActivity : AppCompatActivity() {
         // 边切边判的话，排在后面的成员会把刚到的新格误当成重复按，白白多推一支
         // （起播瞬间 seek，现场看到就是一次凝滞/闪黑）。
         val beforeFolders = follows.associate { (id, _) -> id to videoSurfaces[id]?.folderKey }
-        for ((winId, _) in follows) {
-            endPreviewCovering(winId, if (repeat) "墙板重复触发" else "墙板切换")
+        for ((winId, content) in follows) {
+            endPreviewCovering(winId, if (repeat) "${noun}重复触发" else "${noun}切换")
             val folderId = resolved[winId]
             if (folderId == null) {
-                Log.w(TAG, "窗口 $winId 跟随墙板 ${describeSource(source)} 解析不到可播的文件夹，保持原画面")
-                logToFile("窗口 [$winId] ${describeSource(source)} 无可播文件夹，保持原画面", "WARN", "WALLPANEL", "SKIP")
+                Log.w(TAG, "窗口 $winId 跟随${noun} ${describeSource(source)} 解析不到可播的文件夹，保持原画面")
+                logToFile("窗口 [$winId] ${describeSource(source)} 无可播文件夹，保持原画面", "WARN", cat, "SKIP")
+                continue
+            }
+            // DMX 只动该幕里开了 DMX512 控制的格子：没开的那一幕回到自己的固定逻辑，
+            // 不能因为同一路通道就跟着跳格（A/B 是两套节目）。
+            if (dmx && !dmxAllowedFor(scenes, folderId, content)) {
+                logToFile("DMX 触发 → 文件夹 $folderId 所在幕未开 DMX512 控制，窗口 [$winId] 保持原画面", "INFO", cat, "SKIP")
                 continue
             }
             // 判"下一支"只看落点是不是按键前就在播的那一格，不看这一帧和上一帧是否同一个码：
             // 点歌机码与墙板码可能指向同一格，交替按也不该把画面拽回第一支。
             val leader = winShareGroup[winId]?.leaderId ?: winId
             if (beforeFolders[winId] == folderId) {
-                if (advanced.add(leader)) advancePanelFolder(leader, folderId)
+                if (advanced.add(leader)) advancePanelFolder(leader, folderId, noun, cat)
             } else {
                 playFolderInWindow(winId, folderId)
             }
@@ -1544,7 +1725,7 @@ class MainActivity : AppCompatActivity() {
      * （顺序=按文件名，随机=只洗一次后的固定次序），与自然播完完全同一条路，不另立一套次序。
      * 一格一路解码，这里只动基准窗那一只；组内其余窗跟着同一张画布。
      */
-    private fun advancePanelFolder(leaderWinId: String, folderId: String) {
+    private fun advancePanelFolder(leaderWinId: String, folderId: String, noun: String, cat: String) {
         val player = windowPlayers[leaderWinId]
         if (player == null || player.mediaItemCount == 0) {
             // 播放器不在了（正在重建/这一格没起来）：补一次起播，别让按键变成哑的
@@ -1553,23 +1734,26 @@ class MainActivity : AppCompatActivity() {
         }
         val from = player.currentMediaItemIndex
         player.seekToNextMediaItem()
-        logToFile("墙板触发 → 文件夹 $folderId 下一支：第 ${from + 1}/${player.mediaItemCount} 只 → 第 ${player.currentMediaItemIndex + 1} 只",
-            "INFO", "WALLPANEL", "NEXT")
+        logToFile("${noun}触发 → 文件夹 $folderId 下一支：第 ${from + 1}/${player.mediaItemCount} 只 → 第 ${player.currentMediaItemIndex + 1} 只",
+            "INFO", cat, "NEXT")
     }
 
     /** 日志里对触发源的唯一称呼 */
     private fun describeSource(source: PanelSource): String = when (source) {
         is PanelSource.Frame -> "学习帧 ${source.hex}"
+        is PanelSource.Dmx -> "通道 ${source.folder}"
     }
 
     /**
      * 当前触发源对应哪一格（跟随窗口在 resolveWindowFolder 里问这一句）：
      *   学习帧 → 绑定表；没学过这一帧（或没按过）就返回 null，窗口退回自己的固定逻辑，不劫持。
+     *   DMX   → 通道号就是格子号（"01".."20"），无表可查。
      * 一格一码、不分幕：A/B 两幕问出来是同一格。返回不带幕前缀的格子编号。
      */
-    private fun panelFolderFor(): String? {
-        val hex = (panelSource as? PanelSource.Frame)?.hex ?: return null
-        return (wallPanelBindings.actionFor(hex) as? PanelAction.Folder)?.folder
+    private fun panelFolderFor(): String? = when (val s = panelSource) {
+        is PanelSource.Frame -> (wallPanelBindings.actionFor(s.hex) as? PanelAction.Folder)?.folder
+        is PanelSource.Dmx -> s.folder
+        null -> null
     }
 
     // 【A-02】 MQTT 连接
@@ -1857,11 +2041,16 @@ class MainActivity : AppCompatActivity() {
                             // auth_result 也带这几个字段（服务端 roomSyncFields 一处收口），
                             // 掉了 set_wallpanel 那一跳的设备靠重连这次自愈。
                             applyWallPanelFields(resp)
+                            // DMX 同口径：先落节点/速率，再按总闸收放链路（auth_result 也带 dmx_*）
+                            applyDmxFields(resp)
                             // 输出基准同理要先于 applySceneConfigs：那把尺决定每个窗口的落屏矩形，
                             // 建窗之后才纠正的话，这次同步出来的画面仍是按旧分母算的（下一份载荷才归位）。
                             applyOutputField(resp)
                             if (resp.has("wallpanel_enabled")) {
                                 applyWallPanelEnabled(resp.optBoolean("wallpanel_enabled", false))
+                            }
+                            if (resp.has("dmx_enabled")) {
+                                applyDmxEnabled(resp.optBoolean("dmx_enabled", false))
                             }
                             // 授权真值只在云端 devices 表；本机只留两样：scenes_json 缓存（冷启动恢复画面用）
                             // 和 last_authorized（能不能用这份缓存），每次 auth_result 覆盖。
@@ -2038,6 +2227,7 @@ class MainActivity : AppCompatActivity() {
      *                       正常途径是 sync_room_materials / auth_result 载荷里的 debug 字段）
      *   set_wallpanel       立即开关 485 墙板串口链路 + 串口节点/字符格式/学习表（同 set_debug：
      *                       临时值，房间 config.wallpanel_* 才是真相，下一次带这些字段的载荷会覆盖）
+     *   set_dmx             立即开关 DMX512 副板串口链路 + 节点/波特率（同 set_wallpanel 的临时值口径）
      *   wallpanel_learn     开/关学习窗：开窗清空帧台账并在每一帧到达时上报候选列表，
      *                       页面据此让人选中格子后按键、把那一帧绑上去
      *   preview_material    在播这一格的所有窗口里同步试播一只本机素材，播完同步回到原画面
@@ -2143,11 +2333,16 @@ class MainActivity : AppCompatActivity() {
                     // 确定形状，sync_room_materials / auth_result 两条载荷都带；update_windows 不带 → 不动本地状态）
                     // 字段先落 prefs 再收放链路，同一跳里改了节点/波特率才只开一次（见 auth_result 处注释）
                     applyWallPanelFields(cmd)
+                    // DMX 同口径：载荷带了 dmx_* 才覆盖，先落 prefs 再收放链路
+                    applyDmxFields(cmd)
                     // 输出基准同样先落账：下面两条 apply 路径都 post 到主线程，改完尺子再排队，
                     // 排到时拿到的已是新分母（基准变了但 scenes 没变也要重排，见 scenesFingerprint）
                     applyOutputField(cmd)
                     if (cmd.has("wallpanel_enabled")) {
                         applyWallPanelEnabled(cmd.optBoolean("wallpanel_enabled", false))
+                    }
+                    if (cmd.has("dmx_enabled")) {
+                        applyDmxEnabled(cmd.optBoolean("dmx_enabled", false))
                     }
                     val fmKeys = java.lang.StringBuilder()
                     folderMappings?.keys()?.let { val k = it; while (k.hasNext()) { fmKeys.append(k.next()).append(",") } }
@@ -2269,6 +2464,15 @@ class MainActivity : AppCompatActivity() {
                     applyWallPanelEnabled(enabled)
                     Log.d(TAG, "set_wallpanel: enabled=$enabled")
                     logToFile("墙板开关变更: enabled=$enabled 串口=${wallPanelPath()} 波特率=${wallPanelBaud() ?: "驱动默认"} ${bitsFormat(wallPanelSerialBits())}")
+                }
+                "set_dmx" -> {
+                    // DMX512 副板总闸/串口的手动开关（云端 roomDmxFields 变化时补一枪）。
+                    // 同 set_wallpanel：临时值，房间 config.dmx_* 才是真相，下一次载荷按它覆盖。
+                    val enabled = cmd.optBoolean("dmx_enabled", false)
+                    applyDmxFields(cmd)
+                    applyDmxEnabled(enabled)
+                    Log.d(TAG, "set_dmx: enabled=$enabled")
+                    logToFile("DMX 开关变更: enabled=$enabled 串口=${dmxPath()} 波特率=${dmxBaud()}", "INFO", "DMX", "CONFIG")
                 }
                 "wallpanel_learn" -> {
                     // 学习窗（云端【S-06f】）：只控制"要不要把每一帧的候选列表即时上报"，
@@ -2937,6 +3141,10 @@ class MainActivity : AppCompatActivity() {
         learnUntilMs = 0L
         wallPanelLink?.stop()
         wallPanelLink = null
+        // DMX 副板链路同口径收摊（总闸真值在 prefs，重启自恢复）
+        dmxLink?.stop()
+        dmxLink = null
+        dmxPrev = null
         // HDMI 采集管线随 Activity 收摊：相机会话不跨生命周期，下次重建时由窗口的 TextureView 重新挂接
         hdmiCapture?.shutdown()
         hdmiCapture = null
@@ -4190,10 +4398,14 @@ class MainActivity : AppCompatActivity() {
             .map { fid -> fid to (mappings.get(fid) as? org.json.JSONArray ?: org.json.JSONArray()) }
             .toList()
 
-        // 跟随的落点只看当前触发源（panelFolderFor：学习帧查绑定表，一格一码不分幕）。
-        // 全量重建和墙板切换必须同一个入口：各写一份时，重建会把人工学好的那一格忘掉，
-        // 只有墙板正好按下时才切得对。
-        val panelFolder = if (content.optBoolean("follow", false)) panelFolderFor() else null
+        // 跟随的落点只看当前触发源（panelFolderFor：学习帧查绑定表，一格一码不分幕；DMX 通道号即格子号）。
+        // 全量重建和墙板/DMX 切换必须同一个入口：各写一份时，重建会把人工学好的那一格忘掉，
+        // 只有墙板正好按下时才切得对。DMX 还要过该幕 play_settings.dmx 的闸 ——
+        // 没开的那一幕不认这一路通道，重建时也不该被它劫持，回到自己的固定逻辑。
+        val rawPanelFolder = if (content.optBoolean("follow", false)) panelFolderFor() else null
+        val panelFolder = rawPanelFolder?.takeIf { fid ->
+            panelSource !is PanelSource.Dmx || dmxAllowedFor(scenes, fid, content)
+        }
         // 指定了文件夹（content.folderId，纯编号如 "02"）：只播指定目录，
         // 该目录无素材/未映射时告警跳过，不偷偷换播别的文件夹
         val requested = panelFolder ?: content.optString("folderId", "").trim()
@@ -5183,15 +5395,16 @@ class MainActivity : AppCompatActivity() {
     // 留下来的那件事：顺序与随机 —— 清单按格缓存（folderPlaylists），随机只洗一次，
     // 同一格不管重建几次拿到的都是同一份次序。
     //
-    // 2026-11-18 新增 dmx 开关（文件夹是否接受 DMX512 控制，默认关）：本机仅解析保存，
-    // DMX512 接收链路（副板通道表 → 动作）尚未实现，等那一层落地后再按这个闸门放行。
+    // 2026-11-18 新增 dmx 开关（文件夹是否接受 DMX512 控制，默认关）：副板链路见【A-14d】，
+    // 通道 N 的值变动即"按了一次"，落到 applyPanelSource 与 485 同一套切格语义。
+    // 闸门按幕判：A 幕开了、B 幕没开的格子，只有 A 幕的跟随窗会动。
 
     /** 一格的播放设置；全默认 = 顺序循环 + 点歌屏关 + DMX512 关（与云端 playSettingsValue 的"默认不落键"同口径） */
     private class PlaySettings(
         val shuffle: Boolean = false,
         /** true = 这一格在播时显示点歌屏（HDMI 采集）窗口；见 applyHdmiVisibility */
         val hdmi: Boolean = false,
-        /** true = 这一格接受 DMX512 控制。设备端 DMX 接收尚未实现，这里先把设置收下来对齐形状 */
+        /** true = 这一格接受 DMX512 控制（见 applyPanelSource 的 dmxAllowedFor 闸） */
         val dmx: Boolean = false
     )
 
@@ -5300,6 +5513,23 @@ class MainActivity : AppCompatActivity() {
             previewStatusText("试播已拒绝：素材同步中", STATUS_TIP_MS)
             return
         }
+        // 同一只还在试播 = 想重看开头：seekTo 不重配解码器；重走一遍 setMediaItems 只是白烧一套缓冲
+        previews[folderId]?.takeIf { it.filename == filename }?.let { st ->
+            val p = windowPlayers[st.winId]
+            if (p != null) {
+                p.seekTo(0)
+                logToFile("试播重播（同一只，解码器不重配）: $folderId/$filename", "INFO", "PLAYBACK", "PREVIEW")
+                previewStatusText("试播重播：$filename")
+                return
+            }
+        }
+        // 内存已到冷启动闸门同一把尺（400MB）就别再叠一路解码：这台机器上"勉强播"的代价是整机被 lmkd 连杀
+        val availMb = availableMemMb()
+        if (availMb in 1 until PREVIEW_MIN_AVAIL_MB) {
+            logToFile("试播拒绝：可用内存仅 ${availMb}MB", "WARN", "PLAYBACK", "PREVIEW")
+            previewStatusText("试播已拒绝：内存紧张（${availMb}MB）", STATUS_TIP_MS)
+            return
+        }
         // 定位与同步/删除同一个入口：folderId 带幕前缀（"A01"），filename 就是清单里那个落盘名
         val file = materialDirOf(folderId)?.let { materialFileOf(it, filename) }
         if (file == null || !file.exists()) {
@@ -5313,6 +5543,20 @@ class MainActivity : AppCompatActivity() {
             previewStatusText("试播失败：这一格没有窗口在播", STATUS_TIP_MS)
             return
         }
+        // 连点合并（latest wins）：窗口内再点别的只留最后一次，省掉中间那几次注定被打断的解码重配
+        val since = SystemClock.elapsedRealtime() - lastPreviewArmAt
+        if (since in 0 until PREVIEW_MERGE_MS) {
+            pendingPreview?.let { mqttHandler.removeCallbacks(it) }
+            val r = Runnable {
+                pendingPreview = null
+                startGroupPreview(folderId, winIds, filename, maxMs)
+            }
+            pendingPreview = r
+            mqttHandler.postDelayed(r, PREVIEW_MERGE_MS - since)
+            logToFile("试播合并：${PREVIEW_MERGE_MS}ms 内再次点击，只留 $folderId/$filename", "INFO", "PLAYBACK", "PREVIEW")
+            return
+        }
+        lastPreviewArmAt = SystemClock.elapsedRealtime()
         // 换一格试播 = 上一格先正常收尾（回到它自己的正片），不是留着试播画面不管
         previews.keys.filter { it != folderId }.forEach { endPreview(it, "让位给新试播") }
         armPreview(folderId, winId, file, filename, maxMs)
@@ -5498,6 +5742,8 @@ class MainActivity : AppCompatActivity() {
      * applySceneConfigs 开头与 releaseAllWindows 开头，两处缺一不可。
      */
     private fun abortAllPreviews(reason: String) {
+        // 连点合并里还压着一次没落地的试播也一起作废：配置说了算，别等它把画面抢回去
+        pendingPreview?.let { mqttHandler.removeCallbacks(it); pendingPreview = null }
         if (previews.isEmpty()) return
         val n = previews.size
         previews.values.forEach { disarmPreviewWatchdog(it) }
