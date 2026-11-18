@@ -1297,6 +1297,8 @@ class MainActivity : AppCompatActivity() {
                 playFolderInWindow(winId, folderId)
             }
         }
+        // 换格后点歌屏显隐跟着这一格的开关走（同一格再按不换格，但重复算一遍无害且幂等）
+        applyHdmiVisibility(scenes)
     }
 
     /**
@@ -3762,6 +3764,9 @@ class MainActivity : AppCompatActivity() {
         // 每个窗口播什么由自身 content 决定，不需要"当前幕"概念（485 墙板走独立链路，见 applyPanelSource）
         val allWindows = mergeSceneWindows(scenes)
 
+        // 本次配置解析出的在播格：建窗时点歌屏显隐就按它定（分批起播的排队还没跑，读不到屏上落点账）
+        var planFolders: List<String> = emptyList()
+
         // 若所有场景均无窗口，为 Scene A 创建默认全屏窗口
         if (allWindows.length() == 0) {
             val defaultContent = JSONObject().apply { put("type", "SCENE_A") }
@@ -3789,6 +3794,7 @@ class MainActivity : AppCompatActivity() {
                 // 播哪一格先解析出来：同格 ≥2 扇要在起播放器之前就认成一组，等各路解码各建好了再合就晚了
                 PlanWindow(winId, w, content, resolveWindowFolder(scenes, content, winId))
             }
+            planFolders = plan.mapNotNull { it.folderId }.distinct()
             // 纯色 / HDMI 窗口本来就零解码，不掺进共享组
             val groupsByFolder = plan.filter { isVideoContentType(it.content) && it.folderId != null }
                 .groupBy { it.folderId!! }
@@ -3824,6 +3830,7 @@ class MainActivity : AppCompatActivity() {
                 paced++
             }
         }
+        applyHdmiVisibility(scenes, planFolders)
         appliedScenes = scenes
         appliedScenesFp = fp
         appliedPlaySettingsJson = playSettingsJson(scenes)
@@ -3905,6 +3912,8 @@ class MainActivity : AppCompatActivity() {
         appliedPlaySettingsJson = playSettingsJson(scenes)
         // 次序与签名上面已对齐，这里判不出结构变化，只会原地改视图几何并把共享画布按并集重算一次
         applyLiveWindowUpdate(scenes)
+        // 播放设置里的点歌屏开关也走这条原地路：只改 HDMI 窗显隐，不停不重建视频播放器
+        applyHdmiVisibility(scenes, plan.mapNotNull { it.folderId })
         logToFile("配置原地应用：${plan.size} 扇窗只换 ${refresh.size} 路清单，播放器零释放（指纹 $fp）", "INFO", "WINDOW", "INPLACE")
         return true
     }
@@ -4153,6 +4162,29 @@ class MainActivity : AppCompatActivity() {
         appliedScenesFp = scenesFingerprint(scenes)
         appliedPlaySettingsJson = playSettingsJson(scenes)
         Log.d(TAG, "applyLiveWindowUpdate: 轻量应用 ${desired.size} 个窗口")
+    }
+
+    /**
+     * 点歌屏（HDMI 采集）窗口的显隐：看屏上此刻在播哪几格，任一格开着就显示（A/B 两幕同格驱动，
+     * 正常配置下不会分歧；真分歧时以开为准 —— 点歌画面宁可多露也不该在点歌时黑掉）。
+     * 关闭 = 整扇窗 GONE：TextureView 不可见时会销毁自己那块 Surface，采集侧收到 detach，
+     * 最后一路也卸完 HdmiCapture 就关相机，4K 采集的算力和带宽一起停；再打开时走原有 attach 链重开。
+     * 没有任何视频窗在播（纯色/HDMI 房间）时按默认显示：这时没有格子能表达"关"。
+     * @param folderIds 本次配置解析出的在播格；null = 读屏上落点账（videoSurfaces.folderKey）
+     */
+    private fun applyHdmiVisibility(scenes: JSONObject?, folderIds: Collection<String>? = null) {
+        val active = (folderIds ?: videoSurfaces.values.map { it.folderKey })
+            .filter { it.isNotEmpty() }.distinct()
+        val show = active.isEmpty() || active.any { playSettingsOf(scenes, it).hdmi }
+        for ((winId, view) in windowViews) {
+            // HDMI 窗的身份直接看内容签名（"HDMI|…"），不另记一份集合 —— 重建清账时不会漏删漏建
+            if (windowContentSigs[winId]?.startsWith("HDMI|") != true) continue
+            val want = if (show) View.VISIBLE else View.GONE
+            if (view.visibility == want) continue
+            view.visibility = want
+            logToFile("点歌屏：在播文件夹 ${active.joinToString("、").ifEmpty { "无" }} → " +
+                (if (show) "显示" else "关闭") + "窗口 $winId", "INFO", "WINDOW", "HDMI")
+        }
     }
 
     /** 创建单个窗口视图并加入 flSurface */
@@ -4915,9 +4947,11 @@ class MainActivity : AppCompatActivity() {
     // 留下来的那件事：顺序与随机 —— 清单按格缓存（folderPlaylists），随机只洗一次，
     // 同一格不管重建几次拿到的都是同一份次序。
 
-    /** 一格的播放设置；全默认 = 顺序循环（与云端 playSettingsValue 的"默认不落键"同口径） */
+    /** 一格的播放设置；全默认 = 顺序循环 + 点歌屏开（与云端 playSettingsValue 的"默认不落键"同口径） */
     private class PlaySettings(
-        val shuffle: Boolean = false
+        val shuffle: Boolean = false,
+        /** false = 这一格在播时关掉所有点歌屏（HDMI 采集）窗口；见 applyHdmiVisibility */
+        val hdmi: Boolean = true
     )
 
     /**
@@ -4950,7 +4984,8 @@ class MainActivity : AppCompatActivity() {
             val tbl = scenes.optJSONObject(k)?.optJSONObject("play_settings") ?: continue
             val cell = tbl.optJSONObject(folderId) ?: tbl.optJSONObject(bare) ?: continue
             return PlaySettings(
-                shuffle = cell.optString("order", "seq") == "shuffle"
+                shuffle = cell.optString("order", "seq") == "shuffle",
+                hdmi = cell.optBoolean("hdmi", true)
             )
         }
         return PlaySettings()
