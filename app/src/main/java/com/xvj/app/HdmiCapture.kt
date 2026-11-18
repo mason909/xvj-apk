@@ -7,17 +7,11 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
-import android.graphics.ImageFormat
-import android.media.Image
-import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
-import android.os.SystemClock
 import android.view.Surface
 import java.io.File
-import java.nio.ByteBuffer
-import kotlin.math.abs
 
 /**
  * HDMI IN 采集管线：RK3588 的 hdmirx 由 Rockchip 相机 HAL 暴露成一台相机（台架报 ID 120）。
@@ -33,10 +27,6 @@ import kotlin.math.abs
  * 线程：Surface 台账与相机会话只在相机线程上读写；attach/detach/shutdown 从主线程投递。
  * 场景重建会连着一串 attach/detach，重开统一去抖成一次；旧 Surface 等会话关掉后再释放
  * （会话还拿着它的时候释放会让 HAL 报错）。
- *
- * 自动去边：会话里再多一路 640×360 YUV 探针（不在时就退回纯画面），扫源画面四周的黑边，
- * 把真实内容的归一化矩形回给界面拼进取景矩阵 —— 输入源自带黑边（含限量范围抬灰的黑）也铺满窗口。
- * 探针占一路处理流：三扇 HDMI 窗已占满 maxNumOutputStreams 时本路不挂，自动去边暂停。
  */
 class HdmiCapture(context: Context, private val log: (msg: String, level: String) -> Unit) {
 
@@ -50,18 +40,6 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         private const val OPEN_TIMEOUT_MS = 8_000L
         /** 重建窗口时 attach/detach 会连成一串，攒一小会儿再重开 */
         private const val RESTART_DEBOUNCE_MS = 150L
-
-        /** 去边探针：与 1080p 同视角的缩略 YUV，64800 像素扫边足够 */
-        private const val PROBE_W = 640
-        private const val PROBE_H = 360
-        /** 探针分析节奏：去边跟的是几何不是画面，400ms 一帧就够 */
-        private const val PROBE_SAMPLE_MS = 400L
-        /** 同一结果连续出现几次才采纳/撤回：挡住换源黑场与单帧抖动 */
-        private const val PROBE_STABLE = 3
-        /** 黑边亮度上限（Y）：限量范围的黑≈16，留噪声余量但低于桌面灰（#212121） */
-        private const val BAR_LUMA_MAX = 36
-        /** 小于这个宽度的边视为信号毛边，不裁（探针像素） */
-        private const val BAR_MIN_PX = 2
     }
 
     private val appContext = context.applicationContext
@@ -78,8 +56,6 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
     var onStreamState: ((Boolean) -> Unit)? = null
     /** 相机线程回调：缺 CAMERA 权限。界面负责去要（root 静默授权或系统弹窗） */
     var onNeedPermission: (() -> Unit)? = null
-    /** 主线程回调：源画面真实内容框（自动去边）。归一化 [x,y,w,h]，无黑边时 [0,0,1,1] */
-    var onSourceCrop: ((FloatArray) -> Unit)? = null
 
     /** winId -> TextureView 交上来的 Surface；相机线程独占 */
     private val surfaces = LinkedHashMap<String, Surface>()
@@ -92,20 +68,9 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
     /** openCamera 在途：期间再调一次会抛「相机已打开」，目标没变就等它落地 */
     private var opening = false
     private var openTargets: List<Surface> = emptyList()
-    private var openProbe: Surface? = null
     private var reopenAfterOpen = false
     /** 每次重开自增：迟到的 openCamera/onConfigured 回调据此认领自己是不是过期的那一轮 */
     private var generation = 0
-
-    /** 去边探针与判定状态（相机线程独占） */
-    private var probe: ImageReader? = null
-    /** 这一版固件不接受"画面+探针"混跑：踩过一次就永久退回纯画面，别每轮重开都再试一遍 */
-    private var probeDisabled = false
-    private var probeAt = 0L
-    private var stableRect: IntArray? = null
-    private var candidateRect: IntArray? = null
-    private var candidateCount = 0
-    private var publishedCrop: FloatArray? = null
 
     fun attach(winId: String, surface: Surface) = handler.post {
         val old = surfaces.remove(winId)
@@ -147,8 +112,6 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         handler.post {
             generation++
             closeLocked()
-            probe?.close()
-            probe = null
             surfaces.values.forEach { it.release() }
             surfaces.clear()
             graveyard.forEach { it.release() }
@@ -193,10 +156,7 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
             return
         }
         val gen = generation
-        // 去边探针也吃一路处理流：已经顶到输出上限（三扇窗）时不挂，优先保画面
-        val probeSurface = if (!probeDisabled && targets.size < MAX_STREAMS) ensureProbe()?.surface else null
         openTargets = targets
-        openProbe = probeSurface
         opening = true
         reopenAfterOpen = false
         try {
@@ -212,7 +172,7 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
                     }
                     if (surfaces.isEmpty()) { cam.close(); return }
                     device = cam
-                    startSessionLocked(cam, openTargets, openProbe, gen)
+                    startSessionLocked(cam, openTargets, gen)
                 }
 
                 override fun onDisconnected(cam: CameraDevice) {
@@ -259,8 +219,7 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
     }
 
     @Suppress("DEPRECATION")
-    private fun startSessionLocked(cam: CameraDevice, windows: List<Surface>, probeSurface: Surface?, gen: Int) {
-        val targets = if (probeSurface != null) windows + probeSurface else windows
+    private fun startSessionLocked(cam: CameraDevice, targets: List<Surface>, gen: Int) {
         val request = try {
             cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 targets.forEach { addTarget(it) }
@@ -278,10 +237,9 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
                     session = s
                     try {
                         s.setRepeatingRequest(request.build(), null, handler)
-                        log("HDMI 输入：出流 ${W}x$H（${windows.size} 扇窗）" + if (probeSurface != null) "，带自动去边" else "", "INFO")
+                        log("HDMI 输入：出流 ${W}x$H（${targets.size} 扇窗）", "INFO")
                         setStreaming(true)
                     } catch (e: Exception) {
-                        if (probeSurface != null) probeDisabled = true
                         log("HDMI 输入：出流失败 ${e.message}", "ERROR")
                         closeLocked()
                         scheduleRetry()
@@ -290,15 +248,10 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     if (gen != generation) return
-                    if (probeSurface != null) {
-                        // 有的固件不接受 YUV+PRIVATE 混跑：先摘探针保画面，之后不再挂它
-                        probeDisabled = true
-                        log("HDMI 输入：去边探针这一路没被固件接受，退回纯画面", "WARN")
-                        startSessionLocked(cam, windows, null, gen)
-                    } else if (windows.size > 1) {
-                        // 多路输出不被固件接受时退回单路：第一扇窗能亮，其余保持占位
-                        log("HDMI 输入：${windows.size} 路输出配置失败，退回单路", "WARN")
-                        startSessionLocked(cam, windows.take(1), null, gen)
+                    // 多路输出不被固件接受时退回单路：第一扇窗能亮，其余保持占位
+                    if (targets.size > 1) {
+                        log("HDMI 输入：${targets.size} 路输出配置失败，退回单路", "WARN")
+                        startSessionLocked(cam, targets.take(1), gen)
                     } else {
                         log("HDMI 输入：会话配置失败", "ERROR")
                         closeLocked()
@@ -311,134 +264,6 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
             closeLocked()
             scheduleRetry()
         }
-    }
-
-    /**
-     * 去边探针：按需创建（会话要挂它时才建），生命周期跟整个 HdmiCapture 走。
-     * 相机 HAL 三档尺寸都支持 YUV_420_888（640×360/1080p/4K），取最小档，只做缩略扫边。
-     */
-    private fun ensureProbe(): ImageReader? {
-        if (probeDisabled) return null
-        probe?.let { return it }
-        return try {
-            val r = ImageReader.newInstance(PROBE_W, PROBE_H, ImageFormat.YUV_420_888, 2)
-            r.setOnImageAvailableListener({ reader -> onProbeFrame(reader) }, handler)
-            probe = r
-            r
-        } catch (e: Exception) {
-            log("HDMI 输入：去边探针创建失败 ${e.message}（本次不启用自动去边）", "WARN")
-            null
-        }
-    }
-
-    /** 探针帧回调（相机线程）：限频取最新一帧分析；分析失败不能影响出流主链路 */
-    private fun onProbeFrame(reader: ImageReader) {
-        val img = try { reader.acquireLatestImage() } catch (e: Exception) { null } ?: return
-        try {
-            val now = SystemClock.elapsedRealtime()
-            if (now - probeAt < PROBE_SAMPLE_MS) return
-            probeAt = now
-            analyzeProbe(img)
-        } catch (e: Exception) {
-        } finally {
-            img.close()
-        }
-    }
-
-    /**
-     * 扫黑边：从四条边往里走，整条边（隔 4 个像素采样）都低于 [BAR_LUMA_MAX] 才算黑边。
-     * 限量范围把黑抬到 Y≈16、桌面灰在 #212121（Y≈33）以上，阈值取 36 两头都能分开。
-     * 结果要连续 [PROBE_STABLE] 次一致才采纳/撤回，换源黑场不会把画面一把推近。
-     */
-    private fun analyzeProbe(img: Image) {
-        val plane = img.planes[0]
-        val buf: ByteBuffer = plane.buffer
-        val rowStride = plane.rowStride
-        val pixelStride = plane.pixelStride
-        val w = img.width
-        val h = img.height
-        var left = 0
-        while (left < w / 2 && columnDark(buf, rowStride, pixelStride, left, h)) left++
-        var right = 0
-        while (right < w / 2 && columnDark(buf, rowStride, pixelStride, w - 1 - right, h)) right++
-        var top = 0
-        while (top < h / 2 && rowDark(buf, rowStride, pixelStride, top, w)) top++
-        var bottom = 0
-        while (bottom < h / 2 && rowDark(buf, rowStride, pixelStride, h - 1 - bottom, w)) bottom++
-        if (left < BAR_MIN_PX) left = 0
-        if (right < BAR_MIN_PX) right = 0
-        if (top < BAR_MIN_PX) top = 0
-        if (bottom < BAR_MIN_PX) bottom = 0
-        val cw = w - left - right
-        val ch = h - top - bottom
-        // 内容小于一成说明整屏就是黑（无信号/全黑画面），没有可裁的目标
-        val rect = if (cw >= w / 10 && ch >= h / 10) intArrayOf(left, top, cw, ch) else intArrayOf(0, 0, w, h)
-
-        val stable = stableRect
-        when {
-            stable != null && near(stable, rect) -> {
-                candidateRect = null
-                candidateCount = 0
-            }
-            candidateRect != null && near(candidateRect!!, rect) -> {
-                candidateCount++
-                if (candidateCount >= PROBE_STABLE) {
-                    stableRect = rect
-                    candidateRect = null
-                    candidateCount = 0
-                    publishCrop(rect, w, h)
-                }
-            }
-            else -> {
-                candidateRect = rect
-                candidateCount = 1
-            }
-        }
-    }
-
-    private fun columnDark(buf: ByteBuffer, rowStride: Int, pixelStride: Int, x: Int, h: Int): Boolean {
-        var y = 0
-        while (y < h) {
-            val idx = y * rowStride + x * pixelStride
-            if (idx >= buf.limit()) return false
-            if ((buf.get(idx).toInt() and 0xFF) > BAR_LUMA_MAX) return false
-            y += 4
-        }
-        return true
-    }
-
-    private fun rowDark(buf: ByteBuffer, rowStride: Int, pixelStride: Int, y: Int, w: Int): Boolean {
-        val base = y * rowStride
-        var x = 0
-        while (x < w) {
-            val idx = base + x * pixelStride
-            if (idx >= buf.limit()) return false
-            if ((buf.get(idx).toInt() and 0xFF) > BAR_LUMA_MAX) return false
-            x += 4
-        }
-        return true
-    }
-
-    private fun near(a: IntArray, b: IntArray): Boolean =
-        abs(a[0] - b[0]) <= 3 && abs(a[1] - b[1]) <= 3 && abs(a[2] - b[2]) <= 3 && abs(a[3] - b[3]) <= 3
-
-    /** 内容框变了（含恢复全画面）才回界面，1% 以内的抖动不打扰 */
-    private fun publishCrop(rect: IntArray, w: Int, h: Int) {
-        val crop = floatArrayOf(
-            rect[0].toFloat() / w, rect[1].toFloat() / h,
-            rect[2].toFloat() / w, rect[3].toFloat() / h
-        )
-        val old = publishedCrop
-        if (old != null &&
-            abs(old[0] - crop[0]) < 0.01f && abs(old[1] - crop[1]) < 0.01f &&
-            abs(old[2] - crop[2]) < 0.01f && abs(old[3] - crop[3]) < 0.01f) return
-        publishedCrop = crop
-        val l = Math.round(crop[0] * 100)
-        val r = Math.round((1f - crop[0] - crop[2]) * 100)
-        val t = Math.round(crop[1] * 100)
-        val b = Math.round((1f - crop[1] - crop[3]) * 100)
-        log("HDMI 自动去边：去掉 左${l}% 右${r}% 上${t}% 下${b}%", "INFO")
-        main.post { onSourceCrop?.invoke(crop) }
     }
 
     private fun closeLocked() {
