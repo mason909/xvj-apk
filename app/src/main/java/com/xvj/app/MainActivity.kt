@@ -975,6 +975,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 主线程：整层收起。退出到桌面/唤回这类状态没有 holdMs，唤回后不清会一直压在重建的画面上 */
+    private fun clearStatus() {
+        statusMsg = ""
+        statusShown = false
+        statusBarOn = false
+        renderStatus()
+    }
+
     /** 主线程：换文案/状态后重绘一次，并按需安排自动收起（只对自己这一代生效） */
     private fun renderStatus(holdMs: Long = 0L) {
         statusGen++
@@ -5714,6 +5722,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 退出结束后按本机缓存把画面放回去：授权闸门与 restoreCachedScenes 同一口径 */
     private fun rebuildAfterExit(reason: String) {
+        clearStatus()
         // 退出期间被废止过就不该把缓存画面放回去
         if (!prefs.getBoolean("last_authorized", false)) {
             logToFile("唤回（$reason）：本机已非授权态，改播欢迎视频", "WARN", "WINDOW", "DESKTOP")
