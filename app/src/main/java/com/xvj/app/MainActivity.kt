@@ -5182,12 +5182,17 @@ class MainActivity : AppCompatActivity() {
     //
     // 留下来的那件事：顺序与随机 —— 清单按格缓存（folderPlaylists），随机只洗一次，
     // 同一格不管重建几次拿到的都是同一份次序。
+    //
+    // 2026-11-18 新增 dmx 开关（文件夹是否接受 DMX512 控制，默认关）：本机仅解析保存，
+    // DMX512 接收链路（副板通道表 → 动作）尚未实现，等那一层落地后再按这个闸门放行。
 
-    /** 一格的播放设置；全默认 = 顺序循环 + 点歌屏关（与云端 playSettingsValue 的"默认不落键"同口径） */
+    /** 一格的播放设置；全默认 = 顺序循环 + 点歌屏关 + DMX512 关（与云端 playSettingsValue 的"默认不落键"同口径） */
     private class PlaySettings(
         val shuffle: Boolean = false,
         /** true = 这一格在播时显示点歌屏（HDMI 采集）窗口；见 applyHdmiVisibility */
-        val hdmi: Boolean = false
+        val hdmi: Boolean = false,
+        /** true = 这一格接受 DMX512 控制。设备端 DMX 接收尚未实现，这里先把设置收下来对齐形状 */
+        val dmx: Boolean = false
     )
 
     /**
@@ -5221,7 +5226,8 @@ class MainActivity : AppCompatActivity() {
             val cell = tbl.optJSONObject(folderId) ?: tbl.optJSONObject(bare) ?: continue
             return PlaySettings(
                 shuffle = cell.optString("order", "seq") == "shuffle",
-                hdmi = cell.optBoolean("hdmi", false)
+                hdmi = cell.optBoolean("hdmi", false),
+                dmx = cell.optBoolean("dmx", false)
             )
         }
         return PlaySettings()
