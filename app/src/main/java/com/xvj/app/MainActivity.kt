@@ -40,7 +40,7 @@
  *   3. sync_room_materials 命令 → requestRoomMaterialSync 按房间去重后进对账：
  *      /api/room-materials-v2/{roomId} 拉全量清单
  *      → 按 Scene A/B 逐文件夹对账（多的删、缺的/变的进下载计划；本地文件在且没有可比对凭据时按字节数跳过，见【size 兜底】）
- *      → runDownloadPlan 串行下载整批计划，按云端下发的字节数刷底部进度条（仅调试模式可见）
+ *      → runDownloadPlan 串行下载整批计划，按云端下发的字节数刷窗口正中的进度条（仅调试模式可见）
  *   4. 播放循环：applySceneConfigs 按 scenes 配置渲染窗口（结构与屏上一致则直接跳过，见幂等闸门）
  *
  * 配置版本对账契约（rev，改同步前必读）：
@@ -59,9 +59,9 @@
  *   - SharedPreferences 持久化，重启后由 loadConfig() 读回并 applyDebugUi() 刷一次
  *   - true 时 logToFile() 通过 xvj/device/{id}/log 上报到 device_logs 表
  *     （唯一例外：action=PREVIEW 的试播日志恒上报 —— 试播本身不挂 debug，设备侧拒绝得有回执）
- *   - true 时整层"运维 UI"可见（applyDebugUi）：左下角 statusText 的状态文字 + 底部 syncProgressBar
- *     下载进度条。关掉后大屏上只剩播放内容，那十几处 statusText 赋值不必各自判 debug——
- *     隐藏容器即可，文字照常更新；现场要排查就开调试
+ *   - true 时整层"运维 UI"可见（applyDebugUi）：**每扇在播窗口正中**一份状态文字 + 素材同步进度条，
+ *     没有窗口时退回整屏居中面板。关掉后大屏上只剩播放内容，那十几处 setStatus 调用不必各自判 debug——
+ *     隐藏面板即可，文字照常更新；现场要排查就开调试
  * 
  * 文件夹级播放设置（scenes[X].play_settings，三端共用一份口径，详见【A-12】）：
  *   - 每格只有 { order }：'seq' 顺序循环 | 'shuffle' 随机循环；全默认的格子云端不落键 —— 落了会让全库 rev 漂移一次，
@@ -139,13 +139,20 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.view.Gravity
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
+import android.util.TypedValue
 import android.net.Uri
 import android.view.Surface
 import android.view.TextureView
@@ -279,6 +286,22 @@ class MainActivity : AppCompatActivity() {
     private var coldStartGateSince = 0L
     /** 冷启动闸门挂着的重试；新配置到来时换掉旧的，保证落地的是最新一份 */
     private var coldStartRetry: Runnable? = null
+
+    // ========== 运维层（状态文字 + 素材同步进度条）==========
+    /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
+    private val STATUS_ACK_MS = 3_500L
+    private val STATUS_TIP_MS = 5_000L
+    /** 当前要显示的运维文案；空 + statusShown=false 时整层不占屏 */
+    private var statusMsg: String = ""
+    private var statusShown = false
+    /** 素材同步进度条：只在 runDownloadPlan 这段期间为 true */
+    private var statusBarOn = false
+    private var statusBarPercent = 0
+    /** 状态代次：每次改写 +1，到点的自动收起只对自己那一代生效（后来的文案不会被旧定时器误收） */
+    private var statusGen = 0
+    /** windowId -> 该窗口正中的那份面板。窗口增删/几何变化时由 refreshWindowStatusOverlays 对齐 */
+    private val windowStatusOverlays = HashMap<String, WindowStatusOverlay>()
+
     // ==============================
     private var mqttClient: MqttClient? = null
     private val mqttHandler = Handler(Looper.getMainLooper())
@@ -861,7 +884,7 @@ class MainActivity : AppCompatActivity() {
 
         Log.d(TAG, "Device ID: $deviceId")
 
-        // 按 prefs 里的 debug_mode 刷一次运维层（启动即决定左下角文字/进度条是否可见）
+        // 按 prefs 里的 debug_mode 刷一次运维层（启动即决定窗口正中的文字/进度条是否可见）
         applyDebugUi()
 
         // 485 墙板是本地硬件链路，离线也要能用：先恢复学习绑定表（不然冷启动按下的第一帧查不到东西），
@@ -885,7 +908,7 @@ class MainActivity : AppCompatActivity() {
         val cached = prefs.getString("scenes_json", null) ?: return
         try {
             applySceneConfigs(org.json.JSONObject(cached))
-            binding.statusText?.text = "离线恢复上次画面"
+            setStatus("离线恢复上次画面（待云端确认）")
             logToFile("冷启动按缓存恢复窗口（待云端确认）", "INFO", "WINDOW", "CONFIG")
         } catch (e: Exception) {
             Log.e(TAG, "冷启动恢复缓存失败: ${e.message}")
@@ -905,20 +928,227 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 按 debug_mode 收放"运维层"= 左下角状态文字（statusText）+ 底部同步进度条（syncProgressBar）。
-     * 设备接投影/大屏，观众看得到画面：调试模式关掉时整层 GONE，
-     * 因此全文那十几处 statusText.text 赋值不必各自判 debug（隐藏容器就够了，文字照常更新）。
-     * 两个视图在 XML 里都默认 gone（安全侧：启动第一帧也不会漏出运维文字），所以这里只管开的一面。
+     * 按 debug_mode 收放"运维层"= 状态文字 + 素材同步进度条。
+     * 有在播窗口时每扇窗正中各一份（windowStatusOverlays），没有窗口时退回 XML 里的整屏居中面板，
+     * 两者不会同时显示。设备接投影/大屏，调试模式关掉时整层 GONE，
+     * 因此全文那十几处 setStatus 调用不必各自判 debug（隐藏面板就够了，文字照常更新）。
      * 任意线程可调（内部 post 到主线程）。
      */
     private fun applyDebugUi() {
-        val debug = prefs.getBoolean("debug_mode", false)
+        mqttHandler.post { applyStatusUi() }
+    }
+
+    /**
+     * 状态文字的唯一写入口（任意线程可调）：msg 上屏，holdMs>0 时到点自动收起。
+     * 成功类回执传 STATUS_ACK_MS / STATUS_TIP_MS；错误与进行中状态不限时，等下一次覆盖 ——
+     * 运维文字现在压在画面正中间，常驻一条"已完成"会一直挡着内容，回执必须会自己走。
+     */
+    private fun setStatus(msg: String, holdMs: Long = 0L) {
         mqttHandler.post {
-            binding.statusText?.let {
-                it.visibility = if (debug) View.VISIBLE else View.GONE
-                if (debug) it.bringToFront()
+            statusMsg = msg
+            statusShown = true
+            renderStatus(holdMs)
+        }
+    }
+
+    /** 素材同步进度（任意线程，仅 debug 模式上屏）：条打开、文字换成"进度 + 文件名" */
+    private fun setSyncProgress(percent: Int, msg: String) {
+        if (!prefs.getBoolean("debug_mode", false)) return
+        mqttHandler.post {
+            statusMsg = msg
+            statusShown = true
+            statusBarOn = true
+            statusBarPercent = percent.coerceIn(0, 100)
+            renderStatus()
+        }
+    }
+
+    /** 收掉进度条；status 非空时同时换文案（holdMs 口径同 setStatus） */
+    private fun stopSyncProgress(status: String? = null, holdMs: Long = 0L) {
+        mqttHandler.post {
+            statusBarOn = false
+            if (status != null) {
+                statusMsg = status
+                statusShown = true
             }
-            if (!debug) binding.syncProgressBar?.visibility = View.GONE
+            renderStatus(holdMs)
+        }
+    }
+
+    /** 主线程：换文案/状态后重绘一次，并按需安排自动收起（只对自己这一代生效） */
+    private fun renderStatus(holdMs: Long = 0L) {
+        statusGen++
+        val gen = statusGen
+        applyStatusUi()
+        if (holdMs > 0) {
+            mqttHandler.postDelayed({
+                if (gen == statusGen) {
+                    statusShown = false
+                    statusBarOn = false
+                    applyStatusUi()
+                }
+            }, holdMs)
+        }
+    }
+
+    /**
+     * 主线程：把当前状态与显隐落到所有面板上。
+     * 窗口面板只在窗口可见时出；一扇都出不来时（还没建窗 / HDMI 全关 / 退出到桌面）退回整屏居中面板。
+     * 每次刷新都 bringToFront：窗口容器是运行期 addView 到同一个根 FrameLayout 的，后加的会盖住面板。
+     */
+    private fun applyStatusUi() {
+        val debug = prefs.getBoolean("debug_mode", false)
+        var anyWindowPanel = false
+        for ((winId, ov) in windowStatusOverlays) {
+            val win = windowViews[winId]
+            val show = debug && statusShown && win != null && win.visibility == View.VISIBLE
+            ov.holder.visibility = if (show) View.VISIBLE else View.GONE
+            if (!show) continue
+            applyStatusContent(ov.text, ov.bar)
+            ov.holder.bringToFront()
+            anyWindowPanel = true
+        }
+
+        val panel = binding.statusPanel ?: return
+        val showFallback = debug && statusShown && !anyWindowPanel
+        panel.visibility = if (showFallback) View.VISIBLE else View.GONE
+        if (!showFallback) return
+        styleFallbackStatusPanel()
+        binding.statusText?.let { applyStatusContent(it, binding.syncProgressBar) }
+        panel.bringToFront()
+    }
+
+    /** 文字与进度条内容（两类面板共用） */
+    private fun applyStatusContent(text: TextView, bar: ProgressBar?) {
+        text.text = statusMsg
+        bar?.let {
+            it.visibility = if (statusBarOn) View.VISIBLE else View.GONE
+            it.progress = statusBarPercent
+        }
+    }
+
+    /** 整屏兜底面板按真实分辨率缩放（8K 盒子上 14sp 在屏心仍太小） */
+    private fun styleFallbackStatusPanel() {
+        val screen = screenPx()
+        val unit = minOf(screen[0], screen[1]).toFloat()
+        val textPx = (unit / 30f).coerceIn(14f, 64f)
+        val tv = binding.statusText ?: return
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, textPx)
+        tv.maxWidth = (screen[0] * 0.8f).toInt().coerceAtLeast(240)
+        tv.setPadding((textPx * 0.9f).toInt(), (textPx * 0.55f).toInt(),
+            (textPx * 0.9f).toInt(), (textPx * 0.55f).toInt())
+        tv.background = GradientDrawable().apply {
+            setColor(0xB3000000.toInt())
+            cornerRadius = textPx * 0.35f
+        }
+        val bar = binding.syncProgressBar ?: return
+        val lp = bar.layoutParams as? LinearLayout.LayoutParams ?: return
+        lp.width = (screen[0] * 0.4f).toInt().coerceIn(240, 1400)
+        lp.height = maxOf(6, (textPx * 0.16f).toInt())
+        lp.topMargin = (textPx * 0.6f).toInt()
+        bar.layoutParams = lp
+    }
+
+    /**
+     * 主线程：让窗口正中面板跟上 windowViews / 窗口几何。
+     * 全量重建、原地改几何、释放窗口之后各调一次；多出来的面板当场摘掉。
+     * 共享解码组成员共用一块容器，几何按成员自己的配置取（windowGeom），不按成员并集。
+     */
+    private fun refreshWindowStatusOverlays() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mqttHandler.post { refreshWindowStatusOverlays() }
+            return
+        }
+        val root = flSurface ?: return
+        for ((winId, ov) in windowStatusOverlays.toList()) {
+            if (!windowViews.containsKey(winId)) {
+                root.removeView(ov.holder)
+                windowStatusOverlays.remove(winId)
+            }
+        }
+        for (winId in windowViews.keys) {
+            val g = overlayGeomOf(winId) ?: continue
+            val ov = windowStatusOverlays.getOrPut(winId) {
+                WindowStatusOverlay().also {
+                    root.addView(it.holder, FrameLayout.LayoutParams(1, 1).apply {
+                        gravity = Gravity.TOP or Gravity.START
+                    })
+                }
+            }
+            val lp = ov.holder.layoutParams as? FrameLayout.LayoutParams
+                ?: FrameLayout.LayoutParams(1, 1).apply { gravity = Gravity.TOP or Gravity.START }
+            lp.leftMargin = g[0]
+            lp.topMargin = g[1]
+            lp.width = g[2].coerceAtLeast(1)
+            lp.height = g[3].coerceAtLeast(1)
+            ov.holder.layoutParams = lp
+            styleWindowStatusOverlay(ov, g[2], g[3])
+        }
+        applyStatusUi()
+    }
+
+    /** 这扇窗当前落屏矩形。共享组成员看自己的配置；其余直接读容器 LayoutParams（三类内容都建了容器） */
+    private fun overlayGeomOf(winId: String): IntArray? {
+        if (windowShareGroup.containsKey(winId)) {
+            val w = videoSurfaces[winId]?.winJson ?: return null
+            return windowGeom(w)
+        }
+        val c = windowViews[winId] as? FrameLayout ?: return null
+        val p = c.layoutParams as? FrameLayout.LayoutParams ?: return null
+        return intArrayOf(p.leftMargin, p.topMargin, p.width, p.height)
+    }
+
+    /** 窗口面板版式按窗口尺寸缩放：全屏大窗与角落小窗用同一套比例 */
+    private fun styleWindowStatusOverlay(ov: WindowStatusOverlay, winW: Int, winH: Int) {
+        val unit = minOf(winW, winH).toFloat()
+        val textPx = (unit / 22f).coerceIn(24f, 200f)
+        val padH = (textPx * 0.8f).toInt()
+        val padV = (textPx * 0.5f).toInt()
+        ov.text.setTextSize(TypedValue.COMPLEX_UNIT_PX, textPx)
+        ov.text.maxWidth = (winW * 0.86f).toInt().coerceAtLeast(120)
+        ov.text.setPadding(padH, padV, padH, padV)
+        ov.text.background = GradientDrawable().apply {
+            setColor(0xB3000000.toInt())
+            cornerRadius = textPx * 0.35f
+        }
+        val barW = (winW * 0.55f).toInt().coerceAtLeast(120)
+        val barH = maxOf(6, (textPx * 0.16f).toInt())
+        ov.bar.layoutParams = LinearLayout.LayoutParams(barW, barH).apply {
+            topMargin = (textPx * 0.55f).toInt()
+        }
+    }
+
+    /** 一扇窗正中的面板：与窗口同矩形的透明 holder，内容在 holder 内居中，不拦触摸 */
+    private inner class WindowStatusOverlay {
+        val holder = FrameLayout(this@MainActivity).apply {
+            isClickable = false
+            isFocusable = false
+        }
+        val panel = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            isClickable = false
+            isFocusable = false
+        }
+        val text = TextView(this@MainActivity).apply {
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            maxLines = 3
+            ellipsize = TextUtils.TruncateAt.END
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            includeFontPadding = false
+        }
+        val bar = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progressTintList = ColorStateList.valueOf(Color.rgb(76, 175, 80))
+            progressBackgroundTintList = ColorStateList.valueOf(0x33FFFFFF)
+        }
+
+        init {
+            panel.addView(text)
+            panel.addView(bar)
+            holder.addView(panel, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         }
     }
 
@@ -1373,7 +1603,7 @@ class MainActivity : AppCompatActivity() {
                         Log.w(TAG, "MQTT Connection Lost: ${cause?.message}")
                         logToFile("MQTT Connection Lost: ${cause?.message}")
                         mqttHandler.post {
-                            binding.statusText?.text = "连接断开,重连中..."
+                            setStatus("云端连接断开，正在重连…")
                         }
                         // P4 fix: 检查是否真的断了，再用退避策略重连
                         if (mqttClient?.isConnected != true) {
@@ -1411,7 +1641,7 @@ class MainActivity : AppCompatActivity() {
                     // 通道一通就先还旧账：上一次是怎么死的，全靠这几行
                     flushPreviousSessionLog()
                     mqttHandler.post {
-                        binding.statusText?.text = "云端已连接"
+                        setStatus("云端已连接", STATUS_ACK_MS)
                     }
                     // P4 fix: 连接成功后执行，不要在闭包外裸调
                     checkForUpdate()
@@ -1426,7 +1656,8 @@ class MainActivity : AppCompatActivity() {
                     // 服务端的 rev 对账也拿不到任何补发机会，界面上只剩一个"离线"。
                     reconnectMQTT()
                     mqttHandler.post {
-                        binding.statusText?.text = "连接失败: ${e.message}"
+                        // 异常原文只进日志（上一行已写）；上屏文案给人看，不贴堆栈/英文
+                        setStatus("云端连接失败，正在重试…")
                     }
                 }
             } catch (e: Exception) {
@@ -1608,7 +1839,7 @@ class MainActivity : AppCompatActivity() {
                     mqttHandler.post {
                         if (authorized) {
                             prefs.edit().putBoolean("last_authorized", true).apply()
-                            binding.statusText?.text = "已授权至房间 $roomId"
+                            setStatus("已授权 · 房间 $roomId", STATUS_ACK_MS)
                             // 停止欢迎视频等旧播放器
                             releasePlayer()
                             // 墙板字段要先于 applySceneConfigs：跟随窗口第一次落屏就要能查学习表，
@@ -1661,7 +1892,7 @@ class MainActivity : AppCompatActivity() {
                             }
                         } else {
                             prefs.edit().putBoolean("last_authorized", false).apply()
-                            binding.statusText?.text = "设备未授权"
+                            setStatus("设备未授权")
                             // 切欢迎视频（playWelcomeVideo 会连旧窗口一起清掉）
                             showUnauthorizedAlert(message)
                         }
@@ -1673,7 +1904,7 @@ class MainActivity : AppCompatActivity() {
                     mqttHandler.post {
                         // 撤掉冷启动缓存的放行标志：下次开机不再拿这份已失效的画面抢先播
                         prefs.edit().putBoolean("last_authorized", false).apply()
-                        binding.statusText?.text = "已废止"
+                        setStatus("设备已被远程废止")
                         showUnauthorizedAlert("设备已被远程废止，请联系管理员")
                     }
                 }
@@ -2133,7 +2364,7 @@ class MainActivity : AppCompatActivity() {
             logToFile("房间 $roomId 同步已在飞，本次指令并入待补跑 (rev=$rev)", "INFO", "SYNC", "SKIP")
             return
         }
-        mqttHandler.post { binding.statusText?.text = "同步房间素材中..." }
+        setStatus("正在核对房间素材…")
         downloadExecutor.submit { runRoomSyncLoop(req) }
     }
 
@@ -2165,7 +2396,7 @@ class MainActivity : AppCompatActivity() {
      * 3) syncSceneFolders("A"/"B") 按 scenes.A/B.folder_mappings 对账：映射有变的下、多的删，
      *    只**收集**待下载任务不真下载；映射真相只在 scenes 里，
      *    folderMappingsFallback 仅给旧服务端兜底，B 幕缺失时按空映射处理。
-     * 4) runDownloadPlan 按字节进度逐个下载（调试模式下底部进度条可见），串行、单线程，
+     * 4) runDownloadPlan 按字节进度逐个下载（调试模式下窗口正中进度条可见），串行、单线程，
      *    回来的是 PlanResult(written, failed)——"下成了几个、没下成几个"，不是"排了几个任务"。
      * 5) 回主线程 applySceneConfigs：优先用本次载荷的 scenes，没有才回落 prefs 缓存；
      *    新素材落格由 applySceneChangesInPlace 逐窗比磁盘清单（playlistStale）原地换清单，
@@ -2186,7 +2417,7 @@ class MainActivity : AppCompatActivity() {
             // 拉取失败返回 null：保持本地现状中止本轮，绝不进入清空分支
             val allMaterials = fetchRoomMaterials(roomId)
             if (allMaterials == null) {
-                hideSyncProgress()   // fetchRoomMaterials 内部已把 statusText 改成失败文案，这里只收条
+                hideSyncProgress()   // fetchRoomMaterials 内部已把状态文字改成失败文案，这里只收条
                 return
             }
 
@@ -2196,7 +2427,9 @@ class MainActivity : AppCompatActivity() {
             if (plan.isEmpty()) logToFile("素材对账完成: 无需下载（映射内素材本地已齐）")
             val res = runDownloadPlan(plan)
             val complete = res.failed == 0
-            hideSyncProgress(if (complete) "素材同步完成" else "素材同步未完成：${res.failed} 个未落地")
+            // 完成是回执，亮一下就走；有失败就常驻到下一次状态覆盖（那才是要人处理的）
+            if (complete) hideSyncProgress("素材同步完成", STATUS_ACK_MS)
+            else hideSyncProgress("素材同步未完成：${res.failed} 个文件未落地")
 
             // 下载过东西不再当成"必须整屏重建"的理由：新素材落进哪一格，applySceneChangesInPlace 就
             // 逐窗比一遍磁盘清单（playlistStale），只给那一格换清单，播放器和 surface 一个都不动。
@@ -2285,44 +2518,29 @@ class MainActivity : AppCompatActivity() {
      *
      * 可见范围 = 仅房间调试模式（prefs.debug_mode）：设备接投影/大屏时观众看得到画面，
      * 常态播放页不该冒出进度条；非调试模式直接 return，只留 logToFile。
-     * 整层运维 UI 的显隐归 applyDebugUi() 管，这里这次判空只是让下载线程不必多绕一趟主线程。
+     * 面板的显隐统一归 applyStatusUi() 管，这里这次判空只是让下载线程不必多绕一趟主线程。
      *
      * 线程：只在 downloadExecutor 线程被调用（开环 0%、256KB 字节回调、每个文件收尾各一次），
-     * 百分比在调用线程算好后连文案一起 post 给 mqttHandler —— 不留任何共享可变状态，
+     * 百分比在调用线程算好后连文案一起 post 给主线程 —— 不留任何共享可变状态，
      * 理论上两轮同步并发时最坏只是显示上互相覆盖一下，不会算错或崩。
      *
-     * bringToFront 是必需的：窗口容器是 applySceneConfigs 之后 addView 到同一个根 FrameLayout 的，
-     * 会盖住 XML 里靠后的 statusText / syncProgressBar。
+     * 文案分两行：上行"同步素材 3/8 · 45%"是远看的那一眼，下行文件名给现场认出卡在哪只。
      */
     private fun updateSyncProgress(doneBytes: Long, totalBytes: Long, totalFiles: Int, taskIndex: Int, filename: String) {
         if (!prefs.getBoolean("debug_mode", false)) return
         val done = doneBytes.coerceAtMost(totalBytes)
         val percent = if (totalBytes <= 0L) 100 else ((done * 100) / totalBytes).toInt().coerceIn(0, 100)
-        val text = "同步素材 ${taskIndex + 1}/$totalFiles · $percent% · $filename"
-        mqttHandler.post {
-            binding.syncProgressBar?.let { bar ->
-                bar.visibility = View.VISIBLE
-                bar.progress = percent
-                bar.bringToFront()
-            }
-            binding.statusText?.let { tv ->
-                tv.text = text
-                tv.bringToFront()
-            }
-        }
+        val text = "同步素材 ${taskIndex + 1}/$totalFiles · $percent%\n$filename"
+        setSyncProgress(percent, text)
     }
 
     /**
-     * 收掉进度条（可选同时改写左下角状态文字）。
-     * syncProgressBar 只有一处显（updateSyncProgress）和两处隐（本函数、applyDebugUi 关调试模式），
-     * 别处不要再直接碰它。
+     * 收掉进度条（可选同时改写状态文字）。
+     * 进度条只有一处开（updateSyncProgress）和两处关（本函数、自动收起的 renderStatus），别处不要再碰它。
      * 不带 status 时只收条不动文字（失败文案已由 fetchRoomMaterials 等处自己写好）。
      */
-    private fun hideSyncProgress(status: String? = null) {
-        mqttHandler.post {
-            binding.syncProgressBar?.visibility = View.GONE
-            if (status != null) binding.statusText?.text = status
-        }
+    private fun hideSyncProgress(status: String? = null, holdMs: Long = 0L) {
+        stopSyncProgress(status, holdMs)
     }
 
     /**
@@ -2352,7 +2570,7 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "获取房间素材失败: " + e.message)
             logToFile("获取房间素材失败，中止本轮同步保持本地现状: " + e.message, "ERROR", "SYNC", "ERROR")
-            mqttHandler.post { binding.statusText?.text = "素材同步失败（云端不可达）" }
+            setStatus("素材同步失败：云端不可达")
             null
         }
     }
@@ -2638,11 +2856,11 @@ class MainActivity : AppCompatActivity() {
     // player 是"单播放器"残留链路：只有未授权时的欢迎视频（showUnauthorizedAlert → playWelcomeVideo）
     // 和 config 命令的 loop 开关会碰它；窗口播放全部走 windowPlayers，两套播放器互不影响。
 
-    /** 停掉单播放器并释放；不清 statusText 以外的状态，也不动窗口播放器 */
+    /** 停掉单播放器并释放；只改运维文案，也不动窗口播放器 */
     private fun stopPlayback() {
         Log.d(TAG, "stopPlayback called")
         releasePlayer()
-        binding.statusText?.text = "播放已停止"
+        setStatus("播放已停止", STATUS_ACK_MS)
     }
 
     /** 释放单播放器并从 playerView 上摘下来（可重复调用） */
@@ -3831,6 +4049,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
         applyHdmiVisibility(scenes, planFolders)
+        // 窗口齐了才给每扇窗放运维面板；放完 applyStatusUi 会把当前文案落到新面板上
+        refreshWindowStatusOverlays()
         appliedScenes = scenes
         appliedScenesFp = fp
         appliedPlaySettingsJson = playSettingsJson(scenes)
@@ -4157,6 +4377,8 @@ class MainActivity : AppCompatActivity() {
         }
         // 共享解码组按全组最新几何重排画面（并集矩形 + 每扇窗自己的矩形）
         for (fk in shareGroups.keys.toList()) refreshShareGroup(fk)
+        // 窗口几何变了，窗口正中的运维面板跟着挪
+        refreshWindowStatusOverlays()
         // 屏上现在就是这份配置了：指纹跟着走，否则下一轮素材对账收尾会白重建一次、视频重头播
         appliedScenes = scenes
         appliedScenesFp = scenesFingerprint(scenes)
@@ -4186,6 +4408,8 @@ class MainActivity : AppCompatActivity() {
             logToFile("点歌屏：在播文件夹 ${active.joinToString("、").ifEmpty { "无" }} → " +
                 (if (show) "显示" else "关闭") + "窗口 $winId", "INFO", "WINDOW", "HDMI")
         }
+        // 被关掉的那扇窗，窗口正中的运维面板要一起跟着藏起来
+        applyStatusUi()
     }
 
     /** 创建单个窗口视图并加入 flSurface */
@@ -4579,6 +4803,9 @@ class MainActivity : AppCompatActivity() {
         var attached: Surface? = null
         textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                // 隐藏再显示的同一块窗会重建 Surface：destroy 时摘掉的标签登记要补回来，
+                // 否则 refreshHdmiLabels 看不到它，占位字会一直压在画面上不更新
+                hdmiLabels[winId] = label
                 // 这块 Surface 是 GL 的渲染目标，缓冲尺寸跟视图走；采集源尺寸由 HdmiGl 自己那块 SurfaceTexture 管
                 if (width > 0 && height > 0) st.setDefaultBufferSize(width, height)
                 val surf = Surface(st)
@@ -5049,27 +5276,27 @@ class MainActivity : AppCompatActivity() {
             // 退出时窗口全放了，previewTarget 本来也认不出目标，但那条日志会写成"这一格没有窗口在播"，
             // 现场据此去查配置就白跑一趟 —— 这里先把真话说出来。
             logToFile("试播拒绝：设备已退出到桌面", "WARN", "PLAYBACK", "DESKTOP")
-            previewStatusText("试播已拒绝：设备已退出到桌面")
+            previewStatusText("试播已拒绝：设备已退出到桌面", STATUS_TIP_MS)
             return
         }
         // 素材同步在飞时不插队：那一轮正在按清单增删这个目录里的文件，而且它收尾必定 apply 一次场景配置，
         // 真播了也马上会被 abortAllPreviews 抹掉 —— 白费一次解码，还白闪一下屏。整格判一次。
         if (synchronized(syncLock) { syncInFlight.isNotEmpty() }) {
             logToFile("试播拒绝：素材同步进行中，稍后再点一次", "WARN", "PLAYBACK", "PREVIEW")
-            previewStatusText("试播已拒绝：素材同步中")
+            previewStatusText("试播已拒绝：素材同步中", STATUS_TIP_MS)
             return
         }
         // 定位与同步/删除同一个入口：folderId 带幕前缀（"A01"），filename 就是清单里那个落盘名
         val file = materialDirOf(folderId)?.let { materialFileOf(it, filename) }
         if (file == null || !file.exists()) {
             logToFile("试播失败：本机没有 $folderId/$filename（这只素材还没到位，先去同步）", "WARN", "PLAYBACK", "PREVIEW")
-            previewStatusText("试播失败：本机没有这只素材")
+            previewStatusText("试播失败：本机没有这只素材", STATUS_TIP_MS)
             return
         }
         val winId = previewTarget(folderId, winIds)
         if (winId == null) {
             logToFile("试播失败：没有窗口在播 $folderId（配置刚改过？先同步一次）", "WARN", "PLAYBACK", "PREVIEW")
-            previewStatusText("试播失败：这一格没有窗口在播")
+            previewStatusText("试播失败：这一格没有窗口在播", STATUS_TIP_MS)
             return
         }
         // 换一格试播 = 上一格先正常收尾（回到它自己的正片），不是留着试播画面不管
@@ -5078,7 +5305,7 @@ class MainActivity : AppCompatActivity() {
         // 共享解码的组里只有基准那一路在 previews 记账，但它一带 N 扇窗：日志与状态文字报真实扇数
         val panels = winShareGroup[winId]?.members?.size ?: 1
         logToFile("试播接管: $folderId/$filename → $panels 扇窗同步", "INFO", "PLAYBACK", "PREVIEW")
-        previewStatusText("试播中: $filename（$panels 扇窗同步）")
+        previewStatusText("试播中：$filename · $panels 扇窗同步")
     }
 
     /**
@@ -5248,7 +5475,7 @@ class MainActivity : AppCompatActivity() {
             (if (st.items.isEmpty()) "（这一格无素材可播）"
              else "第 ${st.itemIndex + 1}/${st.items.size} 只 @${st.positionMs}ms") +
             " → 基准窗 ${st.winId}", "INFO", "PLAYBACK", "PREVIEW")
-        previewStatusText("试播结束，$panels 扇窗已回到正片")
+        previewStatusText("试播结束 · $panels 扇窗已回到正片", STATUS_ACK_MS)
     }
 
     /**
@@ -5264,9 +5491,9 @@ class MainActivity : AppCompatActivity() {
         logToFile("试播让路：$reason（收回 $n 格）", "INFO", "PLAYBACK", "PREVIEW")
     }
 
-    /** 试播的可见回执：debug 开着时大屏左下角就是这行字（运维层的显示闸门统一在 applyDebugUi） */
-    private fun previewStatusText(msg: String) {
-        binding.statusText?.text = msg
+    /** 试播的可见回执：debug 开着时每扇窗正中就是这行字（面板显隐统一在 applyStatusUi） */
+    private fun previewStatusText(msg: String, holdMs: Long = 0L) {
+        setStatus(msg, holdMs)
     }
 
     // 【A-08】 窗口释放
@@ -5287,6 +5514,8 @@ class MainActivity : AppCompatActivity() {
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
         windowContentSigs.clear()
+        // 窗口没了，窗口正中那些面板一并摘掉；状态文字退回整屏居中面板（退出到桌面时就是它）
+        refreshWindowStatusOverlays()
         // 屏上已经没有窗口了，"已应用配置"的指纹必须一起作废：
         // 否则下次拿同一份 scenes 来 apply 会被幂等闸门挡掉，画面停在欢迎视频上不去
         appliedScenesFp = null
@@ -5427,7 +5656,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 logToFile("退出到桌面（$reason）：画面已交还给 $desk，进程与 MQTT 保持", "INFO", "WINDOW", "DESKTOP")
             }
-            binding.statusText?.text = "已退出到桌面：管理台点「唤回画面」或按 HOME 键回来"
+            setStatus("已退出到桌面 · 管理台点「唤回画面」或按 HOME 键回来")
             return
         }
         hideBlackout()

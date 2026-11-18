@@ -29,11 +29,12 @@ import java.io.File
  * 裸 NV12（/dev/video20）也不走：相机 HAL 已做好格式与节奏转换，TextureView 还能直接套窗口的
  * 取景/旋转/镜像矩阵（applyWindowTransform）。
  *
- * 帧率：HAL 的帧率上限来自 /vendor/etc/external_camera_config.xml 的 FpsList，台架那版把
- * 3840×2160 写在 25（1920×1080 写 30、bind-mount 的 fpsBound=60 版给到 60）。源信号是 4K60，
- * v4l2 直读 4K 实测 ~56fps（含拷贝开销），所以这里请求 4K30：静态元数据上报的 [15,30] 本来
- * 就覆盖它，不依赖任何 bind-mount。请求里显式写 AE_TARGET_FPS_RANGE 让 HAL 按 30 出流。
- * 若固件拒绝这个范围，回退一次不带帧率范围的请求。
+ * 帧率：HAL 对外的帧率声明来自 /vendor/etc/external_camera_config.xml 的 FpsList（台架那版
+ * 3840×2160 写 25、1920×1080 写 30），静态元数据里能查到的最高档也只有 30，但实测这版 HAL
+ * 并没有按声明限流：请求 [30,30] 仍按源信号出 ~59.7fps。要求是采集也保持 4K60，所以这里不写死
+ * 帧率，而是请求相机声明的最高一档；声明本身也要在固件里改成 60（台架已覆盖到 /vendor 的
+ * overlay 层、断电不丢，量产要烘进固件），否则换一版严格按声明执行的 HAL 会回落到 25/30。
+ * 若 HAL 拒绝这个范围，回退一次不带帧率范围的请求。
  *
  * 线程：Surface 台账、相机会话、EGL/SurfaceTexture 都在相机线程上；attach/detach/shutdown
  * 从主线程投递。场景重建会连着一串 attach/detach，重开统一去抖成一次。
@@ -44,8 +45,8 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         /** 采集分辨率：4K（HAL 支持的 3840×2160 档），TextureView 侧要按同一尺寸设默认缓冲 */
         const val W = 3840
         const val H = 2160
-        /** 期望出流帧率：源 4K60，4K30 在 HAL 元数据 [15,30] 之内，不依赖 bind-mount */
-        private val FPS_RANGE = Range(30, 30)
+        /** 帧率告警的默认目标（HAL 没报可用范围时的兜底口径） */
+        private const val DEFAULT_TARGET_FPS = 60
         private const val RETRY_MS = 10_000L
         private const val OPEN_TIMEOUT_MS = 8_000L
         /** 重建窗口时 attach/detach 会连成一串，攒一小会儿再重开 */
@@ -92,6 +93,8 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
     private var fpsWarnedAt = 0L
     /** 本进程内还值不值得请求 60fps（固件整帧拒绝后就不试了） */
     private var fpsAllowed = true
+    /** 本次开的相机所声明的最高帧率范围（restartLocked 里按相机能力取，null = 不指定） */
+    private var fpsRange: Range<Int>? = null
     /** 出帧失败日志的冷却时间 */
     private var failLoggedAt = 0L
 
@@ -183,6 +186,8 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
             return
         }
         val gen = generation
+        // 帧率不写死：取这台相机声明的最高档（有 60 就上 60），声明本身靠固件改成 4K60
+        fpsRange = pickMaxFpsRange(id)
         openTargets = targets
         opening = true
         reopenAfterOpen = false
@@ -199,7 +204,7 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
                     }
                     if (surfaces.isEmpty()) { cam.close(); return }
                     device = cam
-                    startSessionLocked(cam, openTargets, gen, withFps = fpsAllowed)
+                    startSessionLocked(cam, openTargets, gen, withFps = fpsAllowed && fpsRange != null)
                 }
 
                 override fun onDisconnected(cam: CameraDevice) {
@@ -253,12 +258,14 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
 
     @Suppress("DEPRECATION")
     private fun startSessionLocked(cam: CameraDevice, targets: List<Surface>, gen: Int, withFps: Boolean) {
+        val reqFps = if (withFps) fpsRange else null
+        val fpsLabel = reqFps?.upper ?: DEFAULT_TARGET_FPS
         val request = try {
             cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 targets.forEach { addTarget(it) }
-                if (withFps) {
+                if (reqFps != null) {
                     try {
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, FPS_RANGE)
+                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, reqFps)
                     } catch (e: Exception) {
                         log("HDMI 输入：帧率范围不被接受，退回默认帧率请求", "WARN")
                     }
@@ -285,9 +292,9 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
                                 if (gen != generation) return
                                 // 请求的帧率超出固件声明的可用范围时，相机服务会整帧拒绝：
                                 // 还没出过帧就退回默认帧率重开，本进程内不再尝试
-                                if (withFps && frames == 0L && failure.reason == CaptureFailure.REASON_ERROR) {
+                                if (reqFps != null && frames == 0L && failure.reason == CaptureFailure.REASON_ERROR) {
                                     fpsAllowed = false
-                                    log("HDMI 输入：固件不接受 ${FPS_RANGE.upper}fps 请求，改回默认帧率重开", "WARN")
+                                    log("HDMI 输入：固件不接受 ${fpsLabel}fps 请求，改回默认帧率重开", "WARN")
                                     closeLocked()
                                     restartLocked()
                                 } else {
@@ -302,12 +309,12 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
                         frames = 0
                         fpsSince = SystemClock.elapsedRealtime()
                         fpsLogged = false
-                        log("HDMI 输入：出流 ${W}x$H（${surfaces.size} 扇窗，请求 ${if (withFps) "${FPS_RANGE.upper}" else "默认"}fps）", "INFO")
+                        log("HDMI 输入：出流 ${W}x$H（${surfaces.size} 扇窗，请求 ${if (reqFps != null) "${fpsLabel}" else "默认"}fps）", "INFO")
                         setStreaming(true)
                     } catch (e: Exception) {
-                        if (withFps) {
+                        if (reqFps != null) {
                             fpsAllowed = false
-                            log("HDMI 输入：${FPS_RANGE.upper}fps 请求被拒（${e.message}），退回默认帧率", "WARN")
+                            log("HDMI 输入：${fpsLabel}fps 请求被拒（${e.message}），退回默认帧率", "WARN")
                             s.close()
                             session = null
                             startSessionLocked(cam, targets, gen, withFps = false)
@@ -340,8 +347,8 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         val now = SystemClock.elapsedRealtime()
         if (now - fpsSince < FPS_SAMPLE_MS) return
         val fps = frames * 1000f / (now - fpsSince)
-        // 低于目标帧率 20% 才算异常：4K30 的目标不是 60，别拿固定 45 误报
-        val low = fps < FPS_RANGE.upper * 0.8f
+        // 低于目标帧率 20% 才算异常：目标可能是 25/30/60，别拿固定 45 误报
+        val low = fps < (fpsRange?.upper ?: DEFAULT_TARGET_FPS) * 0.8f
         if (!fpsLogged || (low && now - fpsWarnedAt >= FPS_WARN_INTERVAL_MS)) {
             log("HDMI 输入：实际出帧 %.1f FPS".format(fps), if (low) "WARN" else "INFO")
             fpsLogged = true
@@ -387,6 +394,18 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         // 固件没按契约报 EXTERNAL 也要能用：hdmirx 节点在、只此一台相机，就是这口
         if (ids.size == 1 && File("/sys/class/hdmirx/hdmirx/status").exists()) return ids[0]
         return null
+    }
+
+    /**
+     * 相机声明的帧率范围里取上限最高的一档（同上限取下限高的）。
+     * 台架这版 HAL 静态元数据最高只写 30，固件把声明改成 60 之后会自动跟着变。
+     */
+    private fun pickMaxFpsRange(id: String): Range<Int>? = try {
+        manager.getCameraCharacteristics(id)
+            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.maxWithOrNull(compareBy({ it.upper }, { it.lower }))
+    } catch (e: Exception) {
+        null
     }
 
     private fun setStreaming(v: Boolean) {

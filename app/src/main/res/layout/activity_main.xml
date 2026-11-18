@@ -15,39 +15,45 @@
         android:background="@android:color/black"
         app:use_controller="false" />
 
-    <!-- 运维层·左下角状态文字：默认 gone（安全侧）。真正的开关在 MainActivity.applyDebugUi()——
-         房间调试模式（prefs.debug_mode）开着才 VISIBLE。
-         这里写死 gone 是为了关掉调试的设备连启动的第一帧都不会把「初始化中...」画到投影上：
-         onCreate 里 setContentView 之后主线程消息队列已有 Choreographer 同步屏障，
-         loadConfig() 那次 post 会排在首次遍历之后，靠代码收会有极短暂的一帧泄漏。 -->
-    <TextView
-        android:id="@+id/statusText"
+    <!-- 运维层兜底面板（整屏正中）：只在屏上没有任何在播窗口时显示（启动、欢迎视频、
+         退出到桌面退化黑屏）。有窗口时由 MainActivity 在**每扇窗正中**各放一份同样的面板，
+         这个 XML 面板就让位（见 refreshWindowStatusOverlays / applyStatusUi）。
+         默认 gone 是安全侧：关掉调试的设备连启动第一帧都不会把运维文字画到投影上。
+         显隐只由 applyStatusUi() 按 prefs.debug_mode + 当前状态决定。 -->
+    <LinearLayout
+        android:id="@+id/statusPanel"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom|start"
-        android:layout_marginStart="20dp"
-        android:layout_marginBottom="56dp"
-        android:background="#80000000"
-        android:padding="10dp"
-        android:text="初始化中..."
-        android:textColor="#FFFFFF"
-        android:textSize="14sp"
-        android:visibility="gone" />
+        android:layout_gravity="center"
+        android:gravity="center_horizontal"
+        android:orientation="vertical"
+        android:visibility="gone">
 
-    <!-- 素材下载进度条：只在房间调试模式（prefs.debug_mode）下由 updateSyncProgress 置 VISIBLE，
-         非调试模式常态播放不给观众看到进度。轨道压成半透明灰，只让绿色填充显眼。
-         注意：窗口容器是运行期 addView 到本 FrameLayout 的，会盖住这里靠后的视图，
-         所以上屏时必须 bringToFront()（见 MainActivity.updateSyncProgress）。 -->
-    <ProgressBar
-        android:id="@+id/syncProgressBar"
-        style="@android:style/Widget.ProgressBar.Horizontal"
-        android:layout_width="match_parent"
-        android:layout_height="8dp"
-        android:layout_gravity="bottom"
-        android:max="100"
-        android:progress="0"
-        android:progressTint="#4CAF50"
-        android:progressBackgroundTint="#33FFFFFF"
-        android:visibility="gone" />
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="#B3000000"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="3"
+            android:padding="14dp"
+            android:text="初始化中…"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
+
+        <!-- 素材同步进度条：轨道半透明灰，只让绿色填充显眼；宽度由代码按屏宽缩放 -->
+        <ProgressBar
+            android:id="@+id/syncProgressBar"
+            style="@android:style/Widget.ProgressBar.Horizontal"
+            android:layout_width="360dp"
+            android:layout_height="8dp"
+            android:layout_marginTop="10dp"
+            android:max="100"
+            android:progress="0"
+            android:progressTint="#4CAF50"
+            android:progressBackgroundTint="#33FFFFFF"
+            android:visibility="gone" />
+    </LinearLayout>
 
 </FrameLayout>
