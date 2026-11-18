@@ -1089,7 +1089,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 这扇窗当前落屏矩形。共享组成员看自己的配置；其余直接读容器 LayoutParams（三类内容都建了容器） */
     private fun overlayGeomOf(winId: String): IntArray? {
-        if (windowShareGroup.containsKey(winId)) {
+        if (winShareGroup.containsKey(winId)) {
             val w = videoSurfaces[winId]?.winJson ?: return null
             return windowGeom(w)
         }
