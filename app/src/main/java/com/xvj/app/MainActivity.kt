@@ -4165,8 +4165,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 点歌屏（HDMI 采集）窗口的显隐：看屏上此刻在播哪几格，任一格开着就显示（A/B 两幕同格驱动，
+     * 点歌屏（HDMI 采集）窗口的显隐：看屏上此刻在播哪几格，任一格开着才显示（A/B 两幕同格驱动，
      * 正常配置下不会分歧；真分歧时以开为准 —— 点歌画面宁可多露也不该在点歌时黑掉）。
+     * 每格默认关（2026-11-18 用户定调），不配置的房间点歌屏窗口不显示。
      * 关闭 = 整扇窗 GONE：TextureView 不可见时会销毁自己那块 Surface，采集侧收到 detach，
      * 最后一路也卸完 HdmiCapture 就关相机，4K 采集的算力和带宽一起停；再打开时走原有 attach 链重开。
      * 没有任何视频窗在播（纯色/HDMI 房间）时按默认显示：这时没有格子能表达"关"。
@@ -4947,11 +4948,11 @@ class MainActivity : AppCompatActivity() {
     // 留下来的那件事：顺序与随机 —— 清单按格缓存（folderPlaylists），随机只洗一次，
     // 同一格不管重建几次拿到的都是同一份次序。
 
-    /** 一格的播放设置；全默认 = 顺序循环 + 点歌屏开（与云端 playSettingsValue 的"默认不落键"同口径） */
+    /** 一格的播放设置；全默认 = 顺序循环 + 点歌屏关（与云端 playSettingsValue 的"默认不落键"同口径） */
     private class PlaySettings(
         val shuffle: Boolean = false,
-        /** false = 这一格在播时关掉所有点歌屏（HDMI 采集）窗口；见 applyHdmiVisibility */
-        val hdmi: Boolean = true
+        /** true = 这一格在播时显示点歌屏（HDMI 采集）窗口；见 applyHdmiVisibility */
+        val hdmi: Boolean = false
     )
 
     /**
@@ -4985,7 +4986,7 @@ class MainActivity : AppCompatActivity() {
             val cell = tbl.optJSONObject(folderId) ?: tbl.optJSONObject(bare) ?: continue
             return PlaySettings(
                 shuffle = cell.optString("order", "seq") == "shuffle",
-                hdmi = cell.optBoolean("hdmi", true)
+                hdmi = cell.optBoolean("hdmi", false)
             )
         }
         return PlaySettings()
