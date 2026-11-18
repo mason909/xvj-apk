@@ -1485,6 +1485,8 @@ class MainActivity : AppCompatActivity() {
      *   frames  = 最近 1 分钟内收到的 485 帧指纹（[{hex,n,age}]，最多 8 种）；一段都没收到就不带这个字段，
      *              服务端据此清掉这台机的显示值。后台拿它判"分帧对不对"和学习模式的候选帧，
      *              所以它是瞬时状态：只进内存台账，不进 rev，也不进库。
+     *   secondary_display = 副屏（1080/eDP）此刻通着没有（读 DRM 连接器 status，以文件为准）；
+     *              本机没有这条显示链时整个字段不带，服务端按"不支持"处理，管理台开关显示未知。
      * 服务端把 status 落到 devices.status、整段原文存 devices.status_data（该列没有读侧），
      * 并因带了 version/version_code 而 UPSERT device_versions —— 后台"版本管理"页看的正是这张表。
      * 未授权设备同样在上报，服务端不区分；心跳本身 30s 一次，不写 operation_logs。
@@ -1507,6 +1509,8 @@ class MainActivity : AppCompatActivity() {
                 val screen = screenPx()
                 put("screen_w", screen[0])
                 put("screen_h", screen[1])
+                // 副屏（1080/eDP）此刻通着没有。文件不存在 = 本机没有这条显示链，整个字段不带。
+                readSecondaryDisplayOn()?.let { put("secondary_display", it) }
                 // 台账为空（这一分钟没帧）就整段不带：服务端把"没带"当清掉显示值，留着上一轮的旧帧反而误导
                 val frames = frameLedger.toJson(SystemClock.elapsedRealtime())
                 if (frames.length() > 0) put("frames", frames)
@@ -1782,6 +1786,8 @@ class MainActivity : AppCompatActivity() {
      *   exit_desktop        退出到桌面：释放画面并把原厂桌面顶到身前，进程/MQTT 全活着（与 stop 的差别见【A-15】）
      *   reopen_desktop      唤回画面：root 把自己顶回前台，回到前台那次按 prefs 的 scenes_json 重建
      *   reboot              远程重启整台设备（管理台设备卡「重启设备」；root reboot，无 root 只记日志）
+     *   secondary_display   开关 1080/eDP 副屏（管理台设备卡「副屏」；root 写 DRM 连接器，无 root 只记日志，
+     *                       实际状态由心跳 secondary_display 回传，见【A-18】）
      *   config              改 mqtt_server / loop（只影响单播放器 player，不影响窗口播放器）
      *   sync_room_materials 房间素材全量对账（服务端【S-07】/授权链路发出）
      *   update_windows      轻量窗口重排，不下素材（编辑器 live 实时预览）
@@ -1857,6 +1863,16 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         shotExecutor.execute { captureAndUploadScreenshot(uploadUrl, shotToken) }
                     }
+                }
+                // 副屏开关（管理台设备卡「副屏」）：1080/eDP 那条显示链开机默认关（vendor init rc），
+                // 这里只做运行时切换。和 reboot 一样要 root，无 root 只记一行拒绝。
+                // 执行完补一跳心跳：开关是"点了立刻想看到结果"的动作，不该等下一个 30 秒周期。
+                "secondary_display" -> {
+                    val on = cmd.optBoolean("on", false)
+                    logToFile("副屏开关：${if (on) "开启" else "关闭"} 1080/eDP 显示链", "INFO", "MQTT", "DISPLAY")
+                    Thread {
+                        if (applySecondaryDisplay(on)) mqttHandler.post { sendStatus("online") }
+                    }.start()
                 }
                 "config" -> {
                     // 更新配置
@@ -3463,6 +3479,49 @@ class MainActivity : AppCompatActivity() {
         return Pair(code, out.toString().trim())
     }
 
+    // ========== 【A-18】副屏（1080/eDP）运行时开关 ==========
+    /**
+     * 副屏（1080/eDP）此刻是否通着。读 DRM 连接器的 status 文件，不靠内存记账 ——
+     * 写 off 之后内核会立刻改成 disconnected，以文件为准才反映真实链路。
+     * @return true/false；本机没有这条显示链（文件不存在）或读失败时 null（心跳就不带这个字段）
+     */
+    private fun readSecondaryDisplayOn(): Boolean? {
+        return try {
+            val f = File("/sys/class/drm/card0-eDP-1/status")
+            if (f.exists()) f.readText().trim() == "connected" else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 写 DRM 连接器状态来开关副屏。写 status 只改内核侧连接状态，
+     * 再写 uevent change 才会让 HWC/DisplayManager 重新探一次；台架实测 on 约 4 秒多出一块
+     * 1920×1080 扩展屏、off 约 10 秒收回（sysfs 读数立即翻转，显示解绑是异步的）。
+     * 与 reboot 共用 su 通道：量产 user 版没有 su 时只记一行拒绝，不弹授权框吊住线程。
+     * @return 命令是否执行成功（不代表显示已完全切换，实际状态以心跳读数与 dumpsys 为准）
+     */
+    private fun applySecondaryDisplay(on: Boolean): Boolean {
+        if (!File("/sys/class/drm/card0-eDP-1/status").exists()) {
+            logToFile("副屏开关放弃：本机没有 /sys/class/drm/card0-eDP-1（没有 1080/eDP 显示链）",
+                "WARN", "MQTT", "DISPLAY")
+            return false
+        }
+        if (!silentInstallReady()) {
+            logToFile("副屏开关放弃：本机没有 root，写不了 DRM 状态（量产机需系统签名或厂商特权接口）",
+                "WARN", "MQTT", "DISPLAY")
+            return false
+        }
+        val state = if (on) "on" else "off"
+        val r = execAsRoot(
+            "echo $state > /sys/class/drm/card0-eDP-1/status && echo change > /sys/class/drm/card0-eDP-1/uevent",
+            8000)
+        val ok = r.first == 0
+        logToFile("副屏开关：写入 $state ${if (ok) "成功" else "失败(code=${r.first})"}: ${r.second}",
+            if (ok) "INFO" else "ERROR", "MQTT", "DISPLAY")
+        return ok
+    }
+
     // ========== 【A-16】实时截图（云端【S-15】的设备侧） ==========
     // 一帧当前落屏画面 → JPEG → POST 回服务端。为什么走 root screencap 而不是 MediaProjection：
     // 后者要点授权框，无人值守的包厢机器弹不出来也没人点；screencap 和静默安装共用同一个 root 前提
@@ -4487,8 +4546,8 @@ class MainActivity : AppCompatActivity() {
         var attached: Surface? = null
         textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-                // 采集流尺寸以 SurfaceTexture 默认缓冲为准（必须落在相机 HAL 支持的档位里）
-                st.setDefaultBufferSize(HdmiCapture.W, HdmiCapture.H)
+                // 这块 Surface 是 GL 的渲染目标，缓冲尺寸跟视图走；采集源尺寸由 HdmiGl 自己那块 SurfaceTexture 管
+                if (width > 0 && height > 0) st.setDefaultBufferSize(width, height)
                 val surf = Surface(st)
                 attached = surf
                 hdmi().attach(winId, surf)
@@ -4496,7 +4555,10 @@ class MainActivity : AppCompatActivity() {
                 refreshHdmiLabels()
             }
 
-            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                // 编辑器里拉伸窗口：渲染目标缓冲必须跟着变，否则 GL 只画出旧尺寸一块
+                if (width > 0 && height > 0) st.setDefaultBufferSize(width, height)
+            }
 
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
                 attached?.let { hdmiCapture?.detach(winId, it) }

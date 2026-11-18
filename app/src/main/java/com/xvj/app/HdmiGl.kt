@@ -84,7 +84,7 @@ class HdmiGlRenderer(private val log: (msg: String, level: String) -> Unit) {
 
     private var ready = false
 
-    private class Win(val surface: Surface) {
+    private class Win(val id: String, val surface: Surface) {
         var egl: EGLSurface = EGL14.EGL_NO_SURFACE
         var w = 0
         var h = 0
@@ -93,6 +93,9 @@ class HdmiGlRenderer(private val log: (msg: String, level: String) -> Unit) {
 
     /** winId → 窗口。EGLSurface 在第一次画到它时才建（省掉空窗的缓冲） */
     private val wins = LinkedHashMap<String, Win>()
+
+    /** eglQuerySurface 的取值暂存：每帧都要查，别每帧新建数组 */
+    private val qv = IntArray(1)
 
     /** 初始化 EGL 与相机输出 SurfaceTexture；成功一次后不再重建 */
     fun start(): Boolean {
@@ -161,7 +164,7 @@ class HdmiGlRenderer(private val log: (msg: String, level: String) -> Unit) {
     fun attachWindow(winId: String, surface: Surface) {
         val old = wins[winId]
         if (old != null && old.surface === surface) return // 同一块重复接入：保留已建的 EGLSurface
-        wins[winId] = Win(surface)
+        wins[winId] = Win(winId, surface)
         if (old != null) destroyWindow(old)
     }
 
@@ -202,15 +205,19 @@ class HdmiGlRenderer(private val log: (msg: String, level: String) -> Unit) {
                 return
             }
             w.egl = created
-            val v = IntArray(1)
-            EGL14.eglQuerySurface(dpy, w.egl, EGL14.EGL_WIDTH, v, 0)
-            w.w = v[0]
-            EGL14.eglQuerySurface(dpy, w.egl, EGL14.EGL_HEIGHT, v, 0)
-            w.h = v[0]
         }
+        // 每帧重查：编辑器里拉伸窗口后 BufferQueue 换了尺寸，viewport 不跟就会只画在左下角一块
+        val nw = queryDim(w, EGL14.EGL_WIDTH)
+        val nh = queryDim(w, EGL14.EGL_HEIGHT)
+        if (nw > 0 && nh > 0 && (nw != w.w || nh != w.h)) {
+            if (w.w > 0) log("HDMI 输入：${w.id} 尺寸 ${w.w}x${w.h} → ${nw}x${nh}", "INFO")
+            w.w = nw
+            w.h = nh
+        }
+        if (w.w <= 0 || w.h <= 0) return
         if (!EGL14.eglMakeCurrent(dpy, w.egl, w.egl, ctx)) {
+            // 尺寸换档后旧 surface 可能整块作废：丢掉让下一帧按新尺寸重建，别把窗口判死
             destroyWindow(w)
-            w.failed = true
             return
         }
         // 不等垂直同步：多窗时跟不上就丢帧，别把采集队列越积越久
@@ -232,7 +239,18 @@ class HdmiGlRenderer(private val log: (msg: String, level: String) -> Unit) {
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(aPos)
         GLES20.glDisableVertexAttribArray(aTex)
-        EGL14.eglSwapBuffers(dpy, w.egl)
+        if (!EGL14.eglSwapBuffers(dpy, w.egl)) {
+            // 新尺寸的缓冲被旧 surface 拒收时同样重建
+            destroyWindow(w)
+        }
+    }
+
+    private fun queryDim(w: Win, what: Int): Int {
+        return try {
+            if (EGL14.eglQuerySurface(dpy, w.egl, what, qv, 0)) qv[0] else 0
+        } catch (e: Exception) {
+            0
+        }
     }
 
     private fun destroyWindow(w: Win) {
