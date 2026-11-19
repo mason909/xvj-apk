@@ -4758,28 +4758,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 点歌屏（HDMI 采集）窗口的显隐：看给定的在播格，任一格开着才显示。
-     * 配置落地时给的是屏上全部在播格（A/B 分歧以开为准 —— 点歌画面宁可多露也不该黑掉）；
-     * 墙板/DMX 触发时只给这次真落到的格：某一幕没这一格素材就保持原画面，不参与判定
-     * （老板 2026-11-19 定调"没素材不切就行"）。
+     * 点歌屏（HDMI 采集）窗口的显隐：看给定的在播格的「点歌屏模式」，只显示同一模式的那套点歌窗。
+     * 模式 0=关、1~3=模式N（窗口配置里内容属性 content.mode 选的，缺省 1）。
+     * 多格同时在播各选了不同模式时取最大那个（A/B 分歧、多点歌屏宁可按大的那套出，不黑屏）；
+     * 配置落地时给的是屏上全部在播格；墙板/DMX 触发时只给这次真落到的格：某一幕没这一格素材就保持原画面，
+     * 不参与判定（老板 2026-11-19 定调"没素材不切就行"）。
      * 每格默认关（2026-11-18 用户定调），不配置的房间点歌屏窗口不显示。
      * 关闭 = 整扇窗 GONE：TextureView 不可见时会销毁自己那块 Surface，采集侧收到 detach，
      * 最后一路也卸完 HdmiCapture 就关相机，4K 采集的算力和带宽一起停；再打开时走原有 attach 链重开。
-     * 没有任何视频窗在播（纯色/HDMI 房间）时按默认显示：这时没有格子能表达"关"。
+     * 没有任何视频窗在播（纯色/HDMI 房间）时按默认显示全部：这时没有格子能表达"关"。
      * @param folderIds 参与判定的在播格；null = 读屏上落点账（videoSurfaces.folderKey）
      */
     private fun applyHdmiVisibility(scenes: JSONObject?, folderIds: Collection<String>? = null) {
         val active = (folderIds ?: videoSurfaces.values.map { it.folderKey })
             .filter { it.isNotEmpty() }.distinct()
-        val show = active.isEmpty() || active.any { playSettingsOf(scenes, it).hdmi }
+        val wantMode = active.map { playSettingsOf(scenes, it).hdmiMode }.maxOrNull() ?: 0
+        val showAll = active.isEmpty()
+        // winId → 这扇点歌窗归属的模式；缺省/非法一律按模式1（与云端"缺键=模式1"同口径）
+        val winModes: Map<String, Int> = if (scenes == null) emptyMap() else
+            enabledWindowsSorted(scenes).associate { (id, w) ->
+                val c = w.optJSONObject("content")
+                id to if (c == null || !c.optString("type", "").equals("HDMI", true)) 1
+                else c.optInt("mode", 1).let { if (it in 1..3) it else 1 }
+            }
         for ((winId, view) in windowViews) {
             // HDMI 窗的身份直接看内容签名（"HDMI|…"），不另记一份集合 —— 重建清账时不会漏删漏建
             if (windowContentSigs[winId]?.startsWith("HDMI|") != true) continue
+            val mine = winModes[winId] ?: 1
+            val show = showAll || (wantMode > 0 && mine == wantMode)
             val want = if (show) View.VISIBLE else View.GONE
             if (view.visibility == want) continue
             view.visibility = want
-            logToFile("点歌屏：在播文件夹 ${active.joinToString("、").ifEmpty { "无" }} → " +
-                (if (show) "显示" else "关闭") + "窗口 $winId", "INFO", "WINDOW", "HDMI")
+            logToFile("点歌屏：在播文件夹 ${active.joinToString("、").ifEmpty { "无" }}（模式 $wantMode）→ " +
+                (if (show) "显示" else "关闭") + "窗口 $winId（模式 $mine）", "INFO", "WINDOW", "HDMI")
         }
         // 被关掉的那扇窗，窗口正中的运维面板要一起跟着藏起来
         applyStatusUi()
@@ -5562,6 +5573,8 @@ class MainActivity : AppCompatActivity() {
         val shuffle: Boolean = false,
         /** true = 这一格在播时显示点歌屏（HDMI 采集）窗口；见 applyHdmiVisibility */
         val hdmi: Boolean = false,
+        /** 点歌屏模式 0=关 1~3=模式N（点歌窗有三套配置，选哪套就只显示 content.mode 相同的那套）；见 applyHdmiVisibility */
+        val hdmiMode: Int = 0,
         /** true = 这一格接受 DMX512 控制（见 applyPanelSource 的 dmxAllowedFor 闸） */
         val dmx: Boolean = false
     )
@@ -5595,9 +5608,12 @@ class MainActivity : AppCompatActivity() {
         for (k in sceneKeys) {
             val tbl = scenes.optJSONObject(k)?.optJSONObject("play_settings") ?: continue
             val cell = tbl.optJSONObject(folderId) ?: tbl.optJSONObject(bare) ?: continue
+            val hdmiOn = cell.optBoolean("hdmi", false)
             return PlaySettings(
                 shuffle = cell.optString("order", "seq") == "shuffle",
-                hdmi = cell.optBoolean("hdmi", false),
+                hdmi = hdmiOn,
+                // 老配置只有 hdmi:true，按模式1 处理（云端模式1 不落 hdmi_mode，同一口径）
+                hdmiMode = if (!hdmiOn) 0 else cell.optInt("hdmi_mode", 1).let { if (it in 1..3) it else 1 },
                 dmx = cell.optBoolean("dmx", false)
             )
         }
