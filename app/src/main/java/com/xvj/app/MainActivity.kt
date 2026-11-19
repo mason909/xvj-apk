@@ -66,6 +66,12 @@
  *     没有窗口时退回整屏居中面板。关掉后大屏上只剩播放内容，那十几处 setStatus 调用不必各自判 debug——
  *     隐藏面板即可，文字照常更新；现场要排查就开调试
  * 
+ * 窗口名浮层（window_names）：
+ *   - 写入只经 setWindowNames()，两个来源：auth_result 与 sync_room_materials 的 window_names 字段、
+ *     set_window_names 指令（管理台打开「窗口配置」置 true、关掉置 false）
+ *   - true 时每扇在播窗口正中常亮该窗口的 name（旁边没有状态文字时它就是正中那一条），
+ *     与 debug 无关 —— 名字是改窗口时的对屏辅助，不是运维信息；SharedPreferences 持久化
+ * 
  * 文件夹级播放设置（scenes[X].play_settings，三端共用一份口径，详见【A-12】）：
  *   - 每格只有 { order }：'seq' 顺序循环 | 'shuffle' 随机循环；全默认的格子云端不落键 —— 落了会让全库 rev 漂移一次，
  *     部署后每台在线设备都被对账判成"落后"补发同步、视频从头播
@@ -332,6 +338,8 @@ class MainActivity : AppCompatActivity() {
     private var statusGen = 0
     /** windowId -> 该窗口正中的那份面板。窗口增删/几何变化时由 refreshWindowStatusOverlays 对齐 */
     private val windowStatusOverlays = HashMap<String, WindowStatusOverlay>()
+    /** windowId -> 窗口名（配置里的 name）。window_names 浮层开着时显示在窗口正中，建窗/轻量更新时刷新 */
+    private val windowNames = HashMap<String, String>()
 
     // ==============================
     private var mqttClient: MqttClient? = null
@@ -961,6 +969,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * window_names 的唯一写入口：落 prefs + 立刻刷新窗口名浮层显隐（口径对齐 setDebugMode）。
+     * 两个来源：auth_result / sync_room_materials 载荷里的 window_names 字段、set_window_names 指令
+     * （管理台打开「窗口配置」时置 true、关掉置 false）。与 debug 无关 —— 名字是改窗口时的对屏辅助，
+     * 不是运维信息，所以不走 applyDebugUi。
+     */
+    private fun setWindowNames(on: Boolean) {
+        prefs.edit().putBoolean("window_names", on).apply()
+        mqttHandler.post { applyStatusUi() }
+    }
+
+    /**
      * 按 debug_mode 收放"运维层"= 状态文字 + 素材同步进度条。
      * 有在播窗口时每扇窗正中各一份（windowStatusOverlays），没有窗口时退回 XML 里的整屏居中面板，
      * 两者不会同时显示。设备接投影/大屏，调试模式关掉时整层 GONE，
@@ -1035,17 +1054,30 @@ class MainActivity : AppCompatActivity() {
     /**
      * 主线程：把当前状态与显隐落到所有面板上。
      * 窗口面板只在窗口可见时出；一扇都出不来时（还没建窗 / HDMI 全关 / 退出到桌面）退回整屏居中面板。
+     * 同一块面板承担两件事、各自独立判显隐：窗口名（window_names，编辑器开着时常亮，不用 debug）
+     * 与 debug 的状态文字/进度条（两者同出时竖排，名字在上）。
      * 每次刷新都 bringToFront：窗口容器是运行期 addView 到同一个根 FrameLayout 的，后加的会盖住面板。
      */
     private fun applyStatusUi() {
         val debug = prefs.getBoolean("debug_mode", false)
+        val names = prefs.getBoolean("window_names", false)
         var anyWindowPanel = false
         for ((winId, ov) in windowStatusOverlays) {
             val win = windowViews[winId]
-            val show = debug && statusShown && win != null && win.visibility == View.VISIBLE
+            val winVisible = win != null && win.visibility == View.VISIBLE
+            val showName = names && winVisible
+            val showStatus = debug && statusShown && winVisible
+            val show = showName || showStatus
             ov.holder.visibility = if (show) View.VISIBLE else View.GONE
             if (!show) continue
-            applyStatusContent(ov.text, ov.bar)
+            ov.name.visibility = if (showName) View.VISIBLE else View.GONE
+            if (showName) ov.name.text = windowNames[winId]?.takeIf { it.isNotEmpty() } ?: winId
+            ov.text.visibility = if (showStatus) View.VISIBLE else View.GONE
+            if (showStatus) {
+                applyStatusContent(ov.text, ov.bar)
+            } else {
+                ov.bar.visibility = View.GONE
+            }
             ov.holder.bringToFront()
             anyWindowPanel = true
         }
@@ -1145,6 +1177,13 @@ class MainActivity : AppCompatActivity() {
         val textPx = (unit / 22f).coerceIn(24f, 200f)
         val padH = (textPx * 0.8f).toInt()
         val padV = (textPx * 0.5f).toInt()
+        ov.name.setTextSize(TypedValue.COMPLEX_UNIT_PX, textPx)
+        ov.name.maxWidth = (winW * 0.86f).toInt().coerceAtLeast(120)
+        ov.name.setPadding(padH, padV, padH, padV)
+        ov.name.background = GradientDrawable().apply {
+            setColor(0xB3000000.toInt())
+            cornerRadius = textPx * 0.35f
+        }
         ov.text.setTextSize(TypedValue.COMPLEX_UNIT_PX, textPx)
         ov.text.maxWidth = (winW * 0.86f).toInt().coerceAtLeast(120)
         ov.text.setPadding(padH, padV, padH, padV)
@@ -1171,6 +1210,15 @@ class MainActivity : AppCompatActivity() {
             isClickable = false
             isFocusable = false
         }
+        /** 窗口名（window_names 浮层）：名字只有一行，压在最上面；状态文字收起时它就是正中那一条 */
+        val name = TextView(this@MainActivity).apply {
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            includeFontPadding = false
+        }
         val text = TextView(this@MainActivity).apply {
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
@@ -1186,6 +1234,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         init {
+            panel.addView(name)
             panel.addView(text)
             panel.addView(bar)
             holder.addView(panel, FrameLayout.LayoutParams(
@@ -2118,6 +2167,10 @@ class MainActivity : AppCompatActivity() {
                             if (resp.has("debug")) {
                                 setDebugMode(resp.optBoolean("debug", false))
                             }
+                            // 窗口名浮层同口径：载荷带了才覆盖（服务端 roomSyncFields 恒带，老服务端不带 → 保留本机现值）
+                            if (resp.has("window_names")) {
+                                setWindowNames(resp.optBoolean("window_names", false))
+                            }
                             // 触发素材同步（映射真相在 scenes 里，folderMappings 仅作旧服务端兜底）；
                             // rev 随请求走，对账真的跑完才记进 appliedRev 给心跳对账用
                             if (folderMappings != null || scenes != null) {
@@ -2266,6 +2319,7 @@ class MainActivity : AppCompatActivity() {
      *   set_wallpanel       立即开关 485 墙板串口链路 + 串口节点/字符格式/学习表（同 set_debug：
      *                       临时值，房间 config.wallpanel_* 才是真相，下一次带这些字段的载荷会覆盖）
      *   set_dmx             立即开关 DMX512 副板串口链路 + 节点/波特率（同 set_wallpanel 的临时值口径）
+     *   set_window_names    立即开关窗口名浮层（管理台开关「窗口配置」时云端补的轻枪，同 set_debug 口径）
      *   wallpanel_learn     开/关学习窗：开窗清空帧台账并在每一帧到达时上报候选列表，
      *                       页面据此让人选中格子后按键、把那一帧绑上去
      *   preview_material    在播这一格的所有窗口里同步试播一只本机素材，播完同步回到原画面
@@ -2367,6 +2421,8 @@ class MainActivity : AppCompatActivity() {
                     val hasDebug = cmd.has("debug")
                     val debug = hasDebug && cmd.optBoolean("debug", false)
                     if (hasDebug) setDebugMode(debug)
+                    // 窗口名浮层同 debug 口径：载荷带了才覆盖（update_windows 不带 → 不动本地状态）
+                    if (cmd.has("window_names")) setWindowNames(cmd.optBoolean("window_names", false))
                     // 墙板字段与 debug 同口径：只在载荷真带字段时才覆盖（服务端 roomWallpanelFields 恒算出
                     // 确定形状，sync_room_materials / auth_result 两条载荷都带；update_windows 不带 → 不动本地状态）
                     // 字段先落 prefs 再收放链路，同一跳里改了节点/波特率才只开一次（见 auth_result 处注释）
@@ -2511,6 +2567,14 @@ class MainActivity : AppCompatActivity() {
                     applyDmxEnabled(enabled)
                     Log.d(TAG, "set_dmx: enabled=$enabled")
                     logToFile("DMX 开关变更: enabled=$enabled 串口=${dmxPath()} 波特率=${dmxBaud()}", "INFO", "DMX", "CONFIG")
+                }
+                "set_window_names" -> {
+                    // 窗口名浮层的手动开关（管理台打开/关掉「窗口配置」时由云端漏斗补一枪）。
+                    // 同 set_debug：临时值，房间 config.window_names 才是真相，下一次载荷按它覆盖。
+                    val on = cmd.optBoolean("window_names", false)
+                    setWindowNames(on)
+                    Log.d(TAG, "set_window_names: on=$on")
+                    logToFile("窗口名浮层: ${if (on) "开" else "关"}", "INFO", "WINDOW", "CONFIG")
                 }
                 "wallpanel_learn" -> {
                     // 学习窗（云端【S-06f】）：只控制"要不要把每一帧的候选列表即时上报"，
@@ -4231,6 +4295,7 @@ class MainActivity : AppCompatActivity() {
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
         windowContentSigs.clear()
+        windowNames.clear()
 
         // 收集所有场景的窗口，A 和 B 的 windows 合并后统一渲染
         // 每个窗口播什么由自身 content 决定，不需要"当前幕"概念（485 墙板走独立链路，见 applyPanelSource）
@@ -4592,6 +4657,7 @@ class MainActivity : AppCompatActivity() {
             // 共享组成员的几何/透明度/亮度长在 GL 画布上（一块画布代表整组），这里一律跳过，
             // 组级重排放到循环后面做一次 —— 并集矩形要按全组最新的几何算，逐扇改会改出一半新一半旧
             videoSurfaces[winId]?.winJson = w
+            windowNames[winId] = w.optString("name", "")
             if (winShareGroup.containsKey(winId)) continue
             val c = windowViews[winId] as? FrameLayout ?: continue
 
@@ -4729,6 +4795,7 @@ class MainActivity : AppCompatActivity() {
         panelBlackout?.bringToFront()
         windowViews[winId] = container
         windowContentSigs[winId] = contentSignature(content)
+        windowNames[winId] = w.optString("name", "")
         // 布局完成后应用截取/旋转/镜像（取景与矩阵中心都依赖实际视图尺寸），未就绪则等首次布局再补
         container.post { applyTransformWhenReady(view, w) }
         val cr = cropRect(w)
@@ -4795,6 +4862,7 @@ class MainActivity : AppCompatActivity() {
             // 成员共用同一块容器：windowViews 里每扇窗都指到它，摘旧视图时重复 removeView 是无害空转
             windowViews[p.winId] = container
             windowContentSigs[p.winId] = contentSignature(p.content)
+            windowNames[p.winId] = p.win.optString("name", "")
             videoSurfaces[p.winId] = VideoSurface(container, canvas, p.win, PlaySettings())
         }
         refreshShareGroup(folderId)
@@ -5817,6 +5885,7 @@ class MainActivity : AppCompatActivity() {
         windowViews.values.forEach { flSurface?.removeView(it) }
         windowViews.clear()
         windowContentSigs.clear()
+        windowNames.clear()
         // 窗口没了，窗口正中那些面板一并摘掉；状态文字退回整屏居中面板（退出到桌面时就是它）
         refreshWindowStatusOverlays()
         // 屏上已经没有窗口了，"已应用配置"的指纹必须一起作废：
