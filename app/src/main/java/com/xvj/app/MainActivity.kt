@@ -298,6 +298,13 @@ class MainActivity : AppCompatActivity() {
     private var exited = false
     /** 找不到别的桌面（或拉起失败）时的退化黑布；正常退到桌面时恒为 null */
     private var blackout: View? = null
+    /**
+     * 墙板「全关」盖布：与上面的退化黑布是两条命 —— 那个只在退桌面失败时盖，
+     * 这个由墙板开关键开关（全关盖、全开撤）。播放不停，撤掉就回到原画面。
+     * 状态只在内存里，重启/进程被杀都回到正常画面：黑屏是一次氛围动作，不是配置。
+     */
+    private var panelBlackout: View? = null
+    private var panelBlackoutOn = false
     /** 界面是否在前台（onResume 起、onPause 落）：云端「唤回」据此决定自己顶回来还是等现场按键 */
     private var activityForeground = false
     /** 还在桌面身后时收到的唤回：先记账，回到前台那次 onResume 补建画面 */
@@ -1341,6 +1348,25 @@ class MainActivity : AppCompatActivity() {
             }
         }
         applyWallPanelBindings(payload)
+        applyWallPanelCodes(payload)
+    }
+
+    /**
+     * 全开/全关码（config.wallpanel_on_frame / wallpanel_off_frame）的唯一写入口：
+     * 载荷真带了键才覆盖，null / 空 / 非法 = 没配这一键（清掉本机旧码）。
+     * 形状闸与服务端同一把：1~64 字节的大写十六进制（WallPanelHex.isValid）。
+     */
+    private fun applyWallPanelCodes(payload: JSONObject) {
+        listOf("wallpanel_on_frame" to "全开码", "wallpanel_off_frame" to "全关码").forEach { (key, label) ->
+            if (!payload.has(key)) return@forEach
+            val raw = payload.opt(key)
+            val hex = (if (raw == null || raw === JSONObject.NULL) "" else raw.toString().trim().uppercase())
+                .takeIf { it.isNotEmpty() && WallPanelHex.isValid(it) } ?: ""
+            if (hex != (prefs.getString(key, "") ?: "")) {
+                prefs.edit().putString(key, hex).apply()
+                logToFile("墙板$label 下发为 ${if (hex.isEmpty()) "未配置" else hex}", "INFO", "WALLPANEL", "CONFIG")
+            }
+        }
     }
 
     /**
@@ -1529,6 +1555,11 @@ class MainActivity : AppCompatActivity() {
         val hex = WallPanelHex.of(event.frame)
         frameLedger.record(hex, nowMs)
         if (nowMs < learnUntilMs) publishFrameSnapshot()
+        // 全开/全关先判：这两个码不是"切到某一格"，命中就不再往下查绑定表
+        val onHex = prefs.getString("wallpanel_on_frame", "") ?: ""
+        val offHex = prefs.getString("wallpanel_off_frame", "") ?: ""
+        if (onHex.isNotEmpty() && hex == onHex) { applyPanelBlackout(false, hex); return }
+        if (offHex.isNotEmpty() && hex == offHex) { applyPanelBlackout(true, hex); return }
         if (wallPanelBindings.actionFor(hex) != null) {
             applyPanelSource(PanelSource.Frame(hex), hex)
             return
@@ -4694,6 +4725,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         flSurface?.addView(container, params)
+        // 全关黑布必须留在最上层：重建时新窗口是后加进来的，会把盖布压到下面
+        panelBlackout?.bringToFront()
         windowViews[winId] = container
         windowContentSigs[winId] = contentSignature(content)
         // 布局完成后应用截取/旋转/镜像（取景与矩阵中心都依赖实际视图尺寸），未就绪则等首次布局再补
@@ -4741,6 +4774,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(canvas, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         flSurface?.addView(container, FrameLayout.LayoutParams(1, 1).apply { gravity = Gravity.TOP or Gravity.START })
+        panelBlackout?.bringToFront()
         val grp = ShareGroup(folderId, leaderId, container, canvas, ids)
         shareGroups[folderId] = grp
         for (winId in ids) winShareGroup[winId] = grp
@@ -6004,6 +6038,41 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "唤回重建失败: ${e.message}")
             logToFile("唤回失败：scenes 缓存解析异常 ${e.message}", "ERROR", "WINDOW", "ERROR")
         }
+    }
+
+    /**
+     * 墙板全开/全关：全关 = 给所有窗口盖一层黑布（播放不停，撤掉即回到原画面），全开 = 撤掉。
+     * 只在黑布这一层动画面：解码器、播放清单、墙板跟随一概照常跑，所以全开是瞬时的，不用重新起播。
+     * 已在主线程（handleWallPanelEvent 的调用点）。
+     */
+    private fun applyPanelBlackout(on: Boolean, hex: String) {
+        if (exited) {
+            // 桌面顶在身前时盖黑布没有意义；真记下来反而会在唤回时莫名其妙黑着
+            logToFile("墙板${if (on) "全关" else "全开"}帧 $hex：本机在桌面（已退出），忽略", "INFO", "WALLPANEL", "SKIP")
+            return
+        }
+        if (on == panelBlackoutOn) {
+            logToFile("墙板${if (on) "全关" else "全开"}帧 $hex：已经是这个状态，忽略", "INFO", "WALLPANEL", "SKIP")
+            return
+        }
+        val root = flSurface ?: return
+        panelBlackoutOn = on
+        if (on) {
+            val v = panelBlackout ?: View(this).apply {
+                setBackgroundColor(Color.BLACK)
+                root.addView(this, FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            }
+            panelBlackout = v
+            v.bringToFront()
+        } else {
+            panelBlackout?.let { root.removeView(it) }
+            panelBlackout = null
+        }
+        // 提示文字属于运维层：debug 开着时要压在黑布上面，关着时整层不见
+        applyDebugUi()
+        logToFile("墙板${if (on) "全关" else "全开"}帧 $hex：${if (on) "所有窗口盖黑，播放继续" else "撤掉黑布，回到原画面"}",
+            "INFO", "WALLPANEL", "FRAME")
     }
 
     /** 黑布盖到根容器最后一层（覆盖顺序只能靠 bringToFront，窗口容器都是 addView 进来的） */
