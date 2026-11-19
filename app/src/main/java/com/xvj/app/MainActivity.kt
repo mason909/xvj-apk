@@ -1689,6 +1689,8 @@ class MainActivity : AppCompatActivity() {
         }
         // 一格一路解码（#175），同一组的成员窗口只让基准窗推一次，其余窗跟着同一张画布
         val advanced = HashSet<String>()
+        // 本次触发真正落到的格（预置前缀）：点歌屏显隐只认这一份，见循环末尾
+        val landedFolders = LinkedHashSet<String>()
         // 判"下一支"必须看按键前就在不在那格：切格会同步刷新整组成员的落点账，
         // 边切边判的话，排在后面的成员会把刚到的新格误当成重复按，白白多推一支
         // （起播瞬间 seek，现场看到就是一次凝滞/闪黑）。
@@ -1715,9 +1717,14 @@ class MainActivity : AppCompatActivity() {
             } else {
                 playFolderInWindow(winId, folderId)
             }
+            // 只有真落到这一格的窗才参与点歌屏判定：某一幕没有这一格素材时它保持原画面
+            // （老板 2026-11-19 定调"没素材不切就行"），旧格不能替这次切换决定显隐
+            if (videoSurfaces[winId]?.folderKey == folderId) landedFolders.add(folderId)
         }
-        // 换格后点歌屏显隐跟着这一格的开关走（同一格再按不换格，但重复算一遍无害且幂等）
-        applyHdmiVisibility(scenes)
+        // 换格后点歌屏显隐跟着这一格的开关走（同一格再按不换格，但重复算一遍无害且幂等）；
+        // 一扇都没落到新格（都没素材/被闸门拦下）就不动现状
+        if (landedFolders.isNotEmpty()) applyHdmiVisibility(scenes, landedFolders)
+        else applyHdmiVisibility(scenes)
     }
 
     /**
@@ -4607,13 +4614,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 点歌屏（HDMI 采集）窗口的显隐：看屏上此刻在播哪几格，任一格开着才显示（A/B 两幕同格驱动，
-     * 正常配置下不会分歧；真分歧时以开为准 —— 点歌画面宁可多露也不该在点歌时黑掉）。
+     * 点歌屏（HDMI 采集）窗口的显隐：看给定的在播格，任一格开着才显示。
+     * 配置落地时给的是屏上全部在播格（A/B 分歧以开为准 —— 点歌画面宁可多露也不该黑掉）；
+     * 墙板/DMX 触发时只给这次真落到的格：某一幕没这一格素材就保持原画面，不参与判定
+     * （老板 2026-11-19 定调"没素材不切就行"）。
      * 每格默认关（2026-11-18 用户定调），不配置的房间点歌屏窗口不显示。
      * 关闭 = 整扇窗 GONE：TextureView 不可见时会销毁自己那块 Surface，采集侧收到 detach，
      * 最后一路也卸完 HdmiCapture 就关相机，4K 采集的算力和带宽一起停；再打开时走原有 attach 链重开。
      * 没有任何视频窗在播（纯色/HDMI 房间）时按默认显示：这时没有格子能表达"关"。
-     * @param folderIds 本次配置解析出的在播格；null = 读屏上落点账（videoSurfaces.folderKey）
+     * @param folderIds 参与判定的在播格；null = 读屏上落点账（videoSurfaces.folderKey）
      */
     private fun applyHdmiVisibility(scenes: JSONObject?, folderIds: Collection<String>? = null) {
         val active = (folderIds ?: videoSurfaces.values.map { it.folderKey })
