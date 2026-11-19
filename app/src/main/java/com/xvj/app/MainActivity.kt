@@ -72,6 +72,13 @@
  *   - true 时每扇在播窗口正中常亮该窗口的 name（旁边没有状态文字时它就是正中那一条），
  *     与 debug 无关 —— 名字是改窗口时的对屏辅助，不是运维信息；SharedPreferences 持久化
  * 
+ * 测试背景浮层（window_testcard）：
+ *   - 写入只经 setWindowTestcard()，来源同上（window_testcard 字段 / set_window_testcard 指令），
+ *     与窗口名同开同关：管理台打开「窗口配置」时一起置 true，关掉一起置 false
+ *   - true 时每扇在播窗口铺满 testcard.jpg（居中裁切），画在名字/状态面板下面 —— 改窗口时每扇窗
+ *     的框子和内容一目了然；关掉后图卡撤走，原素材继续播（不重建播放器、视频不中断）
+ *   - 与 window_names 一样不进 debug 闸门、不进 rev；SharedPreferences 持久化
+ * 
  * 文件夹级播放设置（scenes[X].play_settings，三端共用一份口径，详见【A-12】）：
  *   - 每格只有 { order }：'seq' 顺序循环 | 'shuffle' 随机循环；全默认的格子云端不落键 —— 落了会让全库 rev 漂移一次，
  *     部署后每台在线设备都被对账判成"落后"补发同步、视频从头播
@@ -980,6 +987,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * window_testcard 的唯一写入口：落 prefs + 立刻刷新测试背景浮层（口径对齐 setWindowNames）。
+     * 来源：auth_result / sync_room_materials 载荷里的 window_testcard 字段、set_window_testcard 指令
+     * （管理台打开「窗口配置」时与窗口名一起置 true，关掉一起置 false）。
+     */
+    private fun setWindowTestcard(on: Boolean) {
+        prefs.edit().putBoolean("window_testcard", on).apply()
+        mqttHandler.post { applyStatusUi() }
+    }
+
+    /**
      * 按 debug_mode 收放"运维层"= 状态文字 + 素材同步进度条。
      * 有在播窗口时每扇窗正中各一份（windowStatusOverlays），没有窗口时退回 XML 里的整屏居中面板，
      * 两者不会同时显示。设备接投影/大屏，调试模式关掉时整层 GONE，
@@ -1054,21 +1071,28 @@ class MainActivity : AppCompatActivity() {
     /**
      * 主线程：把当前状态与显隐落到所有面板上。
      * 窗口面板只在窗口可见时出；一扇都出不来时（还没建窗 / HDMI 全关 / 退出到桌面）退回整屏居中面板。
-     * 同一块面板承担两件事、各自独立判显隐：窗口名（window_names，编辑器开着时常亮，不用 debug）
-     * 与 debug 的状态文字/进度条（两者同出时竖排，名字在上）。
+     * 同一块面板承担三件事、各自独立判显隐：测试背景图卡（window_testcard，垫在最底层）、
+     * 窗口名（window_names，编辑器开着时常亮，不用 debug）与 debug 的状态文字/进度条（名字与文字同出时竖排，名字在上）。
      * 每次刷新都 bringToFront：窗口容器是运行期 addView 到同一个根 FrameLayout 的，后加的会盖住面板。
      */
     private fun applyStatusUi() {
         val debug = prefs.getBoolean("debug_mode", false)
         val names = prefs.getBoolean("window_names", false)
+        val testcard = prefs.getBoolean("window_testcard", false)
         var anyWindowPanel = false
         for ((winId, ov) in windowStatusOverlays) {
             val win = windowViews[winId]
             val winVisible = win != null && win.visibility == View.VISIBLE
+            val showCard = testcard && winVisible
             val showName = names && winVisible
             val showStatus = debug && statusShown && winVisible
-            val show = showName || showStatus
+            val show = showCard || showName || showStatus
             ov.holder.visibility = if (show) View.VISIBLE else View.GONE
+            if (showCard) {
+                // 图卡只解一次、全窗共享；解码失败就只留黑底（比整窗透出下层内容更清楚这是"盖住了"）
+                if (ov.card.drawable == null) testCardBitmap()?.let { ov.card.setImageBitmap(it) }
+            }
+            ov.card.visibility = if (showCard) View.VISIBLE else View.GONE
             if (!show) continue
             ov.name.visibility = if (showName) View.VISIBLE else View.GONE
             if (showName) ov.name.text = windowNames[winId]?.takeIf { it.isNotEmpty() } ?: winId
@@ -1204,6 +1228,14 @@ class MainActivity : AppCompatActivity() {
             isClickable = false
             isFocusable = false
         }
+        /** 测试背景图卡（window_testcard 浮层）：铺满整块 holder，垫在名字/状态面板下面 */
+        val card = ImageView(this@MainActivity).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(Color.BLACK)
+            isClickable = false
+            isFocusable = false
+            visibility = View.GONE
+        }
         val panel = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -1234,6 +1266,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         init {
+            holder.addView(card, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             panel.addView(name)
             panel.addView(text)
             panel.addView(bar)
@@ -2167,9 +2201,12 @@ class MainActivity : AppCompatActivity() {
                             if (resp.has("debug")) {
                                 setDebugMode(resp.optBoolean("debug", false))
                             }
-                            // 窗口名浮层同口径：载荷带了才覆盖（服务端 roomSyncFields 恒带，老服务端不带 → 保留本机现值）
+                            // 窗口名/测试背景浮层同口径：载荷带了才覆盖（服务端 roomSyncFields 恒带，老服务端不带 → 保留本机现值）
                             if (resp.has("window_names")) {
                                 setWindowNames(resp.optBoolean("window_names", false))
+                            }
+                            if (resp.has("window_testcard")) {
+                                setWindowTestcard(resp.optBoolean("window_testcard", false))
                             }
                             // 触发素材同步（映射真相在 scenes 里，folderMappings 仅作旧服务端兜底）；
                             // rev 随请求走，对账真的跑完才记进 appliedRev 给心跳对账用
@@ -2320,6 +2357,7 @@ class MainActivity : AppCompatActivity() {
      *                       临时值，房间 config.wallpanel_* 才是真相，下一次带这些字段的载荷会覆盖）
      *   set_dmx             立即开关 DMX512 副板串口链路 + 节点/波特率（同 set_wallpanel 的临时值口径）
      *   set_window_names    立即开关窗口名浮层（管理台开关「窗口配置」时云端补的轻枪，同 set_debug 口径）
+     *   set_window_testcard 立即开关测试背景浮层（与窗口名同批下发、同开同关，同 set_debug 口径）
      *   wallpanel_learn     开/关学习窗：开窗清空帧台账并在每一帧到达时上报候选列表，
      *                       页面据此让人选中格子后按键、把那一帧绑上去
      *   preview_material    在播这一格的所有窗口里同步试播一只本机素材，播完同步回到原画面
@@ -2421,8 +2459,9 @@ class MainActivity : AppCompatActivity() {
                     val hasDebug = cmd.has("debug")
                     val debug = hasDebug && cmd.optBoolean("debug", false)
                     if (hasDebug) setDebugMode(debug)
-                    // 窗口名浮层同 debug 口径：载荷带了才覆盖（update_windows 不带 → 不动本地状态）
+                    // 窗口名/测试背景浮层同 debug 口径：载荷带了才覆盖（update_windows 不带 → 不动本地状态）
                     if (cmd.has("window_names")) setWindowNames(cmd.optBoolean("window_names", false))
+                    if (cmd.has("window_testcard")) setWindowTestcard(cmd.optBoolean("window_testcard", false))
                     // 墙板字段与 debug 同口径：只在载荷真带字段时才覆盖（服务端 roomWallpanelFields 恒算出
                     // 确定形状，sync_room_materials / auth_result 两条载荷都带；update_windows 不带 → 不动本地状态）
                     // 字段先落 prefs 再收放链路，同一跳里改了节点/波特率才只开一次（见 auth_result 处注释）
@@ -2575,6 +2614,14 @@ class MainActivity : AppCompatActivity() {
                     setWindowNames(on)
                     Log.d(TAG, "set_window_names: on=$on")
                     logToFile("窗口名浮层: ${if (on) "开" else "关"}", "INFO", "WINDOW", "CONFIG")
+                }
+                "set_window_testcard" -> {
+                    // 测试背景浮层的手动开关，与窗口名同开同关（云端漏斗同一批补枪）。
+                    // 同 set_debug：临时值，房间 config.window_testcard 才是真相，下一次载荷按它覆盖。
+                    val on = cmd.optBoolean("window_testcard", false)
+                    setWindowTestcard(on)
+                    Log.d(TAG, "set_window_testcard: on=$on")
+                    logToFile("测试背景浮层: ${if (on) "开" else "关"}", "INFO", "WINDOW", "CONFIG")
                 }
                 "wallpanel_learn" -> {
                     // 学习窗（云端【S-06f】）：只控制"要不要把每一帧的候选列表即时上报"，
