@@ -75,7 +75,7 @@
  * 测试背景浮层（window_testcard）：
  *   - 写入只经 setWindowTestcard()，来源同上（window_testcard 字段 / set_window_testcard 指令），
  *     与窗口名同开同关：管理台打开「窗口配置」时一起置 true，关掉一起置 false
- *   - true 时每扇在播窗口铺满 testcard.jpg（居中裁切），画在名字/状态面板下面 —— 改窗口时每扇窗
+ *   - true 时每扇在播窗口拉伸铺满 testcard.jpg（随窗口矩形变形，不保比例），画在名字/状态面板下面 —— 改窗口时每扇窗
  *     的框子和内容一目了然；关掉后图卡撤走，原素材继续播（不重建播放器、视频不中断）
  *   - 与 window_names 一样不进 debug 闸门、不进 rev；SharedPreferences 持久化
  * 
@@ -1236,9 +1236,9 @@ class MainActivity : AppCompatActivity() {
             isClickable = false
             isFocusable = false
         }
-        /** 测试背景图卡（window_testcard 浮层）：铺满整块 holder，垫在名字/状态面板下面 */
+        /** 测试背景图卡（window_testcard 浮层）：拉伸铺满整块 holder（随窗口矩形变形），垫在名字/状态面板下面 */
         val card = ImageView(this@MainActivity).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
+            scaleType = ImageView.ScaleType.FIT_XY
             setBackgroundColor(Color.BLACK)
             isClickable = false
             isFocusable = false
@@ -5131,11 +5131,11 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(x, y, wd, ht)
     }
 
-    /** 测试背景窗口：固定图卡铺满（居中裁切），图卡读不到才退回 content.color 纯色 */
+    /** 测试背景窗口：固定图卡拉伸铺满（随窗口矩形变形），图卡读不到才退回 content.color 纯色 */
     private fun createColorView(w: JSONObject, content: JSONObject): View {
         testCardBitmap()?.let { bmp ->
             return ImageView(this).apply {
-                scaleType = ImageView.ScaleType.CENTER_CROP
+                scaleType = ImageView.ScaleType.FIT_XY
                 setBackgroundColor(Color.BLACK)
                 setImageBitmap(bmp)
             }
