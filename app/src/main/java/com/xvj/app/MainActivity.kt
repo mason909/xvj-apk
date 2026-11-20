@@ -132,6 +132,7 @@ package com.xvj.app
 
 import android.Manifest
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -153,6 +154,8 @@ import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.audio.AudioSink
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -2267,7 +2270,7 @@ class MainActivity : AppCompatActivity() {
                 releaseAllWindows()
 
                 // 创建新播放器播放欢迎视频
-                player = ExoPlayer.Builder(this@MainActivity).setLoadControl(localBufferLoadControl()).build().apply {
+                player = buildExoPlayer().apply {
                     binding.playerView.player = this
                     // 使用 Android resource URI 访问 raw 资源
                     val uri = android.net.Uri.parse("android.resource://${packageName}/raw/welcome")
@@ -4909,7 +4912,7 @@ class MainActivity : AppCompatActivity() {
         // 一路解码器喂一块画布。解码端的 Surface 要等画布拿到 TextureView 的 st、建好 GL 上下文
         // 才诞生（比这里晚），所以交接走回调；素材分辨率变了（4K 混 1080p）由 VideoSize 回调报给
         // 离屏纹理，尺寸不落对，MediaCodec 就可能按 1x1 起流水线
-        val player = ExoPlayer.Builder(this).setLoadControl(localBufferLoadControl()).build().apply {
+        val player = buildExoPlayer().apply {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
         }
@@ -5283,6 +5286,48 @@ class MainActivity : AppCompatActivity() {
         if (granted) hdmi().retryNow() else refreshHdmiLabels()
     }
 
+    /** 只记一次：每个窗口都建播放器，逐窗刷这条日志会把 xvj.log 冲花 */
+    @Volatile private var audioDisabledLogged = false
+
+    /**
+     * 本机所有 ExoPlayer 的统一出口：不装音频渲染器 + 收紧缓冲。
+     *
+     * 【为什么掐掉音频】#348 装机体硬挂的那条链子（ANR trace + audioserver native 栈取证）：
+     * 资源吃紧 → 某只素材的 AAC 音轨报 ERROR_CODE_DECODING_FAILED → 换片凝滞 15s、HDMI 出帧塌到 0.6fps
+     * → audioserver 主线程死在 TimeCheck::TimeCheckThread::startMonitoring 的互斥上
+     * → Media3 建播放器时主线程走进 AudioPortEventHandler.init → registerClient 等 binder
+     * → 主线程彻底卡死、心跳停 → 保活进程拉起新实例，依旧死在 WINDOW CREATE → 整机只能断电。
+     * VJ 盒子本身不出声（声音走点歌机/外接 PA），音轨对出画面没有任何贡献，却带来两条硬依赖：
+     * 解码 AAC（上面那类错误）和 AudioManager 的 binder 调用（audioserver 一僵，主线程跟着僵）。
+     * 掐掉后这两类风险直接归零，播放器也不再因音轨解不开而整路停摆。
+     */
+    /** 只记一次：每个窗口都建播放器，逐窗刷这条日志会把 xvj.log 冲花 */
+    @Volatile private var audioDisabledLogged = false
+
+    private fun buildExoPlayer(): ExoPlayer {
+        if (!audioDisabledLogged) {
+            audioDisabledLogged = true
+            logToFile("播放器：已禁用音频渲染器（本机不出声，规避 audioserver 死锁拖死主线程）", "INFO", "PLAYBACK", "AUDIO")
+        }
+        return ExoPlayer.Builder(this)
+            .setRenderersFactory(noAudioRenderersFactory())
+            .setLoadControl(localBufferLoadControl())
+            .build()
+    }
+
+    /**
+     * 只留视频渲染器：media3 的 buildAudioSink 返回 null 时就不会再走 buildAudioRenderers，
+     * 这是官方留的口子（见 DefaultRenderersFactory 注释），比覆盖 buildAudioRenderers 少建一个 AudioSink。
+     */
+    private fun noAudioRenderersFactory(): DefaultRenderersFactory =
+        object : DefaultRenderersFactory(this) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean
+            ): AudioSink? = null
+        }
+
     /**
      * 每路播放器自己的缓冲预算。返回新实例，不能共享：DefaultLoadControl 在 onInitialized 里
      * 认死一个播放器，第二个来初始化会抛 IllegalStateException。
@@ -5346,7 +5391,7 @@ class MainActivity : AppCompatActivity() {
         // TextureView 而不是 SurfaceView：窗口要套旋转/镜像矩阵（见 applyTransformWhenReady）
         val textureView = TextureView(this)
         container.addView(textureView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        val player = ExoPlayer.Builder(this).setLoadControl(localBufferLoadControl()).build().apply {
+        val player = buildExoPlayer().apply {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
             setVideoTextureView(textureView)

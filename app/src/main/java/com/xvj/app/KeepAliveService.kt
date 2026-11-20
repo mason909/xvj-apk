@@ -15,6 +15,7 @@ import java.io.File
 import java.io.FileWriter
 import java.io.PrintWriter
 import java.io.RandomAccessFile
+import java.util.concurrent.TimeUnit
 
 /**
  * 【A-17】保活：主进程被 lmkd 收走之后，把画面自己拉回来。
@@ -134,6 +135,10 @@ class KeepAliveService : Service() {
         revivePending = false
         // 等待期间用户点了退出：那是显式动作，不拉
         if (File(filesDir, EXIT_MARKER).exists()) return
+        // 连拉三次还起不来 = 系统级僵死，不是本进程被杀：再拉只会卡在同一处。
+        // （#348 实况：audioserver 死锁后新实例能起、卡死在 WINDOW CREATE，除断电无解。）
+        // 这种局面下 root 重启是唯一自救手段；限 30 分钟一次，防应用自身崩 → 重启 → 再崩的循环。
+        if (previousStreak >= 2 && tryRootReboot()) return
         try {
             // 带 HOME 类目：与同进程双实例去重（liveInstance 收摊）同一条入口，起错了栈也会被收掉
             startActivity(Intent(this, MainActivity::class.java).apply {
@@ -151,6 +156,37 @@ class KeepAliveService : Service() {
             revivePending = false
             appendLog("保活：拉起画面失败: ${e.message}")
             Log.w(TAG, "拉起画面失败: ${e.message}")
+        }
+    }
+
+    /**
+     * 系统僵死时的自救：root 重启。没有 root / su 没授权时命令会立刻非 0 退出，
+     * 这里如实回 false，让调用方继续原来的拉起动作，冷却期也不消耗。
+     */
+    private fun tryRootReboot(): Boolean {
+        val sp = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val last = sp.getLong(KEY_LAST_REBOOT, 0)
+        if (last > 0 && now - last < REBOOT_COOLDOWN_MS) {
+            appendLog("保活：系统疑似僵死，但上次重启在 ${(now - last) / 60_000} 分钟前（冷却 " +
+                "${REBOOT_COOLDOWN_MS / 60_000} 分钟），改为继续拉起")
+            return false
+        }
+        return try {
+            appendLog("保活：连续拉起不生效，判定系统僵死，执行 root 重启")
+            val proc = Runtime.getRuntime().exec(arrayOf("/system/bin/su", "-c", "reboot"))
+            val exited = proc.waitFor(10, TimeUnit.SECONDS)
+            // reboot 正常会以 0 立刻退出；su 拒绝授权同样会退（非 0）—— 必须分清，别把没 root 当重启成功
+            val ok = exited && proc.exitValue() == 0
+            if (ok) {
+                sp.edit().putLong(KEY_LAST_REBOOT, now).commit()
+            } else {
+                appendLog("保活：root 重启未执行（无 root 或 su 拒绝），改为继续拉起")
+            }
+            ok
+        } catch (e: Exception) {
+            appendLog("保活：root 重启失败: ${e.message}")
+            false
         }
     }
 
@@ -215,5 +251,9 @@ class KeepAliveService : Service() {
         private const val PREFS = "keepalive"
         private const val KEY_STREAK = "revive_streak"
         private const val KEY_LAST_REVIVE = "last_revive_at"
+        private const val KEY_LAST_REBOOT = "last_reboot_at"
+
+        /** 系统僵死自救：连拉不生效时 root 重启，同一台机 30 分钟内最多一次 */
+        private const val REBOOT_COOLDOWN_MS = 30 * 60_000L
     }
 }
