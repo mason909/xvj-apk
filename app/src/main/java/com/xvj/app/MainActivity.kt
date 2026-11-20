@@ -231,7 +231,7 @@ class MainActivity : AppCompatActivity() {
      * 本机最近一次**动了画面**的墙板/DMX 触发源；null = 这台机开机至今没收到过学过的帧
      * （跟随窗口退回各自的固定逻辑）。两种源：
      *   [PanelSource.Frame] 学习来的帧指纹，各幕按自己的绑定表各自解析出该切的格子；
-     *   [PanelSource.Dmx]   副板通道变动，通道号直接就是格子号（A/B 各切各的物理目录）。
+     *   [PanelSource.Dmx]   副板通道 1 的值就是格子号（1~30，A/B 各切各的物理目录）。
      * 只在内存里，故意不落 prefs：重启后回到"没按过"，画面落在各窗自己的固定格 ——
      * 现场要的是可预测的开机画面，而不是上一次营业结束时的状态；也因此不用跟 rev 对账。
      * 读写都在主线程（墙板/DMX 事件由链路 post 到主线程，窗口应用也在主线程）。
@@ -244,6 +244,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 上一帧 20 路通道值；null = 刚开链路还没收到过帧（首帧只当基线，不触发）。
      * 值变动（且新值非零）才算"按了一次"，落到 [PanelSource.Dmx] 与 485 共用同一套切格逻辑。
+     * 调格只认 [DMX_FOLDER_CHANNEL] 这一路，其余通道照存不认（副板 20 路都可能变，基线得整帧对比）。
      */
     private var dmxPrev: IntArray? = null
     /** 收到的帧去重台账：心跳带回云端做排障可见，学习模式的候选列表也从它出（主线程读写） */
@@ -483,6 +484,10 @@ class MainActivity : AppCompatActivity() {
          * 不挡的话一次按键会连跳两支；超出窗口的重复才按用户定的语义"播下一支"处理。
          */
         private const val WALLPANEL_REPEAT_DEBOUNCE_MS = 300L
+        /** DMX512 调格通道：写死第 1 路（下标 0），值 N 就调文件夹 NN；其余 19 路只存不认 */
+        private const val DMX_FOLDER_CHANNEL = 0
+        /** 通道值 1:1 对应文件夹 01~30，值域外的 31~255 没有格子可落 */
+        private const val DMX_FOLDER_MAX = 30
         /** 输出基准的缺省值 = 历史口径那份 1920×1080 设计稿（房间没设 config.output 时按它换算） */
         private const val DESIGN_W = 1920
         private const val DESIGN_H = 1080
@@ -1659,11 +1664,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * DMX512 一帧到达：值变动（且新值非零）就算"按了一次"，通道号 N 直接落到文件夹 NN，
+     * DMX512 一帧到达：只认通道 1，值 1:1 调文件夹（值 N = 格子 NN），
      * 与 485 学过的帧共用 [applyPanelSource]。口径：
      *   首帧只当基线 —— 开机时副板已经在报当前值，那不是一次按键，不能无故切格；
-     *   归零只当松手，不触发（推子/按钮回落都会经过 0）；
-     *   同一帧里多路变动各算一次（推子联动两路时两格都该动）；
+     *   值没变不触发；归零只当松手，不触发（推子/按钮回落都会经过 0）；
+     *   1~30 之外的值为 0 或 31~255：没有对应文件夹，忽略；
      *   这一格没在任何一幕开 DMX512 控制 → 只记日志，链路照常收帧（别的格可能开着）。
      * 已在主线程（DmxLink 把帧 post 过来了）。
      */
@@ -1674,12 +1679,10 @@ class MainActivity : AppCompatActivity() {
             logToFile("DMX 首帧已收（基线不触发）: ${frame.summary()}", "INFO", "DMX", "FRAME")
             return
         }
-        for (i in frame.channels.indices) {
-            val v = frame.channels[i]
-            if (v == 0 || v == prev.getOrElse(i) { -1 }) continue
-            val fid = (if (i + 1 < 10) "0" else "") + (i + 1)
-            onDmxTrigger(fid, v)
-        }
+        val v = frame.channels.getOrNull(DMX_FOLDER_CHANNEL) ?: return
+        if (v == 0 || v == prev.getOrElse(DMX_FOLDER_CHANNEL) { -1 }) return
+        if (v > DMX_FOLDER_MAX) return
+        onDmxTrigger(if (v < 10) "0$v" else "$v", v)
     }
 
     /** 一路通道变动 → 一次墙板式按键（同格再按 = 下一支，见 applyPanelSource） */
@@ -1868,7 +1871,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 当前触发源对应哪一格（跟随窗口在 resolveWindowFolder 里问这一句）：
      *   学习帧 → 绑定表；没学过这一帧（或没按过）就返回 null，窗口退回自己的固定逻辑，不劫持。
-     *   DMX   → 通道号就是格子号（"01".."20"），无表可查。
+     *   DMX   → 通道 1 的值就是格子号（"01".."30"），无表可查。
      * 一格一码、不分幕：A/B 两幕问出来是同一格。返回不带幕前缀的格子编号。
      */
     private fun panelFolderFor(): String? = when (val s = panelSource) {
@@ -4548,7 +4551,7 @@ class MainActivity : AppCompatActivity() {
             .map { fid -> fid to (mappings.get(fid) as? org.json.JSONArray ?: org.json.JSONArray()) }
             .toList()
 
-        // 跟随的落点只看当前触发源（panelFolderFor：学习帧查绑定表，一格一码不分幕；DMX 通道号即格子号）。
+        // 跟随的落点只看当前触发源（panelFolderFor：学习帧查绑定表，一格一码不分幕；DMX 通道 1 的值即格子号）。
         // 全量重建和墙板/DMX 切换必须同一个入口：各写一份时，重建会把人工学好的那一格忘掉，
         // 只有墙板正好按下时才切得对。DMX 还要过该幕 play_settings.dmx 的闸 ——
         // 没开的那一幕不认这一路通道，重建时也不该被它劫持，回到自己的固定逻辑。

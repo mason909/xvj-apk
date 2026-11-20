@@ -99,13 +99,13 @@ sealed class PanelAction {
 
 /**
  * 动了画面的那一次触发源（只活在内存，重启退回"没按过"）。
- * 记的是"哪一帧/哪一路让我切的"，具体切到哪一格交给学习表解析或通道号直接给出。
+ * 记的是"哪一帧/哪一路的值让我切的"，具体切到哪一格交给学习表解析或值直接给出。
  */
 sealed class PanelSource {
     /** 命中学习绑定表的帧指纹 */
     data class Frame(val hex: String) : PanelSource()
 
-    /** DMX512 通道变动：folder = 通道号对应的格子（"01".."20"，不带幕前缀） */
+    /** DMX512 通道 1 的值即格子号：folder = 值对应的格子（"01".."30"，不带幕前缀） */
     data class Dmx(val folder: String) : PanelSource()
 }
 
