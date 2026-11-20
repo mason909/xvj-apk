@@ -75,7 +75,8 @@
  * 测试背景浮层（window_testcard）：
  *   - 写入只经 setWindowTestcard()，来源同上（window_testcard 字段 / set_window_testcard 指令），
  *     与窗口名同开同关：管理台打开「窗口配置」时一起置 true，关掉一起置 false
- *   - true 时每扇在播窗口拉伸铺满 testcard.jpg（随窗口矩形变形，不保比例），画在名字/状态面板下面 —— 改窗口时每扇窗
+ *   - true 时每扇在播窗口拉伸铺满测试卡（随窗口矩形变形，不保比例），画在名字/状态面板下面：
+ *     点歌窗用网格卡 testcard_hdmi.png（对角线+十字中线对几何），其余窗用彩条卡 testcard.jpg —— 改窗口时每扇窗
  *     的框子和内容一目了然；关掉后图卡撤走，原素材继续播（不重建播放器、视频不中断）
  *   - 与 window_names 一样不进 debug 闸门、不进 rev；SharedPreferences 持久化
  * 
@@ -500,6 +501,7 @@ class MainActivity : AppCompatActivity() {
         // 测试背景图卡：原始 8000×4500，入包前压成 3840×2160 JPEG（全尺寸解码要 144MB）。
         // 设备端再按 1/2 采样解，1920 宽 ≈ 8MB —— 台架 4GB 闲置内存只有几百 MB，这张图是共享位图不能省这一步。
         private const val TEST_CARD_ASSET = "testcard.jpg"
+        private const val HDMI_CARD_ASSET = "testcard_hdmi.png"
         private const val TEST_CARD_SAMPLE = 2
     }
 
@@ -1097,8 +1099,15 @@ class MainActivity : AppCompatActivity() {
             val show = showCard || showName || showStatus
             ov.holder.visibility = if (show) View.VISIBLE else View.GONE
             if (showCard) {
-                // 图卡只解一次、全窗共享；解码失败就只留黑底（比整窗透出下层内容更清楚这是"盖住了"）
-                if (ov.card.drawable == null) testCardBitmap()?.let { ov.card.setImageBitmap(it) }
+                // 图卡按窗口类型各解一次、同类全窗共享；解码失败就只留黑底（比整窗透出下层内容更清楚这是"盖住了"）
+                val kind = if (windowContentSigs[winId]?.startsWith("HDMI|") == true) "HDMI" else "STD"
+                if (ov.cardKind != kind) {
+                    ov.cardKind = kind
+                    ov.card.setImageDrawable(null)
+                }
+                if (ov.card.drawable == null) {
+                    (if (kind == "HDMI") hdmiCardBitmap() else testCardBitmap())?.let { ov.card.setImageBitmap(it) }
+                }
             }
             ov.card.visibility = if (showCard) View.VISIBLE else View.GONE
             if (!show) continue
@@ -1244,6 +1253,8 @@ class MainActivity : AppCompatActivity() {
             isFocusable = false
             visibility = View.GONE
         }
+        /** 当前垫的图卡种类（HDMI=网格卡 / STD=彩条卡）：窗口类型变了要换卡，不能留着旧位图 */
+        var cardKind: String? = null
         val panel = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -5148,7 +5159,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 测试背景图卡只解一次：所有测试背景窗口共享同一张位图（渲染时不再拷贝） */
+    /** 彩条卡只解一次：素材窗/存量测试背景窗共享同一张位图（点歌窗走 hdmiCardBitmap 的网格卡） */
     private var testCardBmp: Bitmap? = null
     private var testCardTried = false
 
@@ -5170,6 +5181,31 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             logToFile("测试背景：图卡读取失败 ${e.message}，退回纯色", "WARN", "SYNC", "WINDOW")
             null
+        }
+    }
+
+    /** 点歌窗网格卡：与彩条卡同一套懒解码口径；网格卡读不到就垫彩条卡，仍表明"盖住了" */
+    private var hdmiCardBmp: Bitmap? = null
+    private var hdmiCardTried = false
+
+    private fun hdmiCardBitmap(): Bitmap? {
+        hdmiCardBmp?.let { return it }
+        if (hdmiCardTried) return testCardBitmap()
+        hdmiCardTried = true
+        return try {
+            val opts = BitmapFactory.Options().apply { inSampleSize = TEST_CARD_SAMPLE }
+            assets.open(HDMI_CARD_ASSET).use { BitmapFactory.decodeStream(it, null, opts) }
+                ?.also {
+                    hdmiCardBmp = it
+                    logToFile("测试背景：点歌窗网格卡 ${it.width}×${it.height} 就绪", "INFO", "WINDOW", "TESTCARD")
+                }
+                ?: run {
+                    logToFile("测试背景：点歌窗网格卡解码失败，退回彩条卡", "WARN", "SYNC", "WINDOW")
+                    testCardBitmap()
+                }
+        } catch (e: Exception) {
+            logToFile("测试背景：点歌窗网格卡读取失败 ${e.message}，退回彩条卡", "WARN", "SYNC", "WINDOW")
+            testCardBitmap()
         }
     }
 
