@@ -5301,9 +5301,6 @@ class MainActivity : AppCompatActivity() {
      * 解码 AAC（上面那类错误）和 AudioManager 的 binder 调用（audioserver 一僵，主线程跟着僵）。
      * 掐掉后这两类风险直接归零，播放器也不再因音轨解不开而整路停摆。
      */
-    /** 只记一次：每个窗口都建播放器，逐窗刷这条日志会把 xvj.log 冲花 */
-    @Volatile private var audioDisabledLogged = false
-
     private fun buildExoPlayer(): ExoPlayer {
         if (!audioDisabledLogged) {
             audioDisabledLogged = true
