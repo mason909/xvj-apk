@@ -4101,11 +4101,18 @@ class MainActivity : AppCompatActivity() {
      * 用 grep 一趟扫 /proc 下各进程的 cmdline：实测 43–57ms；per-pid fork tr 要 1.8s（#354 就是慢在扫描上，
      * kill 还没落地，lmkd 先把应用杀了）。别用 pidof —— comm 只取前 15 字节，会连带误杀别的
      * android.hardware.* 服务。
+     * 匹配串写成 [m]edia：su、sh、grep 自己的命令行都原样带着这串模式文本，不加这层会被自己的
+     * 正则命中、连脚本一起 kill（#355 实测退出码 137：HAL 死了，日志却报失败）。
+     * @return 杀掉的解码器进程数；脚本超时或 su 没起来时 -1
      */
-    private fun killDecodeHal(): Pair<Int, String> = execAsRoot(
-        "grep -la 'media.c2@1.*-service' /proc/[0-9]*/cmdline 2>/dev/null | " +
-            "while read f; do p=\${f#/proc/}; kill -9 \${p%/cmdline} 2>/dev/null; done; echo done",
-        8_000)
+    private fun killDecodeHal(): Int {
+        val (_, out) = execAsRoot(
+            "k=0; for f in \$(grep -la '[m]edia.c2@1.*-service' /proc/[0-9]*/cmdline 2>/dev/null); do " +
+                "p=\${f#/proc/}; p=\${p%/cmdline}; kill -9 \"\$p\" 2>/dev/null && k=\$((k+1)); done; " +
+                "echo xvj-killed=\$k",
+            8_000)
+        return Regex("xvj-killed=(\\d+)").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+    }
 
     // ========== 【A-18】副屏（1080/eDP）运行时开关 ==========
     /**
@@ -4435,11 +4442,16 @@ class MainActivity : AppCompatActivity() {
             postTeardownHealPending = true
             logToFile("拆窗后可用内存仅 ${healAvail}MB，先回收解码器缓冲再建窗", "WARN", "WINDOW", "REBUILD")
             Thread {
-                val r = killDecodeHal()
-                try { if (r.first == 0) Thread.sleep(REBUILD_HEAL_SETTLE_MS) } catch (e: InterruptedException) {}
+                val killed = killDecodeHal()
+                // 不论杀没杀成，都留沉降时间让内核把旧缓冲引用放开，再量一次留证据
+                try { Thread.sleep(REBUILD_HEAL_SETTLE_MS) } catch (e: InterruptedException) {}
                 val after = availableMemMb()
-                logToFile("解码器缓冲回收${if (r.first == 0) "完成" else "失败(code=${r.first})"}：" +
-                    "可用 ${healAvail}MB→${after}MB，继续建窗", "WARN", "WINDOW", "REBUILD")
+                val what = when {
+                    killed > 0 -> "完成（杀掉 $killed 个解码器进程）"
+                    killed == 0 -> "未命中解码器进程"
+                    else -> "脚本失败"
+                }
+                logToFile("解码器缓冲回收$what，可用 ${healAvail}MB→${after}MB，继续建窗", "WARN", "WINDOW", "REBUILD")
                 mqttHandler.post {
                     postTeardownHealPending = false
                     healWaitRetry = null
