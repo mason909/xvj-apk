@@ -349,6 +349,12 @@ class MainActivity : AppCompatActivity() {
     private var postTeardownHealPending = false
     /** 回收等待期里被挂起的最新配置；新配置到来时替换旧的（落地永远是最新一份） */
     private var healWaitRetry: Runnable? = null
+    /** 低水位看护的周期检查；只在 onCreate 起一条，onDestroy 撤掉 */
+    private var lowWaterWatchdog: Runnable? = null
+    /** 低水位看护已连续量到几次低于红线；回到红线上方立即清零 */
+    private var lowWaterLowTicks = 0
+    /** 低水位看护的回收正在后台跑：期间不再起第二遍杀 HAL */
+    private var lowWaterHealRunning = false
 
     // ========== 运维层（状态文字 + 素材同步进度条）==========
     /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
@@ -735,6 +741,8 @@ class MainActivity : AppCompatActivity() {
         touchAlive()
         startKeepAliveService()
         ensureDefaultHome()
+        // 重建自愈只管建窗前那一刻；风暴停了如果水位还趴在红线附近，靠它兜底（见 startLowWaterWatchdog）
+        startLowWaterWatchdog()
     }
 
     /**
@@ -3328,6 +3336,9 @@ class MainActivity : AppCompatActivity() {
         // HDMI 采集管线随 Activity 收摊：相机会话不跨生命周期，下次重建时由窗口的 TextureView 重新挂接
         hdmiCapture?.shutdown()
         hdmiCapture = null
+        // 低水位看护也停：下面 removeCallbacksAndMessages 虽会带走它，这里显式收掉可防以后改成别的 Handler
+        lowWaterWatchdog?.let { mqttHandler.removeCallbacks(it) }
+        lowWaterWatchdog = null
         // mqttHandler 上挂着窗口启播、rev 记账、重连倒计时、进度条刷新，全部按"界面还在"写的，
         // 必须在 releaseAllWindows 之前清空，否则播放器 release 后仍有 post 排队进来
         mqttHandler.removeCallbacksAndMessages(null)
@@ -4112,6 +4123,59 @@ class MainActivity : AppCompatActivity() {
                 "echo xvj-killed=\$k",
             8_000)
         return Regex("xvj-killed=(\\d+)").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+    }
+
+    /**
+     * 低水位看护（#357 台架复盘后的补口）：重建自愈只在「拆窗后、建窗前」那一下执行。
+     * 编辑风暴一停，若可用内存仍趴在 300–500MB（#357 实测 347–373MB），后面没有重建就再没机会回收，
+     * 整夜贴着 lmkd 的 LOW_MEMORY 线（#354 就死在 362MB）。
+     * 主线程每 LOW_WATER_TICK_MS 量一次，连续 LOW_WATER_TICKS 次低于 REBUILD_HEAL_URGENT_MB 才动手，
+     * 与重建自愈共用同一把冷却锁与同一份回收手法；回收跑后台线程，不挡主线程。
+     * 代价与重建自愈相同：画面会跳下一只（#357 实测 123–206ms），采集会话不重启。
+     */
+    private fun startLowWaterWatchdog() {
+        lowWaterWatchdog?.let { mqttHandler.removeCallbacks(it) }
+        lowWaterLowTicks = 0
+        lowWaterWatchdog = object : Runnable {
+            override fun run() {
+                checkLowWater()
+                mqttHandler.postDelayed(this, LOW_WATER_TICK_MS)
+            }
+        }
+        mqttHandler.postDelayed(lowWaterWatchdog!!, LOW_WATER_TICK_MS)
+    }
+
+    /** 主线程：一次低水位检查（回收进行中、重建自愈挂起时都不动手，避免并发杀两遍） */
+    private fun checkLowWater() {
+        if (lowWaterHealRunning || postTeardownHealPending) return
+        val avail = availableMemMb()
+        if (avail <= 0 || avail >= REBUILD_HEAL_URGENT_MB) {
+            lowWaterLowTicks = 0
+            return
+        }
+        lowWaterLowTicks++
+        if (lowWaterLowTicks < LOW_WATER_TICKS) return
+        val now = SystemClock.elapsedRealtime()
+        // 冷却期只保留计数、不杀；下个周期冷却过了还在低水位就动手
+        if (now - lastDecodeHealAtMs < REBUILD_HEAL_COOLDOWN_MS) return
+        lastDecodeHealAtMs = now
+        lowWaterHealRunning = true
+        lowWaterLowTicks = 0
+        logToFile("低水位看护：可用 ${avail}MB 已连续 ${LOW_WATER_TICKS * (LOW_WATER_TICK_MS / 1000)}s " +
+            "低于 ${REBUILD_HEAL_URGENT_MB}MB，回收解码器缓冲", "WARN", "WINDOW", "REBUILD")
+        Thread {
+            val killed = killDecodeHal()
+            // 与重建自愈同口径：不论杀没杀成，都留沉降时间再量，留一份可对账的回收账
+            try { Thread.sleep(REBUILD_HEAL_SETTLE_MS) } catch (e: InterruptedException) {}
+            val after = availableMemMb()
+            val what = when {
+                killed > 0 -> "完成（杀掉 $killed 个解码器进程）"
+                killed == 0 -> "未命中解码器进程"
+                else -> "脚本失败"
+            }
+            logToFile("低水位看护$what，可用 ${avail}MB→${after}MB", "WARN", "WINDOW", "REBUILD")
+            mqttHandler.post { lowWaterHealRunning = false }
+        }.apply { isDaemon = true }.start()
     }
 
     // ========== 【A-18】副屏（1080/eDP）运行时开关 ==========
@@ -6208,6 +6272,15 @@ class MainActivity : AppCompatActivity() {
      * 杀进程（#354 死在 362MB）。60s 冷却曾被编辑风暴跑赢（#356：一次 745MB 的回收没护住后面 5 轮）。
      */
     private val REBUILD_HEAL_URGENT_MB = 450
+
+    /** 低水位看护的检查周期：每 15s 一次，只读 /proc/meminfo，几乎零开销 */
+    private val LOW_WATER_TICK_MS = 15_000L
+
+    /**
+     * 连续多少次低于 REBUILD_HEAL_URGENT_MB 才 kill HAL：2 次 ≈ 30s。
+     * 要求"持续"是为了避开换片/起播那种十几秒的瞬时低谷，别一低头就黑一下画面。
+     */
+    private val LOW_WATER_TICKS = 2
 
     /** 触发退出的左键次数 */
     private val TAP_GESTURE_COUNT = 5
