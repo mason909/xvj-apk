@@ -39,12 +39,18 @@ import java.util.concurrent.TimeUnit
  *  - 取景或旋转让采样越出纹理边界时按夹边取样（边缘拉伸），原来是容器黑底。
  * 单窗房间完全不走这条路，画面链路与改动前逐字节一致。
  *
+ * 【LOGO 模式】[lumaKey] = true 时同一套画布改成"亮度键"合成：LOGO 素材是纯黑底视频，
+ * 黑像素必须完全透出下层（不做这一步整块 LOGO 矩形会把窗口画面糊黑）。SurfaceFlinger 对
+ * TextureView 这一层只按预乘 alpha 做混合，应用侧拿不到真正的 additive 合成，所以退一步用
+ * "alpha = 取色最大分量"的近似：黑底 alpha=0 不挡下层，亮元素按自身亮度把画面提亮，
+ * 观感与叠加一致（对纯黑底 LOGO 几乎无差别）。
+ *
  * 【线程】一个视图一条 GL HandlerThread + 一个 EGL 上下文，两者都活到 shutdown。喂解码器的那块
  * 离屏 SurfaceTexture 就长在这个上下文里，所以它不随 TextureView 承载用的 st 生灭：后台/失焦时
  * 框架收掉 st，我们只摘掉对应那层窗口表面；回前台再挂一块新的，解码端全程不必重来。
  * updateTexImage 只在 GL 线程上调；几何改动来自主线程（synchronized 交接，下一帧自然生效）。
  */
-class ShareCanvasView(context: Context) : TextureView(context), TextureView.SurfaceTextureListener {
+class ShareCanvasView(context: Context, private val lumaKey: Boolean = false) : TextureView(context), TextureView.SurfaceTextureListener {
 
     /** 一扇成员窗在画布里的画面参数。坐标是画布内部像素（不是整屏），由调用方按并集矩形换算 */
     data class Member(
@@ -425,7 +431,7 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
 
     private fun buildProgram(): Int {
         val vs = compile(GLES20.GL_VERTEX_SHADER, VERTEX_SRC) ?: return 0
-        val fs = compile(GLES20.GL_FRAGMENT_SHADER, FRAGMENT_SRC) ?: return 0
+        val fs = compile(GLES20.GL_FRAGMENT_SHADER, if (lumaKey) LUMA_FRAGMENT_SRC else FRAGMENT_SRC) ?: return 0
         val p = GLES20.glCreateProgram()
         GLES20.glAttachShader(p, vs)
         GLES20.glAttachShader(p, fs)
@@ -509,6 +515,21 @@ class ShareCanvasView(context: Context) : TextureView(context), TextureView.Surf
                 vec4 c = texture2D(sTexture, vTexCoord);
                 // 亮度是乘在颜色上的（与黑色遮罩 alpha=1-亮度 等效），透明度按预乘 alpha 交给系统层混
                 gl_FragColor = vec4(c.rgb * vParam.y * vParam.x, c.a * vParam.x);
+            }
+        """
+
+        /** LOGO 模式的亮度键：alpha 取颜色最大分量（预乘合法：每通道都 ≤ 最大值），黑底 alpha=0 透出下层 */
+        private const val LUMA_FRAGMENT_SRC = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            varying vec2 vTexCoord;
+            varying vec2 vParam;
+            uniform samplerExternalOES sTexture;
+            void main() {
+                vec4 c = texture2D(sTexture, vTexCoord);
+                vec3 rgb = c.rgb * vParam.y * vParam.x;
+                float l = max(rgb.r, max(rgb.g, rgb.b));
+                gl_FragColor = vec4(rgb, l);
             }
         """
     }

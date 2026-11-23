@@ -34,6 +34,9 @@
  * 【A-15】退出到桌面与唤回（setExited / findDesktop / bringSelfByRoot / rebuildAfterExit +
  *         dispatchTouchEvent 左键连点 5 次；入口两条：云端 action:'exit_desktop' / 'reopen_desktop'，
  *         本机连点只管"退出"，回来靠桌面图标 / HOME 键 / 云端唤回）
+ * 【A-16】实时截图（云端令牌回传，见 captureAndUploadScreenshot）
+ * 【A-17】LOGO 叠加层（config.logo；applyLogoField / refreshLogoLayer / buildLogoMembers /
+ *         startLogoPlayer / startLogoDownload；一路解码 + ShareCanvasView(lumaKey) 按窗画入）
  * （A-05 已随"单播放器点播"旧链路一起删除，编号保留空位）
  * ─────────────────────────────────────────────────
  * 
@@ -356,6 +359,19 @@ class MainActivity : AppCompatActivity() {
     /** 低水位看护的回收正在后台跑：期间不再起第二遍杀 HAL */
     private var lowWaterHealRunning = false
 
+    // ========== LOGO 叠加层（config.logo）==========
+    // 房间级一份 LOGO 视频 + 每扇素材窗里的落点。设备端自己画：一路解码 + 一块全屏以外的
+    // ShareCanvasView(lumaKey) 按每扇窗自己的矩形各画一遍，纯黑底按亮度键透出下层。
+    /** 云端下发的 LOGO 配置（已归一；null = 没设）。prefs 里 logo_json 是它的冷启动缓存 */
+    private var logoJson: JSONObject? = null
+    private var logoContainer: FrameLayout? = null
+    private var logoCanvas: ShareCanvasView? = null
+    private var logoPlayer: ExoPlayer? = null
+    /** 当前 LOGO 播放器喂的是哪个文件（路径）；换文件要重建播放器 */
+    private var logoPlayingFile: String = ""
+    /** LOGO 文件正在后台下载：期间不重复排任务，落地后由下载线程回头刷一层 */
+    @Volatile private var logoDownloading = false
+
     // ========== 运维层（状态文字 + 素材同步进度条）==========
     /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
     private val STATUS_ACK_MS = 3_500L
@@ -512,6 +528,13 @@ class MainActivity : AppCompatActivity() {
         private const val DMX_FOLDER_CHANNEL = 0
         /** 通道值 1:1 对应文件夹 01~30，值域外的 31~255 没有格子可落 */
         private const val DMX_FOLDER_MAX = 30
+        /** LOGO 文件地址白名单（与服务端 LOGO_URL_RE 同源）：只认本机上传目录里的内容寻址文件名，挡住外链与路径穿越 */
+        private val LOGO_PATH_RE = Regex("^/uploads/logos/[A-Za-z0-9_-]{1,64}/logo-[a-f0-9]{6,32}\\.(?:mp4|webm|mov|avi|mkv)$")
+        /** LOGO 落盘文件名（url 的最后一段）：同一条白名单的收紧版，落到 filesDir/logo/ 用 */
+        private val LOGO_FILE_RE = Regex("^logo-[a-f0-9]{6,32}\\.(?:mp4|webm|mov|avi|mkv)$")
+        private val LOGO_WINDOW_ID_RE = Regex("^[A-Za-z0-9_-]{1,64}$")
+        /** 每幕最多记多少扇窗（与服务端 LOGO_WINDOWS_MAX 同一上限） */
+        private const val LOGO_WINDOWS_MAX = 64
         /** 输出基准的缺省值 = 历史口径那份 1920×1080 设计稿（房间没设 config.output 时按它换算） */
         private const val DESIGN_W = 1920
         private const val DESIGN_H = 1080
@@ -959,6 +982,11 @@ class MainActivity : AppCompatActivity() {
         // 尺子还没恢复就会按 1920×1080 铺一遍、等载荷来了再重铺（域外值当没设，同 applyOutputField）
         designW = prefs.getInt("output_w", DESIGN_W).takeIf { it in DESIGN_PX_MIN..DESIGN_PX_MAX } ?: DESIGN_W
         designH = prefs.getInt("output_h", DESIGN_H).takeIf { it in DESIGN_PX_MIN..DESIGN_PX_MAX } ?: DESIGN_H
+
+        // LOGO 冷启动恢复：文件真值在 filesDir/logo，这里只回读配置；画面等 restoreCachedScenes 建窗后刷
+        logoJson = normalizeLogo(prefs.getString("logo_json", null)?.let {
+            try { JSONObject(it) } catch (e: Exception) { null }
+        })
 
         Log.d(TAG, "Device ID: $deviceId")
 
@@ -1666,6 +1694,356 @@ class MainActivity : AppCompatActivity() {
         logToFile("输出基准: ${nw}×${nh}", "INFO", "WINDOW", "CONFIG")
     }
 
+    // 【A-17】 LOGO 叠加层（config.logo）
+    // @tag: applyLogoField normalizeLogo refreshLogoLayer buildLogoMembers startLogoPlayer startLogoDownload
+    //
+    // 房间级一只 LOGO 视频，按配置落进若干素材窗。两道闸门同时为真才出：
+    //   1) 窗口 id 在 logo.windows[A|B] 名单里（哪幕的名单都行，名单本身只表达"这扇窗允许"）；
+    //   2) 这扇窗此刻在播的那一格 play_settings.logo === true（切到没开 LOGO 的格就不显示）。
+    // 设备端只起**一路解码**：ExoPlayer 出帧进 ShareCanvasView(lumaKey=true) 的离屏纹理，
+    // 画布再按每扇成员窗的 LOGO 矩形各画一遍（纯黑底按亮度键透出下层，取舍见 ShareCanvasView 注释）。
+    // 不起 N 路播放器的理由与同格共享解码相同：这台盒子 4K60 已吃满 CPU，多一路解码换不来画质，
+    // 只多一份 dma-buf 泄漏风险。
+    //
+    // 几何与前端预览严格同口径：盒中心 = 窗口中心 + (x/200)*窗宽、(y/200)*窗高；盒尺寸 = 窗宽*w%、窗高*h%；
+    // 盒越出窗口的部分按前端画布的 overflow:hidden 裁掉（换算进 Member.crop 归一化取景区）。
+
+    /**
+     * config.logo 的唯一写入口（auth_result / sync_room_materials / update_windows 三处调用）。
+     * 没带这个键 = 保持原样（update_windows 不带、老云端也不带）；带了但为 null/脏值 = 撤下。
+     * 与 applyOutputField 的"缺键不动"同口径：服务端没设时整个键不落，不能拿缺省把既有配置抹掉。
+     */
+    private fun applyLogoField(payload: JSONObject) {
+        if (!payload.has("logo")) return
+        val next = normalizeLogo(payload.optJSONObject("logo"))
+        val prevText = logoJson?.toString()
+        logoJson = next
+        if (next == null) {
+            prefs.edit().remove("logo_json").apply()
+            if (prevText != null) logToFile("LOGO：已撤下", "INFO", "WINDOW", "LOGO")
+        } else {
+            prefs.edit().putString("logo_json", next.toString()).apply()
+            if (prevText != next.toString()) {
+                val wa = logoIdsOf(next.optJSONObject("windows")?.optJSONArray("A")).joinToString("、").ifEmpty { "无" }
+                val wb = logoIdsOf(next.optJSONObject("windows")?.optJSONArray("B")).joinToString("、").ifEmpty { "无" }
+                logToFile("LOGO：${next.optString("filename", "")} 落在 A=[$wa] B=[$wb]", "INFO", "WINDOW", "LOGO")
+            }
+        }
+        mqttHandler.post { refreshLogoLayer() }
+    }
+
+    /**
+     * 下发/缓存里的 logo 归一化：地址必须命中上传接口的固定形状，数值夹到与服务端同一值域。
+     * 不合法（缺 url / 地址不是 /uploads/logos/...）整体当"没设" —— 与 server.js roomLogoField 同口径。
+     */
+    private fun normalizeLogo(raw: JSONObject?): JSONObject? {
+        if (raw == null) return null
+        val url = raw.optString("url", "").trim()
+        if (!LOGO_PATH_RE.matches(url)) return null
+        fun num(name: String, dflt: Double): Double {
+            val v = raw.optDouble(name, dflt)
+            return if (v.isNaN()) dflt else v
+        }
+        val wins = raw.optJSONObject("windows")
+        return JSONObject().apply {
+            put("url", url)
+            put("filename", raw.optString("filename", url.substringAfterLast('/')))
+            put("md5", raw.optString("md5", "").lowercase().filter { it in '0'..'9' || it in 'a'..'f' }.take(32))
+            put("x", num("x", 0.0).coerceIn(-200.0, 200.0))
+            put("y", num("y", 0.0).coerceIn(-200.0, 200.0))
+            put("w", num("w", 50.0).coerceIn(1.0, 100.0))
+            put("h", num("h", 50.0).coerceIn(1.0, 100.0))
+            put("windows", JSONObject().apply {
+                put("A", JSONArray(logoIdsOf(wins?.optJSONArray("A"))))
+                put("B", JSONArray(logoIdsOf(wins?.optJSONArray("B"))))
+            })
+        }
+    }
+
+    /** 窗口名单过滤：只认合法 id、去重、上限 64（与服务端 logoWinIds 同一把尺） */
+    private fun logoIdsOf(arr: JSONArray?): List<String> {
+        if (arr == null) return emptyList()
+        val out = LinkedHashSet<String>()
+        for (i in 0 until arr.length()) {
+            if (out.size >= LOGO_WINDOWS_MAX) break
+            val id = arr.optString(i, "")
+            if (LOGO_WINDOW_ID_RE.matches(id)) out.add(id)
+        }
+        return out.toList()
+    }
+
+    /** LOGO 本地文件：filesDir/logo/<url 末段>；末段与 canonical 归属都校验（防御手改 prefs 的路径穿越） */
+    private fun logoFileOf(cfg: JSONObject): File? {
+        val url = cfg.optString("url", "")
+        if (!LOGO_PATH_RE.matches(url)) return null
+        val name = url.substringAfterLast('/')
+        if (!LOGO_FILE_RE.matches(name)) return null
+        val dir = File(filesDir, "logo")
+        val f = File(dir, name)
+        return try {
+            if (f.canonicalPath.startsWith(dir.canonicalPath + File.separator)) f else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 按"屏上这份 scenes + 当前 logo 配置"落一次 LOGO 层。幂等，所有触发点都汇到这里
+     * （配置落地 / 实时更新 / 墙板切格 / 下载完成）：
+     *  - 没配 / 退出到桌面 / 没有窗口同时过两道闸 → 藏起来（暂停解码）；
+     *  - 文件不在 → 藏起来并排一次下载（在飞去重），下完回头再来一遍；
+     *  - 有成员 → 起播（同文件复用播放器）+ 显示。
+     * 可从任意线程调用（MQTT 线程的处理器直接调）。
+     */
+    private fun refreshLogoLayer(scenes: JSONObject? = appliedScenes) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mqttHandler.post { refreshLogoLayer(scenes) }
+            return
+        }
+        val cfg = logoJson
+        if (cfg == null || exited) { hideLogoLayer(); return }
+        val members = buildLogoMembers(scenes, cfg)
+        if (members.isEmpty()) { hideLogoLayer(); return }
+        val file = logoFileOf(cfg)
+        if (file == null || !file.exists() || file.length() == 0L) {
+            hideLogoLayer()
+            startLogoDownload(cfg)
+            return
+        }
+        startLogoPlayer(file)
+        showLogoLayer(members)
+    }
+
+    /**
+     * 这份 scenes 里该有哪几个 LOGO 矩形。坐标是屏内像素（与窗口容器同一坐标系），
+     * 盒与窗口求交后再把"裁掉了多少"换算成归一化取景区，画布按 crop 采样就不会画到窗口外。
+     */
+    private fun buildLogoMembers(scenes: JSONObject?, cfg: JSONObject): List<ShareCanvasView.Member> {
+        if (scenes == null) return emptyList()
+        val wins = cfg.optJSONObject("windows") ?: return emptyList()
+        val allowA = logoIdsOf(wins.optJSONArray("A"))
+        val allowB = logoIdsOf(wins.optJSONArray("B"))
+        if (allowA.isEmpty() && allowB.isEmpty()) return emptyList()
+        val xOff = cfg.optDouble("x", 0.0).toFloat().coerceIn(-200f, 200f)
+        val yOff = cfg.optDouble("y", 0.0).toFloat().coerceIn(-200f, 200f)
+        val wFrac = (cfg.optDouble("w", 50.0).toFloat() / 100f).coerceIn(0.01f, 1f)
+        val hFrac = (cfg.optDouble("h", 50.0).toFloat() / 100f).coerceIn(0.01f, 1f)
+        val out = ArrayList<ShareCanvasView.Member>()
+        for ((winId, w) in enabledWindowsSorted(scenes)) {
+            if (winId !in allowA && winId !in allowB) continue
+            val view = windowViews[winId] ?: continue
+            if (view.visibility != View.VISIBLE) continue
+            // 第二道闸：这一窗此刻播的那一格开了 LOGO 才出（与云端 playSettingsValue 同一条件）
+            val folderKey = videoSurfaces[winId]?.folderKey?.takeIf { it.isNotEmpty() }
+                ?: resolveWindowFolder(scenes, w.optJSONObject("content") ?: JSONObject(), winId)
+                ?: continue
+            if (!playSettingsOf(scenes, folderKey).logo) continue
+            val g = windowGeom(w)
+            val winLeft = g[0].toFloat()
+            val winTop = g[1].toFloat()
+            val winW = g[2].toFloat().coerceAtLeast(1f)
+            val winH = g[3].toFloat().coerceAtLeast(1f)
+            val boxW = (winW * wFrac).coerceAtLeast(1f)
+            val boxH = (winH * hFrac).coerceAtLeast(1f)
+            val boxLeft = winLeft + winW / 2f + (xOff / 200f) * winW - boxW / 2f
+            val boxTop = winTop + winH / 2f + (yOff / 200f) * winH - boxH / 2f
+            val il = maxOf(boxLeft, winLeft)
+            val it2 = maxOf(boxTop, winTop)
+            val ir = minOf(boxLeft + boxW, winLeft + winW)
+            val ib = minOf(boxTop + boxH, winTop + winH)
+            if (ir - il < 1f || ib - it2 < 1f) continue
+            val crop = floatArrayOf(
+                (il - boxLeft) / boxW, (it2 - boxTop) / boxH,
+                (ir - il) / boxW, (ib - it2) / boxH
+            )
+            val masterB = w.optDouble("_masterB", 1.0).toFloat().coerceIn(0f, 1f)
+            out.add(ShareCanvasView.Member(
+                winId = winId,
+                left = Math.round(il),
+                top = Math.round(it2),
+                width = Math.round(ir - il),
+                height = Math.round(ib - it2),
+                alpha = w.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f),
+                brightness = (w.optDouble("brightness", 1.0).toFloat() * masterB).coerceIn(0f, 1f),
+                crop = crop,
+                rotation = 0,
+                flip = "none"
+            ))
+        }
+        return out
+    }
+
+    /**
+     * 显示 LOGO 层：容器按成员矩形并集定位（画布整块摆过去，成员改画布内坐标）。
+     * 层级：窗口之上、墙板黑布与运维面板之下 —— 后两者每次都要重新 bringToFront，
+     * 因为容器是运行期子视图，不抬一次就会被新加的窗口/面板压住。
+     */
+    private fun showLogoLayer(members: List<ShareCanvasView.Member>) {
+        if (members.isEmpty()) { hideLogoLayer(); return }
+        val canvas = ensureLogoCanvas() ?: return
+        val container = logoContainer ?: return
+        var minX = members[0].left
+        var minY = members[0].top
+        var maxX = minX + members[0].width
+        var maxY = minY + members[0].height
+        for (m in members) {
+            if (m.left < minX) minX = m.left
+            if (m.top < minY) minY = m.top
+            if (m.left + m.width > maxX) maxX = m.left + m.width
+            if (m.top + m.height > maxY) maxY = m.top + m.height
+        }
+        val cw = (maxX - minX).coerceAtLeast(1)
+        val ch = (maxY - minY).coerceAtLeast(1)
+        val lp = container.layoutParams as? FrameLayout.LayoutParams
+            ?: FrameLayout.LayoutParams(cw, ch).apply { gravity = Gravity.TOP or Gravity.START }
+        if (lp.leftMargin != minX || lp.topMargin != minY || lp.width != cw || lp.height != ch) {
+            lp.leftMargin = minX
+            lp.topMargin = minY
+            lp.width = cw
+            lp.height = ch
+            container.layoutParams = lp
+        }
+        canvas.setMembers(members.map { it.copy(left = it.left - minX, top = it.top - minY) })
+        container.visibility = View.VISIBLE
+        container.bringToFront()
+        panelBlackout?.bringToFront()
+        logoPlayer?.play()
+        applyStatusUi()
+    }
+
+    /** 藏起 LOGO 层：视图 GONE（成员清空后画布不清屏，不藏会停在最后一帧）+ 播放器暂停省解码 */
+    private fun hideLogoLayer() {
+        logoContainer?.let { if (it.visibility != View.GONE) it.visibility = View.GONE }
+        logoCanvas?.setMembers(emptyList())
+        logoPlayer?.pause()
+    }
+
+    /** 懒建 LOGO 画布（lumaKey 亮度键）与容器：1×1 占位挂在窗口根上，显隐与几何由 showLogoLayer 管 */
+    private fun ensureLogoCanvas(): ShareCanvasView? {
+        logoCanvas?.let { return it }
+        val root = flSurface ?: return null
+        val canvas = ShareCanvasView(this, lumaKey = true)
+        val container = FrameLayout(this).apply { visibility = View.GONE }
+        container.addView(canvas, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        root.addView(container, FrameLayout.LayoutParams(1, 1).apply { gravity = Gravity.TOP or Gravity.START })
+        panelBlackout?.bringToFront()
+        logoContainer = container
+        logoCanvas = canvas
+        return canvas
+    }
+
+    /**
+     * 起 LOGO 解码器。同文件复用现有播放器（重复刷新配置不重开流水线）；
+     * 解码端 Surface 由画布拿到 TextureView st 之后回调过来（与共享解码组同一条交接）。
+     */
+    private fun startLogoPlayer(file: File) {
+        val path = file.absolutePath
+        val canvas = ensureLogoCanvas() ?: return
+        logoPlayer?.let { p ->
+            if (logoPlayingFile == path) {
+                if (!p.isPlaying) p.play()
+                return
+            }
+        }
+        releaseLogoPlayer()
+        val p = buildExoPlayer().apply {
+            repeatMode = Player.REPEAT_MODE_ALL
+            playWhenReady = true
+            volume = 0f
+        }
+        logoPlayer = p
+        logoPlayingFile = path
+        canvas.onDecoderSurface = { surf -> if (logoPlayer === p) p.setVideoSurface(surf) }
+        p.addListener(object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (logoPlayer === p) canvas.setDecoderSize(videoSize.width, videoSize.height)
+            }
+            override fun onPlayerError(error: PlaybackException) {
+                logToFile("LOGO 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "WINDOW", "LOGO")
+            }
+        })
+        p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+        p.prepare()
+        logToFile("LOGO 起播: ${file.name}（${file.length() / 1024}KB）", "INFO", "WINDOW", "LOGO")
+    }
+
+    /** 放掉 LOGO 解码器（换文件 / 窗口全释放 / Activity 销毁）；画布本身另由 shutdown 收 */
+    private fun releaseLogoPlayer() {
+        logoCanvas?.onDecoderSurface = null
+        logoPlayer?.release()
+        logoPlayer = null
+        logoPlayingFile = ""
+    }
+
+    /**
+     * 下载 LOGO 文件到 filesDir/logo（不在素材根下，与素材同步两不相干）。
+     * 名字内容寻址（带 md5 前 12），tmp+rename 保证半截文件不会顶替正式名；md5 复核不过按失败丢弃。
+     * 同目录只留当前这一只；在飞去重，下载完回主线程重刷一层。
+     */
+    private fun startLogoDownload(cfg: JSONObject) {
+        val urlPath = cfg.optString("url", "")
+        if (!LOGO_PATH_RE.matches(urlPath)) return
+        val name = urlPath.substringAfterLast('/')
+        if (!LOGO_FILE_RE.matches(name)) return
+        if (logoDownloading) return
+        val dir = File(filesDir, "logo")
+        if (!dir.exists() && !dir.mkdirs()) {
+            logToFile("LOGO：建目录失败 ${dir.absolutePath}", "WARN", "WINDOW", "LOGO")
+            return
+        }
+        val dest = File(dir, name)
+        val wantMd5 = cfg.optString("md5", "")
+        logoDownloading = true
+        logToFile("LOGO：开始下载 $name", "INFO", "WINDOW", "LOGO")
+        try {
+            downloadExecutor.execute {
+                var ok = false
+                val tmp = File(dir, "$name.part")
+                try {
+                    val conn = java.net.URL(APK_URL + urlPath).openConnection() as java.net.HttpURLConnection
+                    conn.connectTimeout = 15000
+                    conn.readTimeout = 30000
+                    val code = conn.responseCode
+                    if (code !in 200..299) {
+                        logToFile("LOGO：下载失败 HTTP $code $urlPath", "ERROR", "WINDOW", "LOGO")
+                        conn.disconnect()
+                    } else {
+                        conn.inputStream.use { input -> FileOutputStream(tmp).use { output -> input.copyTo(output, 65536) } }
+                        conn.disconnect()
+                        if (tmp.length() <= 0L) {
+                            logToFile("LOGO：下载到 0 字节，丢弃", "WARN", "WINDOW", "LOGO")
+                        } else {
+                            val got = calculateMd5(tmp)
+                            if (wantMd5.isNotEmpty() && got != wantMd5) {
+                                logToFile("LOGO：md5 不符（云端 $wantMd5，实得 $got），丢弃", "WARN", "WINDOW", "LOGO")
+                            } else {
+                                if (dest.exists()) dest.delete()
+                                ok = tmp.renameTo(dest)
+                                if (!ok) logToFile("LOGO：落盘改名失败", "ERROR", "WINDOW", "LOGO")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    logToFile("LOGO：下载异常 ${e.message}", "ERROR", "WINDOW", "LOGO")
+                } finally {
+                    if (tmp.exists()) tmp.delete()
+                    logoDownloading = false
+                }
+                if (ok) {
+                    // 老文件（上一版 LOGO）清掉：名字带 md5，换一次多一只，不清理会一直堆
+                    dir.listFiles()?.forEach { if (it.isFile && it.name != name) it.delete() }
+                    logToFile("LOGO：下载完成 $name（${dest.length() / 1024}KB）", "INFO", "WINDOW", "LOGO")
+                }
+                mqttHandler.post { refreshLogoLayer() }
+            }
+        } catch (e: Exception) {
+            // 线程池已 shutdown（Activity 收摊中）：复位标志，别把下一次下载永远挡在门外
+            logoDownloading = false
+            logToFile("LOGO：下载任务排队失败 ${e.message}", "WARN", "WINDOW", "LOGO")
+        }
+    }
+
     /**
      * 一帧到达要做的三件事：记账、学习期上报、判义。
      * 记账与判义是两回事 —— 485 上点歌机和墙板合并在同一根线，先无条件留痕，现场才看得清
@@ -1878,6 +2256,8 @@ class MainActivity : AppCompatActivity() {
         // 一扇都没落到新格（都没素材/被闸门拦下）就不动现状
         if (landedFolders.isNotEmpty()) applyHdmiVisibility(scenes, landedFolders)
         else applyHdmiVisibility(scenes)
+        // 换格后这一格的 play_settings.logo 也换了：LOGO 层按新落点重排（同格重复按幂等）
+        refreshLogoLayer(scenes)
     }
 
     /**
@@ -2206,6 +2586,9 @@ class MainActivity : AppCompatActivity() {
                             // 输出基准同理要先于 applySceneConfigs：那把尺决定每个窗口的落屏矩形，
                             // 建窗之后才纠正的话，这次同步出来的画面仍是按旧分母算的（下一份载荷才归位）。
                             applyOutputField(resp)
+                            // LOGO 配置也要先于 applySceneConfigs：建窗收尾会按它刷一层 LOGO 层，
+                            // 晚一步落账就会先按旧 LOGO 出一帧、等下一份载荷才纠正（见 refreshLogoLayer）。
+                            applyLogoField(resp)
                             if (resp.has("wallpanel_enabled")) {
                                 applyWallPanelEnabled(resp.optBoolean("wallpanel_enabled", false))
                             }
@@ -2510,6 +2893,8 @@ class MainActivity : AppCompatActivity() {
                     // 输出基准同样先落账：下面两条 apply 路径都 post 到主线程，改完尺子再排队，
                     // 排到时拿到的已是新分母（基准变了但 scenes 没变也要重排，见 scenesFingerprint）
                     applyOutputField(cmd)
+                    // LOGO 与输出基准同口径：先落配置，下面 applySceneConfigs 收尾才会按新 LOGO 刷层
+                    applyLogoField(cmd)
                     if (cmd.has("wallpanel_enabled")) {
                         applyWallPanelEnabled(cmd.optBoolean("wallpanel_enabled", false))
                     }
@@ -2565,6 +2950,8 @@ class MainActivity : AppCompatActivity() {
                         mqttHandler.post {
                             // 基准与窗口在同一份载荷里：先换尺再重排，只改基准时也是这条轻路径原地重算几何
                             applyOutputField(cmd)
+                            // LOGO 落账先于 applyLiveWindowUpdate：它收尾按新配置刷 LOGO 层
+                            applyLogoField(cmd)
                             applyLiveWindowUpdate(scenes)
                             // 服务端只在"素材映射没变、只有窗口变了"时走这条通道，
                             // 所以几何应用完就等于配置已落地，rev 可以直接记账
@@ -3344,6 +3731,11 @@ class MainActivity : AppCompatActivity() {
         mqttHandler.removeCallbacksAndMessages(null)
         releaseAllWindows()
         releasePlayer()
+        // LOGO 解码器必须在画布 shutdown 之前放：画布收摊要先把解码器的输出端一起收掉
+        releaseLogoPlayer()
+        logoCanvas?.shutdown()
+        logoCanvas = null
+        logoContainer = null
         // 停止定时器并发送离线状态
         stopStatusTimer()
         try {
@@ -4608,6 +5000,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
         applyHdmiVisibility(scenes, planFolders)
+        // 窗口齐了才谈得上 LOGO（两名单纯看 id、看窗口可见性与落点格）；先于运维面板刷，
+        // applyStatusUi 收尾会把面板与新 LOGO 层的层级一起摆对
+        refreshLogoLayer(scenes)
         // 窗口齐了才给每扇窗放运维面板；放完 applyStatusUi 会把当前文案落到新面板上
         refreshWindowStatusOverlays()
         appliedScenes = scenes
@@ -4940,6 +5335,8 @@ class MainActivity : AppCompatActivity() {
         }
         // 共享解码组按全组最新几何重排画面（并集矩形 + 每扇窗自己的矩形）
         for (fk in shareGroups.keys.toList()) refreshShareGroup(fk)
+        // 窗口几何/透明度和落点账都换了：LOGO 层按新的窗矩形与 play_settings 重排一次
+        refreshLogoLayer(scenes)
         // 窗口几何变了，窗口正中的运维面板跟着挪
         refreshWindowStatusOverlays()
         // 屏上现在就是这份配置了：指纹跟着走，否则下一轮素材对账收尾会白重建一次、视频重头播
@@ -5824,8 +6221,10 @@ class MainActivity : AppCompatActivity() {
     // 2026-11-18 新增 dmx 开关（文件夹是否接受 DMX512 控制，默认关）：副板链路见【A-14d】，
     // 通道 N 的值变动即"按了一次"，落到 applyPanelSource 与 485 同一套切格语义。
     // 闸门按幕判：A 幕开了、B 幕没开的格子，只有 A 幕的跟随窗会动。
+    //
+    // logo 开关同理（默认关）：这一格在播时是否允许出房间 LOGO，与 logo.windows 名单两道闸同时为真才出（见【A-17】）。
 
-    /** 一格的播放设置；全默认 = 顺序循环 + 点歌屏关 + DMX512 关（与云端 playSettingsValue 的"默认不落键"同口径） */
+    /** 一格的播放设置；全默认 = 顺序循环 + 点歌屏关 + DMX512 关 + LOGO 关（与云端 playSettingsValue 的"默认不落键"同口径） */
     private class PlaySettings(
         val shuffle: Boolean = false,
         /** true = 这一格在播时显示点歌屏（HDMI 采集）窗口；见 applyHdmiVisibility */
@@ -5833,7 +6232,9 @@ class MainActivity : AppCompatActivity() {
         /** 点歌屏模式 0=关 1~3=模式N（点歌窗有三套配置，选哪套就只显示 content.mode 相同的那套）；见 applyHdmiVisibility */
         val hdmiMode: Int = 0,
         /** true = 这一格接受 DMX512 控制（见 applyPanelSource 的 dmxAllowedFor 闸） */
-        val dmx: Boolean = false
+        val dmx: Boolean = false,
+        /** true = 这一格在播时允许出现房间 LOGO（与 logo.windows 名单同时为真才出，见 buildLogoMembers） */
+        val logo: Boolean = false
     )
 
     /**
@@ -5871,7 +6272,8 @@ class MainActivity : AppCompatActivity() {
                 hdmi = hdmiOn,
                 // 老配置只有 hdmi:true，按模式1 处理（云端模式1 不落 hdmi_mode，同一口径）
                 hdmiMode = if (!hdmiOn) 0 else cell.optInt("hdmi_mode", 1).let { if (it in 1..3) it else 1 },
-                dmx = cell.optBoolean("dmx", false)
+                dmx = cell.optBoolean("dmx", false),
+                logo = cell.optBoolean("logo", false)
             )
         }
         return PlaySettings()
@@ -6206,6 +6608,8 @@ class MainActivity : AppCompatActivity() {
         windowViews.clear()
         windowContentSigs.clear()
         windowNames.clear()
+        // 窗口都没了，LOGO 层也就没有落点（暂停解码，播放器实例留着等重建复用）
+        hideLogoLayer()
         // 窗口没了，窗口正中那些面板一并摘掉；状态文字退回整屏居中面板（退出到桌面时就是它）
         refreshWindowStatusOverlays()
         // 屏上已经没有窗口了，"已应用配置"的指纹必须一起作废：
