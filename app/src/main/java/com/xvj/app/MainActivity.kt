@@ -4096,7 +4096,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 杀掉 c2 解码器 HAL（init 会立刻拉回来）。台架实测：久跑后 4K 解码帧的内核 dma-buf
      * 都挂在 rkvdec/codec2 名下，进程死了内核引用才真还回去，可用内存一次回涨几百 MB。
-     * 按 /proc/*/cmdline 全路径匹配，别用 pidof —— comm 只取前 15 字节，会连带误杀别的
+     * 按各进程 cmdline 全路径匹配，别用 pidof —— comm 只取前 15 字节，会连带误杀别的
      * android.hardware.* 服务。
      */
     private fun killDecodeHal(): Pair<Int, String> = execAsRoot(
