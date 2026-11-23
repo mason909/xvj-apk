@@ -343,10 +343,12 @@ class MainActivity : AppCompatActivity() {
     private var lastRebuildAtMs = 0L
     /** 被重建节流挂起的应用；新配置到来时换掉旧的，落地永远是最新一份 */
     private var rebuildGateRetry: Runnable? = null
-    /** 上次重建前回收解码器缓冲的时刻（elapsedRealtime），冷却期内不再动 HAL */
+    /** 上次拆窗后回收解码器缓冲的时刻（elapsedRealtime），冷却期内不再动 HAL */
     private var lastDecodeHealAtMs = 0L
-    /** 回收任务在路上：期间到来的配置不再另起一次 */
-    private var decodeHealPending = false
+    /** 拆窗后正在等解码器缓冲回收：这期间到来的新配置只排队，不再拆第二遍 */
+    private var postTeardownHealPending = false
+    /** 回收等待期里被挂起的最新配置；新配置到来时替换旧的（落地永远是最新一份） */
+    private var healWaitRetry: Runnable? = null
 
     // ========== 运维层（状态文字 + 素材同步进度条）==========
     /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
@@ -4096,12 +4098,13 @@ class MainActivity : AppCompatActivity() {
     /**
      * 杀掉 c2 解码器 HAL（init 会立刻拉回来）。台架实测：久跑后 4K 解码帧的内核 dma-buf
      * 都挂在 rkvdec/codec2 名下，进程死了内核引用才真还回去，可用内存一次回涨几百 MB。
-     * 按各进程 cmdline 全路径匹配，别用 pidof —— comm 只取前 15 字节，会连带误杀别的
+     * 用 grep 一趟扫 /proc 下各进程的 cmdline：实测 43–57ms；per-pid fork tr 要 1.8s（#354 就是慢在扫描上，
+     * kill 还没落地，lmkd 先把应用杀了）。别用 pidof —— comm 只取前 15 字节，会连带误杀别的
      * android.hardware.* 服务。
      */
     private fun killDecodeHal(): Pair<Int, String> = execAsRoot(
-        "for p in /proc/[0-9]*; do c=\$(tr '\\000' ' ' < \$p/cmdline 2>/dev/null); " +
-            "case \"\$c\" in *media.c2@1.*-service*) kill -9 \${p#/proc/} 2>/dev/null;; esac; done; echo done",
+        "grep -la 'media.c2@1.*-service' /proc/[0-9]*/cmdline 2>/dev/null | " +
+            "while read f; do p=\${f#/proc/}; kill -9 \${p%/cmdline} 2>/dev/null; done; echo done",
         8_000)
 
     // ========== 【A-18】副屏（1080/eDP）运行时开关 ==========
@@ -4319,6 +4322,8 @@ class MainActivity : AppCompatActivity() {
         // 万一下发的是不带窗口的局部载荷，丢掉的那次结构变更由 rev 对账在下个心跳补回来。
         rebuildGateRetry?.let { mqttHandler.removeCallbacks(it) }
         rebuildGateRetry = null
+        healWaitRetry?.let { mqttHandler.removeCallbacks(it) }
+        healWaitRetry = null
         if (scenes == null) {
             Log.w(TAG, "applySceneConfigs: scenes 为空")
             logToFile("scenes 为空，跳过窗口配置", "WARN", "WINDOW", "CONFIG")
@@ -4382,29 +4387,16 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 低内存自愈：每轮全量重建都会在 codec2/rkvdec 侧留下内核 dma-buf 且不归还，
-        // 连续改结构能把 4GB 的板子从 1GB 可用一路顶到 100MB 级，再往下就是 adbd 只握手不响应的死机。
-        // 重建前可用内存不足时，先把解码器 HAL 杀掉让 init 拉新进程，旧帧的内核引用才真还回去；
-        // 期间画面会黑一下并自动跳下一只，换的是一次不把整机拖死的重建。回收失败也照常重建。
-        val healAvail = availableMemMb()
-        val healNow = SystemClock.elapsedRealtime()
-        if (healAvail in 1 until REBUILD_HEAL_MIN_MB && !decodeHealPending &&
-            healNow - lastDecodeHealAtMs >= REBUILD_HEAL_COOLDOWN_MS) {
-            decodeHealPending = true
-            lastDecodeHealAtMs = healNow
-            logToFile("可用内存仅 ${healAvail}MB，重建前先回收解码器缓冲", "WARN", "WINDOW", "REBUILD")
-            Thread {
-                try {
-                    val r = killDecodeHal()
-                    Thread.sleep(REBUILD_HEAL_SETTLE_MS)
-                    logToFile("解码器缓冲回收${if (r.first == 0) "完成，继续重建" else "失败(code=${r.first})，继续重建: ${r.second}"}",
-                        "WARN", "WINDOW", "REBUILD")
-                } finally {
-                    // 无论回收成败都回到重建：配置必须落地；冷却期会挡住下一次回收，不会连杀
-                    decodeHealPending = false
-                    mqttHandler.post { applySceneConfigs(scenes, force, refreshIfStale) }
-                }
-            }.apply { isDaemon = true }.start()
+        // 拆窗后的回收还在路上（后台线程杀 HAL + 等 1.2s）：这份新配置先排队，别在空屏上再拆一遍，
+        // 也别抢在旧配置前面建窗；期间到来的新配置会替换这份，落地永远是最新。
+        if (postTeardownHealPending) {
+            val r = Runnable {
+                healWaitRetry = null
+                applySceneConfigs(scenes, force, refreshIfStale)
+            }
+            healWaitRetry = r
+            logToFile("解码器缓冲回收中，配置延后 ${REBUILD_HEAL_SETTLE_MS}ms 再应用", "WARN", "WINDOW", "REBUILD")
+            mqttHandler.postDelayed(r, REBUILD_HEAL_SETTLE_MS)
             return
         }
         lastRebuildAtMs = rebuildNow
@@ -4430,6 +4422,42 @@ class MainActivity : AppCompatActivity() {
         windowContentSigs.clear()
         windowNames.clear()
 
+        // 低内存自愈（拆窗后、建窗前）：每轮全量重建都会在 codec2/rkvdec 侧留下内核 dma-buf 且不归还，
+        // 连续改结构能把 4GB 的板子从 1GB 可用一路顶到 100MB 级，再往下就是 adbd 只握手不响应的死机。
+        // 放在拆窗之后是因为此时本进程已没有解码客户端，杀 HAL 不会把谁挂在半路；#354 失败取证：
+        // 自愈放在拆窗前，1.8s 的 /proc 扫描还没跑完 lmkd 先把进程杀了（HAL 的 onFramesRendered
+        // 回调撞上空 listener 才 SIGSEGV——那是进程死亡的后果，不是杀出来的）。回收跑后台线程，
+        // 完成后 post 回来接着建窗，主线程不等；失败也照常建窗。
+        val healAvail = availableMemMb()
+        val healNow = SystemClock.elapsedRealtime()
+        if (healAvail in 1 until REBUILD_HEAL_MIN_MB && healNow - lastDecodeHealAtMs >= REBUILD_HEAL_COOLDOWN_MS) {
+            lastDecodeHealAtMs = healNow
+            postTeardownHealPending = true
+            logToFile("拆窗后可用内存仅 ${healAvail}MB，先回收解码器缓冲再建窗", "WARN", "WINDOW", "REBUILD")
+            Thread {
+                val r = killDecodeHal()
+                try { if (r.first == 0) Thread.sleep(REBUILD_HEAL_SETTLE_MS) } catch (e: InterruptedException) {}
+                val after = availableMemMb()
+                logToFile("解码器缓冲回收${if (r.first == 0) "完成" else "失败(code=${r.first})"}：" +
+                    "可用 ${healAvail}MB→${after}MB，继续建窗", "WARN", "WINDOW", "REBUILD")
+                mqttHandler.post {
+                    postTeardownHealPending = false
+                    healWaitRetry = null
+                    // 回收这一两秒里可能已经退出到桌面了：别在桌面身后把窗口建回来
+                    if (!exited) createWindowsForScenes(scenes, fp)
+                }
+            }.apply { isDaemon = true }.start()
+            return
+        }
+        createWindowsForScenes(scenes, fp)
+    }
+
+    /**
+     * 拆窗之后、按这份配置把窗口建起来（建视图、起播放器、落地应用账）。
+     * 从 applySceneConfigs 拆出来，是为了让「拆窗后回收解码器缓冲」能插在两次之间而不动主线程：
+     * 回收跑后台线程，完成后 post 回来接着建。必须在主线程调用。
+     */
+    private fun createWindowsForScenes(scenes: JSONObject, fp: String) {
         // 收集所有场景的窗口，A 和 B 的 windows 合并后统一渲染
         // 每个窗口播什么由自身 content 决定，不需要"当前幕"概念（485 墙板走独立链路，见 applyPanelSource）
         val allWindows = mergeSceneWindows(scenes)
@@ -6148,16 +6176,17 @@ class MainActivity : AppCompatActivity() {
     private val REBUILD_DEFER_MS = 1_500L
 
     /**
-     * 重建前的低内存自愈线（MB）：可用内存掉到它以下，先杀 codec2 HAL 把解码帧的内核引用收回来。
-     * 台架实测正常水位 1GB+，连推十几轮全量重建会滑到 134MB 且不再回涨（#352）。
+     * 拆窗后建窗前的低内存自愈线（MB）：可用内存掉到它以下，先杀 codec2 HAL 把解码帧的内核引用收回来。
+     * 台架实测正常水位 1GB+，连推十几轮全量重建会滑到 134MB 且不再回涨（#352）；留 800MB 余量，
+     * 是因为一轮 4K 建窗 + 起播本身还要吃掉几百 MB。
      */
-    private val REBUILD_HEAL_MIN_MB = 500
+    private val REBUILD_HEAL_MIN_MB = 800
 
-    /** 回收后等 HAL 重启、旧缓冲释放的时间 */
+    /** 回收后等 HAL 重启、旧缓冲释放的时间（后台线程睡，不占主线程） */
     private val REBUILD_HEAL_SETTLE_MS = 1_200L
 
-    /** 两次回收的最小间隔：冷却期内的重建宁可硬上，也不把每轮重建都变成一次黑屏 */
-    private val REBUILD_HEAL_COOLDOWN_MS = 30_000L
+    /** 两次回收的最小间隔：冷却期内的重建宁可硬上，也不把每次重建都变成一次黑屏 */
+    private val REBUILD_HEAL_COOLDOWN_MS = 60_000L
 
     /** 触发退出的左键次数 */
     private val TAP_GESTURE_COUNT = 5
