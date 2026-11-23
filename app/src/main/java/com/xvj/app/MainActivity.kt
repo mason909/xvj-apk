@@ -380,9 +380,10 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var logoDownloading = false
 
     // ========== LOGO 设置辅助网格（config.logo_grid）==========
-    // 管理台打开「LOGO设置」时整屏垫一层等像素方格的网格，帮人肉眼判断 LOGO 在每扇窗里是否被拉变形。
+    // 管理台打开「LOGO设置」时每扇素材窗里各垫一块等像素方格，帮人肉眼判断 LOGO 在这扇窗里是否被拉变形。
     // 层级压在窗口之上、LOGO 层之下；不进 rev，和 window_names 同款轻量下发（set_logo_grid）。
     private var logoGridContainer: FrameLayout? = null
+    private var logoGrid: GridOverlayView? = null
 
     // ========== 运维层（状态文字 + 素材同步进度条）==========
     /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
@@ -1999,8 +2000,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 主线程：收放 LOGO 辅助网格（logo_grid）。开着时整屏一块等像素方格，压在窗口之上、LOGO 层之下，
-     * 给现场一个绝对参照：LOGO 在方格里的宽高比一眼就能看出有没有被拉变形。
+     * 主线程：收放 LOGO 辅助网格（logo_grid）。开着时在**每扇可见素材窗的矩形内**各画一块等像素方格，
+     * 压在窗口之上、LOGO 层之下 —— 网格跟着窗口走而不是铺满整块画布，LOGO 相对所在窗的宽高比一眼可读。
      * 懒建后不再删；关掉只置 GONE，下次打开零开销。每次 refreshLogoLayer 都会再走一遍，
      * 因为窗口重建会往根上后加子视图，网格不重新置顶就会被新窗口盖住。
      */
@@ -2011,12 +2012,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val container = logoGridContainer ?: FrameLayout(this).apply {
-            addView(GridOverlayView(this@MainActivity), FrameLayout.LayoutParams(
+            addView(GridOverlayView(this@MainActivity).also { logoGrid = it }, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             visibility = View.GONE
             root.addView(this, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         }.also { logoGridContainer = it }
+        logoGrid?.setRects(logoGridRects())
         if (container.visibility != View.VISIBLE) container.visibility = View.VISIBLE
         container.bringToFront()
         logoContainer?.let { if (it.visibility == View.VISIBLE) it.bringToFront() }
@@ -2024,8 +2026,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 等像素方格：格边长取屏高 1/12，横竖同一像素数，落屏就是真正的正方形（与窗口几何同一把尺：
-     * 基准=屏真实像素时两轴分母相等）。线宽随分辨率走，8K 上 3px、1080p 上 2px。
+     * 每扇可见素材窗的落点矩形 [x, y, w, h]（屏内像素）。与窗口容器、LOGO 成员同一把尺：
+     * 走 windowGeom（输出基准换算），同格共享解码的成员窗也各得各的真实矩形，不是工作组容器。
+     */
+    private fun logoGridRects(): List<FloatArray> {
+        val scenes = appliedScenes ?: return emptyList()
+        val out = ArrayList<FloatArray>()
+        for ((winId, w) in enabledWindowsSorted(scenes)) {
+            val view = windowViews[winId] ?: continue
+            if (view.visibility != View.VISIBLE) continue
+            val g = windowGeom(w)
+            out.add(floatArrayOf(g[0].toFloat(), g[1].toFloat(), g[2].toFloat(), g[3].toFloat()))
+        }
+        return out
+    }
+
+    /**
+     * 逐窗等像素方格：只在该窗矩形内画线，格边长取窗高 1/12、横竖同一像素数 ⇒ 落屏是真正的正方形
+     * （与窗口几何同一把尺：基准=屏真实像素时两轴分母相等）。线宽随窗高走，8K 上 3px、1080p 上 2px。
      */
     private inner class GridOverlayView(ctx: Context) : View(ctx) {
         private val paint = Paint().apply {
@@ -2033,22 +2051,31 @@ class MainActivity : AppCompatActivity() {
             color = Color.argb(90, 255, 255, 255)
             isAntiAlias = false
         }
+        private var rects: List<FloatArray> = emptyList()
+
+        fun setRects(r: List<FloatArray>) {
+            rects = r
+            invalidate()
+        }
 
         override fun onDraw(canvas: Canvas) {
-            val w = width.toFloat()
-            val h = height.toFloat()
-            if (w <= 0f || h <= 0f) return
-            paint.strokeWidth = (h / 720f).coerceIn(2f, 6f)
-            val cell = (h / 12f).coerceAtLeast(24f)
-            var x = 0f
-            while (x <= w) {
-                canvas.drawLine(x, 0f, x, h, paint)
-                x += cell
-            }
-            var y = 0f
-            while (y <= h) {
-                canvas.drawLine(0f, y, w, y, paint)
-                y += cell
+            for (r in rects) {
+                val l = r[0]; val t = r[1]; val w = r[2]; val h = r[3]
+                if (w <= 0f || h <= 0f) continue
+                paint.strokeWidth = (h / 720f).coerceIn(2f, 6f)
+                val cell = (h / 12f).coerceAtLeast(24f)
+                val right = l + w
+                val bottom = t + h
+                var x = l
+                while (x <= right) {
+                    canvas.drawLine(x, t, x, bottom, paint)
+                    x += cell
+                }
+                var y = t
+                while (y <= bottom) {
+                    canvas.drawLine(l, y, right, y, paint)
+                    y += cell
+                }
             }
         }
     }
@@ -5518,6 +5545,8 @@ class MainActivity : AppCompatActivity() {
         }
         // 被关掉的那扇窗，窗口正中的运维面板要一起跟着藏起来
         applyStatusUi()
+        // 点歌窗显隐变了，逐窗网格的矩形清单也跟着变（关掉的窗不该留一块空网格）
+        applyLogoGrid()
     }
 
     /** 创建单个窗口视图并加入 flSurface */
