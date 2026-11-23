@@ -4437,10 +4437,13 @@ class MainActivity : AppCompatActivity() {
         // 完成后 post 回来接着建窗，主线程不等；失败也照常建窗。
         val healAvail = availableMemMb()
         val healNow = SystemClock.elapsedRealtime()
-        if (healAvail in 1 until REBUILD_HEAL_MIN_MB && healNow - lastDecodeHealAtMs >= REBUILD_HEAL_COOLDOWN_MS) {
+        val healUrgent = healAvail in 1 until REBUILD_HEAL_URGENT_MB
+        if (healAvail in 1 until REBUILD_HEAL_MIN_MB &&
+            (healUrgent || healNow - lastDecodeHealAtMs >= REBUILD_HEAL_COOLDOWN_MS)) {
             lastDecodeHealAtMs = healNow
             postTeardownHealPending = true
-            logToFile("拆窗后可用内存仅 ${healAvail}MB，先回收解码器缓冲再建窗", "WARN", "WINDOW", "REBUILD")
+            logToFile("拆窗后可用内存仅 ${healAvail}MB${if (healUrgent) "（已破硬底线，跳过冷却）" else ""}，" +
+                "先回收解码器缓冲再建窗", "WARN", "WINDOW", "REBUILD")
             Thread {
                 val killed = killDecodeHal()
                 // 不论杀没杀成，都留沉降时间让内核把旧缓冲引用放开，再量一次留证据
@@ -6194,11 +6197,17 @@ class MainActivity : AppCompatActivity() {
      */
     private val REBUILD_HEAL_MIN_MB = 800
 
-    /** 回收后等 HAL 重启、旧缓冲释放的时间（后台线程睡，不占主线程） */
-    private val REBUILD_HEAL_SETTLE_MS = 1_200L
+    /** 回收后等 HAL 重启、旧缓冲释放的时间（后台线程睡，不占主线程）。回收大头是异步的，2s 才量得准 */
+    private val REBUILD_HEAL_SETTLE_MS = 2_000L
 
     /** 两次回收的最小间隔：冷却期内的重建宁可硬上，也不把每次重建都变成一次黑屏 */
-    private val REBUILD_HEAL_COOLDOWN_MS = 60_000L
+    private val REBUILD_HEAL_COOLDOWN_MS = 15_000L
+
+    /**
+     * 回收的硬底线（MB）：低于它就不管冷却直接杀——此时再等冷却，等来的就是 lmkd 的 LOW_MEMORY
+     * 杀进程（#354 死在 362MB）。60s 冷却曾被编辑风暴跑赢（#356：一次 745MB 的回收没护住后面 5 轮）。
+     */
+    private val REBUILD_HEAL_URGENT_MB = 450
 
     /** 触发退出的左键次数 */
     private val TAP_GESTURE_COUNT = 5
