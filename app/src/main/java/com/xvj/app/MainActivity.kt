@@ -535,6 +535,8 @@ class MainActivity : AppCompatActivity() {
         private val LOGO_WINDOW_ID_RE = Regex("^[A-Za-z0-9_-]{1,64}$")
         /** 每幕最多记多少扇窗（与服务端 LOGO_WINDOWS_MAX 同一上限） */
         private const val LOGO_WINDOWS_MAX = 64
+        /** 逐窗几何最多记多少扇窗（与服务端 LOGO_PER_MAX 同一上限） */
+        private const val LOGO_PER_MAX = 128
         /** 输出基准的缺省值 = 历史口径那份 1920×1080 设计稿（房间没设 config.output 时按它换算） */
         private const val DESIGN_W = 1920
         private const val DESIGN_H = 1080
@@ -1706,6 +1708,7 @@ class MainActivity : AppCompatActivity() {
     // 只多一份 dma-buf 泄漏风险。
     //
     // 几何与前端预览严格同口径：盒中心 = 窗口中心 + (x/200)*窗宽、(y/200)*窗高；盒尺寸 = 窗宽*w%、窗高*h%；
+    // 每扇窗可各有一套（config.logo.per_win，各窗宽高比不同）；没单独设的窗回落到房间默认 x/y/w/h。
     // 盒越出窗口的部分按前端画布的 overflow:hidden 裁掉（换算进 Member.crop 归一化取景区）。
 
     /**
@@ -1744,20 +1747,61 @@ class MainActivity : AppCompatActivity() {
             val v = raw.optDouble(name, dflt)
             return if (v.isNaN()) dflt else v
         }
+        val gx = num("x", 0.0).coerceIn(-200.0, 200.0)
+        val gy = num("y", 0.0).coerceIn(-200.0, 200.0)
+        val gw = num("w", 50.0).coerceIn(1.0, 100.0)
+        val gh = num("h", 50.0).coerceIn(1.0, 100.0)
         val wins = raw.optJSONObject("windows")
+        // 逐窗几何：id 白名单、数值夹到与房间默认同一值域、上限 128；缺字段跟随默认
+        val per = JSONObject()
+        val rawPer = raw.optJSONObject("per_win")
+        if (rawPer != null) {
+            fun geo(g: JSONObject, name: String, dflt: Double, lo: Double, hi: Double): Double {
+                val v = g.optDouble(name, dflt)
+                return (if (v.isNaN()) dflt else v).coerceIn(lo, hi)
+            }
+            for (id in rawPer.keys().asSequence().toList().sorted()) {
+                if (per.length() >= LOGO_PER_MAX) break
+                if (!LOGO_WINDOW_ID_RE.matches(id)) continue
+                val g = rawPer.optJSONObject(id) ?: continue
+                per.put(id, JSONObject().apply {
+                    put("x", geo(g, "x", gx, -200.0, 200.0))
+                    put("y", geo(g, "y", gy, -200.0, 200.0))
+                    put("w", geo(g, "w", gw, 1.0, 100.0))
+                    put("h", geo(g, "h", gh, 1.0, 100.0))
+                })
+            }
+        }
         return JSONObject().apply {
             put("url", url)
             put("filename", raw.optString("filename", url.substringAfterLast('/')))
             put("md5", raw.optString("md5", "").lowercase().filter { it in '0'..'9' || it in 'a'..'f' }.take(32))
-            put("x", num("x", 0.0).coerceIn(-200.0, 200.0))
-            put("y", num("y", 0.0).coerceIn(-200.0, 200.0))
-            put("w", num("w", 50.0).coerceIn(1.0, 100.0))
-            put("h", num("h", 50.0).coerceIn(1.0, 100.0))
+            put("x", gx)
+            put("y", gy)
+            put("w", gw)
+            put("h", gh)
+            if (per.length() > 0) put("per_win", per)
             put("windows", JSONObject().apply {
                 put("A", JSONArray(logoIdsOf(wins?.optJSONArray("A"))))
                 put("B", JSONArray(logoIdsOf(wins?.optJSONArray("B"))))
             })
         }
+    }
+
+    /**
+     * 一扇窗的 LOGO 几何：per_win 里有这扇窗就用它，否则用房间默认 x/y/w/h。
+     * 各扇素材窗宽高比不同，同一套相对几何摆出来观感不一样，所以逐窗可单独定。
+     * 返回 [x偏移%, y偏移%, 宽占比, 高占比]（偏移是相对窗口中心的百分比，占比是窗口宽/高的 0~1）。
+     */
+    private fun logoGeoFor(cfg: JSONObject, winId: String): FloatArray {
+        val g = cfg.optJSONObject("per_win")?.optJSONObject(winId)
+        fun v(name: String, dflt: Double): Float = (g?.optDouble(name, dflt) ?: dflt).toFloat()
+        return floatArrayOf(
+            v("x", cfg.optDouble("x", 0.0)).coerceIn(-200f, 200f),
+            v("y", cfg.optDouble("y", 0.0)).coerceIn(-200f, 200f),
+            (v("w", cfg.optDouble("w", 50.0)) / 100f).coerceIn(0.01f, 1f),
+            (v("h", cfg.optDouble("h", 50.0)) / 100f).coerceIn(0.01f, 1f)
+        )
     }
 
     /** 窗口名单过滤：只认合法 id、去重、上限 64（与服务端 logoWinIds 同一把尺） */
@@ -1824,10 +1868,6 @@ class MainActivity : AppCompatActivity() {
         val allowA = logoIdsOf(wins.optJSONArray("A"))
         val allowB = logoIdsOf(wins.optJSONArray("B"))
         if (allowA.isEmpty() && allowB.isEmpty()) return emptyList()
-        val xOff = cfg.optDouble("x", 0.0).toFloat().coerceIn(-200f, 200f)
-        val yOff = cfg.optDouble("y", 0.0).toFloat().coerceIn(-200f, 200f)
-        val wFrac = (cfg.optDouble("w", 50.0).toFloat() / 100f).coerceIn(0.01f, 1f)
-        val hFrac = (cfg.optDouble("h", 50.0).toFloat() / 100f).coerceIn(0.01f, 1f)
         val out = ArrayList<ShareCanvasView.Member>()
         for ((winId, w) in enabledWindowsSorted(scenes)) {
             if (winId !in allowA && winId !in allowB) continue
@@ -1843,10 +1883,11 @@ class MainActivity : AppCompatActivity() {
             val winTop = g[1].toFloat()
             val winW = g[2].toFloat().coerceAtLeast(1f)
             val winH = g[3].toFloat().coerceAtLeast(1f)
-            val boxW = (winW * wFrac).coerceAtLeast(1f)
-            val boxH = (winH * hFrac).coerceAtLeast(1f)
-            val boxLeft = winLeft + winW / 2f + (xOff / 200f) * winW - boxW / 2f
-            val boxTop = winTop + winH / 2f + (yOff / 200f) * winH - boxH / 2f
+            val geo = logoGeoFor(cfg, winId)
+            val boxW = (winW * geo[2]).coerceAtLeast(1f)
+            val boxH = (winH * geo[3]).coerceAtLeast(1f)
+            val boxLeft = winLeft + winW / 2f + (geo[0] / 200f) * winW - boxW / 2f
+            val boxTop = winTop + winH / 2f + (geo[1] / 200f) * winH - boxH / 2f
             val il = maxOf(boxLeft, winLeft)
             val it2 = maxOf(boxTop, winTop)
             val ir = minOf(boxLeft + boxW, winLeft + winW)
