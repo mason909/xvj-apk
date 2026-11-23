@@ -164,9 +164,13 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.view.Gravity
 import android.content.res.ColorStateList
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
+import android.graphics.Paint
+import android.graphics.Shader
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
@@ -4745,14 +4749,13 @@ class MainActivity : AppCompatActivity() {
             }
             if (effB < 1f) {
                 if (dim == null) {
-                    val d = View(this).apply {
-                        setBackgroundColor(Color.BLACK)
-                        alpha = 1f - effB
+                    val d = DitherDimView(this).apply {
+                        setBrightness(effB)
                         tag = DIM_TAG
                     }
                     c.addView(d, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
                 } else {
-                    dim.alpha = 1f - effB
+                    (dim as DitherDimView).setBrightness(effB)
                 }
             } else {
                 dim?.let { c.removeView(it) }
@@ -4851,9 +4854,8 @@ class MainActivity : AppCompatActivity() {
         val container = FrameLayout(this).apply { alpha = opacity }
         container.addView(view, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         if (effB < 1f) {
-            val dim = View(this).apply {
-                setBackgroundColor(Color.BLACK)
-                alpha = 1f - effB
+            val dim = DitherDimView(this).apply {
+                setBrightness(effB)
                 tag = DIM_TAG
             }
             container.addView(dim, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
@@ -6306,5 +6308,57 @@ class MainActivity : AppCompatActivity() {
         blackout?.let { flSurface?.removeView(it) }
         blackout = null
         applyDebugUi()
+    }
+}
+
+/**
+ * 亮度遮罩：黑底 + 4×4 Bayer 抖动 alpha，替代原来的均匀 alpha 黑层。
+ *
+ * 【为什么改】遮罩靠 SurfaceFlinger 的 PREMULTIPLIED 混合实现"乘法调暗"，混在 8-bit gamma
+ * 空间里完成。光晕这类大面积低对比度渐变乘完只剩十几个台阶，现场就是一圈圈色带。
+ * 改成逐像素在 floor/ceil 之间交替后，4×4 的平均值仍是 1-brightness，量化误差被摊成
+ * 高频噪点，看到的是渐变而不是台阶。代价只是一张 4×4 位图，解码与素材链路一概不碰。
+ */
+private class DitherDimView(context: Context) : View(context) {
+    private val paint = Paint().apply {
+        // 必须逐像素落在屏幕上：开插值会把 4×4 抹成一个均匀的灰，白干
+        isFilterBitmap = false
+        isAntiAlias = false
+    }
+    private var brightness = -1f
+
+    init { setWillNotDraw(false) }
+
+    fun setBrightness(b: Float) {
+        val v = b.coerceIn(0f, 1f)
+        if (v == brightness) return
+        brightness = v
+        // 目标遮罩不透明度（0..255）拆成整数部分 + 小数部分：整数部分给每个像素，
+        // 小数部分按 Bayer 阈值分给 4×4 里的一部分像素，平均正好等于 1-brightness
+        val a = ((1f - v) * 255f).coerceIn(0f, 255f)
+        val lo = a.toInt()
+        val frac = a - lo
+        val bmp = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)
+        var i = 0
+        for (y in 0 until 4) for (x in 0 until 4) {
+            val hi = if (BAYER4[i++] < frac * 16f) 1 else 0
+            bmp.setPixel(x, y, Color.argb((lo + hi).coerceAtMost(255), 0, 0, 0))
+        }
+        paint.shader = BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+    }
+
+    companion object {
+        /** 标准 4×4 Bayer 阈值，0..15 各出现一次 */
+        private val BAYER4 = intArrayOf(
+            0, 8, 2, 10,
+            12, 4, 14, 6,
+            3, 11, 1, 9,
+            15, 7, 13, 5
+        )
     }
 }
