@@ -82,6 +82,13 @@
  *     点歌窗用网格卡 testcard_hdmi.png（对角线+十字中线对几何），其余窗用彩条卡 testcard.jpg —— 改窗口时每扇窗
  *     的框子和内容一目了然；关掉后图卡撤走，原素材继续播（不重建播放器、视频不中断）
  *   - 与 window_names 一样不进 debug 闸门、不进 rev；SharedPreferences 持久化
+ *
+ * LOGO 设置辅助网格（logo_grid）：
+ *   - 写入只经 setLogoGrid()，来源同上（logo_grid 字段 / set_logo_grid 指令），
+ *     管理台打开「LOGO设置」置 true、关掉置 false
+ *   - true 时整屏垫一层等像素方格（格边长=屏高 1/12，横竖同像素数 ⇒ 落屏是真正的正方形），
+ *     压在窗口之上、LOGO 层之下，用来肉眼判断 LOGO 在每扇窗里有没有被拉变形
+ *   - 不进 debug 闸门、不进 rev；SharedPreferences 持久化，重连/同步载荷按云端正值自愈
  * 
  * 文件夹级播放设置（scenes[X].play_settings，三端共用一份口径，详见【A-12】）：
  *   - 每格只有 { order }：'seq' 顺序循环 | 'shuffle' 随机循环；全默认的格子云端不落键 —— 落了会让全库 rev 漂移一次，
@@ -371,6 +378,11 @@ class MainActivity : AppCompatActivity() {
     private var logoPlayingFile: String = ""
     /** LOGO 文件正在后台下载：期间不重复排任务，落地后由下载线程回头刷一层 */
     @Volatile private var logoDownloading = false
+
+    // ========== LOGO 设置辅助网格（config.logo_grid）==========
+    // 管理台打开「LOGO设置」时整屏垫一层等像素方格的网格，帮人肉眼判断 LOGO 在每扇窗里是否被拉变形。
+    // 层级压在窗口之上、LOGO 层之下；不进 rev，和 window_names 同款轻量下发（set_logo_grid）。
+    private var logoGridContainer: FrameLayout? = null
 
     // ========== 运维层（状态文字 + 素材同步进度条）==========
     /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
@@ -1056,6 +1068,16 @@ class MainActivity : AppCompatActivity() {
     private fun setWindowTestcard(on: Boolean) {
         prefs.edit().putBoolean("window_testcard", on).apply()
         mqttHandler.post { applyStatusUi() }
+    }
+
+    /**
+     * logo_grid 的唯一写入口：落 prefs + 立刻刷辅助网格（口径对齐 setWindowTestcard）。
+     * 来源：auth_result / sync_room_materials 载荷里的 logo_grid 字段、set_logo_grid 指令
+     * （管理台打开「LOGO设置」时置 true，关掉置 false）。
+     */
+    private fun setLogoGrid(on: Boolean) {
+        prefs.edit().putBoolean("logo_grid", on).apply()
+        mqttHandler.post { applyLogoGrid() }
     }
 
     /**
@@ -1844,6 +1866,8 @@ class MainActivity : AppCompatActivity() {
             mqttHandler.post { refreshLogoLayer(scenes) }
             return
         }
+        // 辅助网格与 LOGO 层同一趟收口：窗口重建后网格要重新置顶到 LOGO 之下、窗口之上
+        applyLogoGrid()
         val cfg = logoJson
         if (cfg == null || exited) { hideLogoLayer(); return }
         val members = buildLogoMembers(scenes, cfg)
@@ -1972,6 +1996,61 @@ class MainActivity : AppCompatActivity() {
         logoContainer = container
         logoCanvas = canvas
         return canvas
+    }
+
+    /**
+     * 主线程：收放 LOGO 辅助网格（logo_grid）。开着时整屏一块等像素方格，压在窗口之上、LOGO 层之下，
+     * 给现场一个绝对参照：LOGO 在方格里的宽高比一眼就能看出有没有被拉变形。
+     * 懒建后不再删；关掉只置 GONE，下次打开零开销。每次 refreshLogoLayer 都会再走一遍，
+     * 因为窗口重建会往根上后加子视图，网格不重新置顶就会被新窗口盖住。
+     */
+    private fun applyLogoGrid() {
+        val root = flSurface ?: return
+        if (!prefs.getBoolean("logo_grid", false)) {
+            logoGridContainer?.let { if (it.visibility != View.GONE) it.visibility = View.GONE }
+            return
+        }
+        val container = logoGridContainer ?: FrameLayout(this).apply {
+            addView(GridOverlayView(this@MainActivity), FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            visibility = View.GONE
+            root.addView(this, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        }.also { logoGridContainer = it }
+        if (container.visibility != View.VISIBLE) container.visibility = View.VISIBLE
+        container.bringToFront()
+        logoContainer?.let { if (it.visibility == View.VISIBLE) it.bringToFront() }
+        panelBlackout?.bringToFront()
+    }
+
+    /**
+     * 等像素方格：格边长取屏高 1/12，横竖同一像素数，落屏就是真正的正方形（与窗口几何同一把尺：
+     * 基准=屏真实像素时两轴分母相等）。线宽随分辨率走，8K 上 3px、1080p 上 2px。
+     */
+    private inner class GridOverlayView(ctx: Context) : View(ctx) {
+        private val paint = Paint().apply {
+            style = Paint.Style.STROKE
+            color = Color.argb(90, 255, 255, 255)
+            isAntiAlias = false
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+            paint.strokeWidth = (h / 720f).coerceIn(2f, 6f)
+            val cell = (h / 12f).coerceAtLeast(24f)
+            var x = 0f
+            while (x <= w) {
+                canvas.drawLine(x, 0f, x, h, paint)
+                x += cell
+            }
+            var y = 0f
+            while (y <= h) {
+                canvas.drawLine(0f, y, w, y, paint)
+                y += cell
+            }
+        }
     }
 
     /**
@@ -2671,6 +2750,10 @@ class MainActivity : AppCompatActivity() {
                             if (resp.has("window_testcard")) {
                                 setWindowTestcard(resp.optBoolean("window_testcard", false))
                             }
+                            // LOGO 辅助网格同口径：载荷带了才覆盖（LOGO 页开着时服务端恒带 true）
+                            if (resp.has("logo_grid")) {
+                                setLogoGrid(resp.optBoolean("logo_grid", false))
+                            }
                             // 触发素材同步（映射真相在 scenes 里，folderMappings 仅作旧服务端兜底）；
                             // rev 随请求走，对账真的跑完才记进 appliedRev 给心跳对账用
                             if (folderMappings != null || scenes != null) {
@@ -2925,6 +3008,7 @@ class MainActivity : AppCompatActivity() {
                     // 窗口名/测试背景浮层同 debug 口径：载荷带了才覆盖（update_windows 不带 → 不动本地状态）
                     if (cmd.has("window_names")) setWindowNames(cmd.optBoolean("window_names", false))
                     if (cmd.has("window_testcard")) setWindowTestcard(cmd.optBoolean("window_testcard", false))
+                    if (cmd.has("logo_grid")) setLogoGrid(cmd.optBoolean("logo_grid", false))
                     // 墙板字段与 debug 同口径：只在载荷真带字段时才覆盖（服务端 roomWallpanelFields 恒算出
                     // 确定形状，sync_room_materials / auth_result 两条载荷都带；update_windows 不带 → 不动本地状态）
                     // 字段先落 prefs 再收放链路，同一跳里改了节点/波特率才只开一次（见 auth_result 处注释）
@@ -3089,6 +3173,14 @@ class MainActivity : AppCompatActivity() {
                     setWindowTestcard(on)
                     Log.d(TAG, "set_window_testcard: on=$on")
                     logToFile("测试背景浮层: ${if (on) "开" else "关"}", "INFO", "WINDOW", "CONFIG")
+                }
+                "set_logo_grid" -> {
+                    // LOGO 设置辅助网格的手动开关（管理台打开/关掉「LOGO设置」时由云端漏斗补一枪）。
+                    // 同 set_window_names：临时值，房间 config.logo_grid 才是真相，下一次载荷按它覆盖。
+                    val on = cmd.optBoolean("logo_grid", false)
+                    setLogoGrid(on)
+                    Log.d(TAG, "set_logo_grid: on=$on")
+                    logToFile("LOGO 辅助网格: ${if (on) "开" else "关"}", "INFO", "LOGO", "CONFIG")
                 }
                 "wallpanel_learn" -> {
                     // 学习窗（云端【S-06f】）：只控制"要不要把每一帧的候选列表即时上报"，
