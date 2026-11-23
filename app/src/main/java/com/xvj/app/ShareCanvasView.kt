@@ -39,11 +39,11 @@ import java.util.concurrent.TimeUnit
  *  - 取景或旋转让采样越出纹理边界时按夹边取样（边缘拉伸），原来是容器黑底。
  * 单窗房间完全不走这条路，画面链路与改动前逐字节一致。
  *
- * 【LOGO 模式】[lumaKey] = true 时同一套画布改成"亮度键"合成：LOGO 素材是纯黑底视频，
- * 黑像素必须完全透出下层（不做这一步整块 LOGO 矩形会把窗口画面糊黑）。SurfaceFlinger 对
- * TextureView 这一层只按预乘 alpha 做混合，应用侧拿不到真正的 additive 合成，所以退一步用
- * "alpha = 取色最大分量"的近似：黑底 alpha=0 不挡下层，亮元素按自身亮度把画面提亮，
- * 观感与叠加一致（对纯黑底 LOGO 几乎无差别）。
+ * 【LOGO 模式】[lumaKey] = true 时同一套画布改成 Resolume Auto Mask 口径的亮度键：LOGO 素材是
+ * 纯黑底视频，黑像素必须完全透出下层（不做这一步整块 LOGO 矩形会把窗口画面糊黑）。键（alpha）只取
+ * **源亮度**，颜色不被键二次衰减，窗口亮度只压暗颜色、不把键打折——否则整块 LOGO 会被乘两遍而发灰
+ * 发透。SurfaceFlinger 对 TextureView 只按预乘 alpha 混合，拿不到真正的 additive，所以颜色夹到键
+ * 以内交给"src + dst*(1-key)"合成，观感与 Resolume 的 Auto Mask 混叠一致。
  *
  * 【线程】一个视图一条 GL HandlerThread + 一个 EGL 上下文，两者都活到 shutdown。喂解码器的那块
  * 离屏 SurfaceTexture 就长在这个上下文里，所以它不随 TextureView 承载用的 st 生灭：后台/失焦时
@@ -518,7 +518,13 @@ class ShareCanvasView(context: Context, private val lumaKey: Boolean = false) : 
             }
         """
 
-        /** LOGO 模式的亮度键：alpha 取颜色最大分量（预乘合法：每通道都 ≤ 最大值），黑底 alpha=0 透出下层 */
+        /**
+         * LOGO 模式的 Auto Mask 亮度键（对齐 Resolume Auto Mask）：
+         * 键取源亮度而非压暗后的颜色——黑底 alpha=0 透出下层，中间调不再被 alpha 二次衰减；
+         * 减去 0.04 的黑底浮尘（编码器/抖动噪声）避免整块矩形蒙一层灰，pow 0.8 轻提中间调。
+         * 窗口亮度（vParam.y）只压暗颜色，透明度（vParam.x）只作用在键上；
+         * 颜色夹到键以内保持预乘合法，系统层按"src + dst*(1-key)"合成即 Auto Mask 观感。
+         */
         private const val LUMA_FRAGMENT_SRC = """
             #extension GL_OES_EGL_image_external : require
             precision mediump float;
@@ -527,9 +533,10 @@ class ShareCanvasView(context: Context, private val lumaKey: Boolean = false) : 
             uniform samplerExternalOES sTexture;
             void main() {
                 vec4 c = texture2D(sTexture, vTexCoord);
-                vec3 rgb = c.rgb * vParam.y * vParam.x;
-                float l = max(rgb.r, max(rgb.g, rgb.b));
-                gl_FragColor = vec4(rgb, l);
+                float l = max(c.r, max(c.g, c.b));
+                l = clamp((l - 0.04) / 0.96, 0.0, 1.0);
+                l = pow(l, 0.8) * vParam.x;
+                gl_FragColor = vec4(min(c.rgb * vParam.y, vec3(l)), l);
             }
         """
     }
