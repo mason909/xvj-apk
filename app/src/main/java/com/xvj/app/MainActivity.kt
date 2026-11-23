@@ -343,6 +343,10 @@ class MainActivity : AppCompatActivity() {
     private var lastRebuildAtMs = 0L
     /** 被重建节流挂起的应用；新配置到来时换掉旧的，落地永远是最新一份 */
     private var rebuildGateRetry: Runnable? = null
+    /** 上次重建前回收解码器缓冲的时刻（elapsedRealtime），冷却期内不再动 HAL */
+    private var lastDecodeHealAtMs = 0L
+    /** 回收任务在路上：期间到来的配置不再另起一次 */
+    private var decodeHealPending = false
 
     // ========== 运维层（状态文字 + 素材同步进度条）==========
     /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
@@ -4089,6 +4093,17 @@ class MainActivity : AppCompatActivity() {
         return Pair(code, out.toString().trim())
     }
 
+    /**
+     * 杀掉 c2 解码器 HAL（init 会立刻拉回来）。台架实测：久跑后 4K 解码帧的内核 dma-buf
+     * 都挂在 rkvdec/codec2 名下，进程死了内核引用才真还回去，可用内存一次回涨几百 MB。
+     * 按 /proc/*/cmdline 全路径匹配，别用 pidof —— comm 只取前 15 字节，会连带误杀别的
+     * android.hardware.* 服务。
+     */
+    private fun killDecodeHal(): Pair<Int, String> = execAsRoot(
+        "for p in /proc/[0-9]*; do c=\$(tr '\\000' ' ' < \$p/cmdline 2>/dev/null); " +
+            "case \"\$c\" in *media.c2@1.*-service*) kill -9 \${p#/proc/} 2>/dev/null;; esac; done; echo done",
+        8_000)
+
     // ========== 【A-18】副屏（1080/eDP）运行时开关 ==========
     /**
      * 副屏（1080/eDP）此刻是否通着。读 DRM 连接器的 status 文件，不靠内存记账 ——
@@ -4364,6 +4379,32 @@ class MainActivity : AppCompatActivity() {
             logToFile("整屏重建过于频繁（距上次 ${rebuildNow - lastRebuildAtMs}ms），延后 ${REBUILD_DEFER_MS}ms 再应用",
                 "WARN", "WINDOW", "REBUILD")
             mqttHandler.postDelayed(r, REBUILD_DEFER_MS)
+            return
+        }
+
+        // 低内存自愈：每轮全量重建都会在 codec2/rkvdec 侧留下内核 dma-buf 且不归还，
+        // 连续改结构能把 4GB 的板子从 1GB 可用一路顶到 100MB 级，再往下就是 adbd 只握手不响应的死机。
+        // 重建前可用内存不足时，先把解码器 HAL 杀掉让 init 拉新进程，旧帧的内核引用才真还回去；
+        // 期间画面会黑一下并自动跳下一只，换的是一次不把整机拖死的重建。回收失败也照常重建。
+        val healAvail = availableMemMb()
+        val healNow = SystemClock.elapsedRealtime()
+        if (healAvail in 1 until REBUILD_HEAL_MIN_MB && !decodeHealPending &&
+            healNow - lastDecodeHealAtMs >= REBUILD_HEAL_COOLDOWN_MS) {
+            decodeHealPending = true
+            lastDecodeHealAtMs = healNow
+            logToFile("可用内存仅 ${healAvail}MB，重建前先回收解码器缓冲", "WARN", "WINDOW", "REBUILD")
+            Thread {
+                try {
+                    val r = killDecodeHal()
+                    Thread.sleep(REBUILD_HEAL_SETTLE_MS)
+                    logToFile("解码器缓冲回收${if (r.first == 0) "完成，继续重建" else "失败(code=${r.first})，继续重建: ${r.second}"}",
+                        "WARN", "WINDOW", "REBUILD")
+                } finally {
+                    // 无论回收成败都回到重建：配置必须落地；冷却期会挡住下一次回收，不会连杀
+                    decodeHealPending = false
+                    mqttHandler.post { applySceneConfigs(scenes, force, refreshIfStale) }
+                }
+            }.apply { isDaemon = true }.start()
             return
         }
         lastRebuildAtMs = rebuildNow
@@ -6105,6 +6146,18 @@ class MainActivity : AppCompatActivity() {
 
     /** 被节流的重建延后这么久再应用 */
     private val REBUILD_DEFER_MS = 1_500L
+
+    /**
+     * 重建前的低内存自愈线（MB）：可用内存掉到它以下，先杀 codec2 HAL 把解码帧的内核引用收回来。
+     * 台架实测正常水位 1GB+，连推十几轮全量重建会滑到 134MB 且不再回涨（#352）。
+     */
+    private val REBUILD_HEAL_MIN_MB = 500
+
+    /** 回收后等 HAL 重启、旧缓冲释放的时间 */
+    private val REBUILD_HEAL_SETTLE_MS = 1_200L
+
+    /** 两次回收的最小间隔：冷却期内的重建宁可硬上，也不把每轮重建都变成一次黑屏 */
+    private val REBUILD_HEAL_COOLDOWN_MS = 30_000L
 
     /** 触发退出的左键次数 */
     private val TAP_GESTURE_COUNT = 5
