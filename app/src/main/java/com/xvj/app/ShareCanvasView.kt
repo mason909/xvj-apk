@@ -519,11 +519,10 @@ class ShareCanvasView(context: Context, private val lumaKey: Boolean = false) : 
         """
 
         /**
-         * LOGO 模式的 Auto Mask 亮度键（对齐 Resolume Auto Mask）：
-         * 键取源亮度而非压暗后的颜色——黑底 alpha=0 透出下层，中间调不再被 alpha 二次衰减；
-         * 减去 0.05 的黑底浮尘（编码器/抖动噪声）避免整块矩形蒙一层灰，pow 0.5 提中间调（实测再实一档）。
-         * 窗口亮度（vParam.y）只压暗颜色，透明度（vParam.x）只作用在键上；
-         * 颜色夹到键以内保持预乘合法，系统层按"src + dst*(1-key)"合成即 Auto Mask 观感。
+         * LOGO 模式的硬亮度键（老板口径：要不透明、像贴在窗口上的实体，只把纯黑底透掉）：
+         * 键 = 源亮度做 smoothstep 近二值化——超过噪声线的像素一律 alpha=1 实心盖住下层，
+         * 只有纯黑底 alpha=0 透出；不再按亮度渐隐，否则 LOGO 内部起伏永远半透明飘着。
+         * 颜色按键正规预乘（rgb×键×窗口亮度），实体部分整块替换背景而不是叠加。
          */
         private const val LUMA_FRAGMENT_SRC = """
             #extension GL_OES_EGL_image_external : require
@@ -534,9 +533,8 @@ class ShareCanvasView(context: Context, private val lumaKey: Boolean = false) : 
             void main() {
                 vec4 c = texture2D(sTexture, vTexCoord);
                 float l = max(c.r, max(c.g, c.b));
-                l = clamp((l - 0.05) / 0.95, 0.0, 1.0);
-                l = pow(l, 0.5) * vParam.x;
-                gl_FragColor = vec4(min(c.rgb * vParam.y, vec3(l)), l);
+                float a = smoothstep(0.02, 0.10, l) * vParam.x;
+                gl_FragColor = vec4(c.rgb * vParam.y * a, a);
             }
         """
     }
