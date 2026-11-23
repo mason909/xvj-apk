@@ -339,6 +339,10 @@ class MainActivity : AppCompatActivity() {
     private var coldStartGateSince = 0L
     /** 冷启动闸门挂着的重试；新配置到来时换掉旧的，保证落地的是最新一份 */
     private var coldStartRetry: Runnable? = null
+    /** 上一次整屏重建开始的时刻（elapsedRealtime），0 = 本进程还没重建过 */
+    private var lastRebuildAtMs = 0L
+    /** 被重建节流挂起的应用；新配置到来时换掉旧的，落地永远是最新一份 */
+    private var rebuildGateRetry: Runnable? = null
 
     // ========== 运维层（状态文字 + 素材同步进度条）==========
     /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
@@ -4296,6 +4300,10 @@ class MainActivity : AppCompatActivity() {
             return
         }
         logToFile("开始应用场景配置", "INFO", "WINDOW", "CONFIG")
+        // 有新配置在跑：作废被节流挂起的那份，让落地永远是最新的（旧场景稍后回灌会把画面倒回去）。
+        // 万一下发的是不带窗口的局部载荷，丢掉的那次结构变更由 rev 对账在下个心跳补回来。
+        rebuildGateRetry?.let { mqttHandler.removeCallbacks(it) }
+        rebuildGateRetry = null
         if (scenes == null) {
             Log.w(TAG, "applySceneConfigs: scenes 为空")
             logToFile("scenes 为空，跳过窗口配置", "WARN", "WINDOW", "CONFIG")
@@ -4343,6 +4351,22 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        // 重建节流：连着推倒整屏是这台 4GB 机器最贵的操作（每次重建 ~97MB dma-buf，见上方闸门注释）。
+        // 只在相距太近时延后，正常单次改配置不受影响；延后期间的新配置会覆盖这份，落地仍是最新。
+        val rebuildNow = SystemClock.elapsedRealtime()
+        if (!force && lastRebuildAtMs != 0L && rebuildNow - lastRebuildAtMs < REBUILD_MIN_GAP_MS) {
+            val r = Runnable {
+                rebuildGateRetry = null
+                applySceneConfigs(scenes, force, refreshIfStale)
+            }
+            rebuildGateRetry = r
+            logToFile("整屏重建过于频繁（距上次 ${rebuildNow - lastRebuildAtMs}ms），延后 ${REBUILD_DEFER_MS}ms 再应用",
+                "WARN", "WINDOW", "REBUILD")
+            mqttHandler.postDelayed(r, REBUILD_DEFER_MS)
+            return
+        }
+        lastRebuildAtMs = rebuildNow
 
         // 走到这里才是真整屏重建（原地闸门没接住）。这一行是台架复测数"重建次数"的唯一锚点，
         // 别在别处复用：播放设置翻转等在原地路径里完成，不应计入重建。
@@ -4784,8 +4808,10 @@ class MainActivity : AppCompatActivity() {
      * 配置落地时给的是屏上全部在播格；墙板/DMX 触发时只给这次真落到的格：某一幕没这一格素材就保持原画面，
      * 不参与判定（老板 2026-11-19 定调"没素材不切就行"）。
      * 每格默认关（2026-11-18 用户定调），不配置的房间点歌屏窗口不显示。
-     * 关闭 = 整扇窗 GONE：TextureView 不可见时会销毁自己那块 Surface，采集侧收到 detach，
-     * 最后一路也卸完 HdmiCapture 就关相机，4K 采集的算力和带宽一起停；再打开时走原有 attach 链重开。
+     * 关闭 = 整扇窗 GONE：TextureView 不可见时会销毁自己那块 Surface，采集侧收到 detach；
+     * 最后一路卸完 HdmiCapture 也不立刻关相机，而是留 20s 宽限（整屏重建的 detach→attach
+     * 只隔一两百毫秒，一收一开就是一次相机会话重建，HAL 侧会留 dma-buf），确认没人用了才收。
+     * 再打开时走原有 attach 链重开。
      * 没有任何视频窗在播（纯色/HDMI 房间）时按默认显示全部：这时没有格子能表达"关"。
      * @param folderIds 参与判定的在播格；null = 读屏上落点账（videoSurfaces.folderKey）
      */
@@ -6069,6 +6095,16 @@ class MainActivity : AppCompatActivity() {
 
     /** 冷启动闸门的重试间隔 */
     private val COLD_START_RETRY_MS = 3_000L
+
+    /**
+     * 整屏重建的最小间隔。台架上「加窗→改尺寸→删窗」连点会接连推倒几次，
+     * 每次都在 codec2/Surface 侧留下内核 dma-buf（#224 实测 ~97MB/次且不归还），
+     * 4GB 的板子十几轮就够把整机压死。间隔内的新配置只保留最新一份延后跑。
+     */
+    private val REBUILD_MIN_GAP_MS = 2_500L
+
+    /** 被节流的重建延后这么久再应用 */
+    private val REBUILD_DEFER_MS = 1_500L
 
     /** 触发退出的左键次数 */
     private val TAP_GESTURE_COUNT = 5

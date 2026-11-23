@@ -1,6 +1,7 @@
 package com.xvj.app
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCaptureSession
@@ -47,10 +48,21 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         const val H = 2160
         /** 帧率告警的默认目标（HAL 没报可用范围时的兜底口径） */
         private const val DEFAULT_TARGET_FPS = 60
-        private const val RETRY_MS = 10_000L
+        /** 重试退避：3s 起、翻倍、封顶 60s。固定 10s 死循环在 HAL 半死时会把缓冲池一轮轮耗光 */
+        private const val RETRY_BASE_MS = 3_000L
+        private const val RETRY_MAX_MS = 60_000L
         private const val OPEN_TIMEOUT_MS = 8_000L
         /** 重建窗口时 attach/detach 会连成一串，攒一小会儿再重开 */
         private const val RESTART_DEBOUNCE_MS = 150L
+        /**
+         * 窗口全空了也别立刻收相机：整屏重建的 detach→attach 之间只隔一两百毫秒，
+         * 一收一开就是一次相机会话重建（台架实测每次重建都在 HAL 侧留下 dma-buf，
+         * 且 2026-11-23 的整机僵死全发生在重建后的「出流」瞬间）。宽限期内保持出流，
+         * 新窗口挂上来直接复用；真的没人用了（退出到桌面/点歌屏全关）再收。
+         */
+        private const val IDLE_CLOSE_MS = 20_000L
+        /** 可用内存低于这个数不开相机会话：4K 采集一开就按码流占缓冲，此处是僵死前最后一脚 */
+        private const val MIN_OPEN_MB = 300
         /** 帧率采样窗口与低频告警间隔 */
         private const val FPS_SAMPLE_MS = 5_000L
         private const val FPS_WARN_INTERVAL_MS = 60_000L
@@ -77,6 +89,10 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var retryScheduled = false
+    /** 连续失败次数：决定下一次重试的退避间隔，出流成功或窗口回流时清零 */
+    private var retryAttempt = 0
+    /** 无窗口宽限关相机的排程（attach 会撤销） */
+    private var idleCloseScheduled = false
     private var restartPending = false
     /** openCamera 在途：期间再调一次会抛「相机已打开」 */
     private var opening = false
@@ -102,6 +118,8 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         val old = surfaces.put(winId, surface)
         renderer.attachWindow(winId, surface) // 内部会把旧 Surface 上的 EGLSurface 先销毁
         if (old != null && old !== surface) old.release()
+        cancelIdleClose()
+        retryAttempt = 0
         log("HDMI 输入：窗口 $winId 接入采集", "INFO")
         scheduleRestart()
     }
@@ -121,6 +139,7 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
 
     /** 权限刚拿到 / 配置刚变：没有会话就再开一轮 */
     fun retryNow() = handler.post {
+        retryAttempt = 0
         if (device == null && !opening) restartLocked()
     }
 
@@ -153,14 +172,13 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
 
     private fun restartLocked() {
         if (surfaces.isEmpty()) {
-            // 没有窗在用了：收回相机（在途的那一轮由 onOpened 看到空台账自行收摊）
-            if (!opening) {
-                generation++
-                closeLocked()
-            }
-            openTargets = emptyList()
+            // 没有窗在用了：先留 20s 宽限。整屏重建的 detach→attach 只隔一两百毫秒，
+            // 一收一开就是一次相机会话重建（HAL 侧留 dma-buf，见 IDLE_CLOSE_MS 注释）。
+            if (device != null || session != null || opening) scheduleIdleClose()
+            else openTargets = emptyList()
             return
         }
+        cancelIdleClose()
         // 已经在出流：窗口增减只是渲染侧的挂/摘，不用重开相机会话
         if (device != null && session != null) return
         val targets = listOfNotNull(ensureInputLocked()).takeIf { it.isNotEmpty() } ?: run {
@@ -175,13 +193,20 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         // 走到这里说明没有可用会话（或只有半开的设备）：收干净再开
         generation++
         closeLocked()
+        // 低内存不开相机：4K 采集一开就按码流占缓冲，2026-11-23 整机僵死就是紧接一次「出流」
+        val availMb = availableMemMb()
+        if (availMb in 1 until MIN_OPEN_MB) {
+            log("HDMI 输入：可用内存仅 ${availMb}MB，暂缓接入采集", "WARN")
+            scheduleRetry()
+            return
+        }
         if (appContext.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             log("HDMI 输入：没有相机权限，采集未启动", "WARN")
             onNeedPermission?.invoke()
             return
         }
         val id = findHdmiCameraId() ?: run {
-            log("HDMI 输入：系统里没有可用的采集相机（无 HDMI IN，或固件没把它接进相机 HAL），10 秒后重试", "WARN")
+            log("HDMI 输入：系统里没有可用的采集相机（无 HDMI IN，或固件没把它接进相机 HAL），${nextRetryDelayMs() / 1000} 秒后重试", "WARN")
             scheduleRetry()
             return
         }
@@ -214,7 +239,7 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
                     device = null
                     session = null
                     setStreaming(false)
-                    log("HDMI 输入：相机被断开（信号源拔线或固件收回），10 秒后重试", "WARN")
+                    log("HDMI 输入：相机被断开（信号源拔线或固件收回），${nextRetryDelayMs() / 1000} 秒后重试", "WARN")
                     scheduleRetry()
                 }
 
@@ -225,7 +250,9 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
                     device = null
                     session = null
                     setStreaming(false)
-                    log("HDMI 输入：相机错误码 $error，10 秒后重试", "ERROR")
+                    // 错误码 4 = MAX_CAMERAS_IN_USE：多半是上一轮的会话还没在 HAL 里落账，
+                    // 固定 10 秒硬撞会在半死状态下反复开会话、一轮轮耗缓冲（2026-11-23 前 73 连撞）
+                    log("HDMI 输入：相机错误码 $error，${nextRetryDelayMs() / 1000} 秒后重试（连续第 ${retryAttempt + 1} 次）", "ERROR")
                     scheduleRetry()
                 }
             }, handler)
@@ -309,7 +336,7 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
                         frames = 0
                         fpsSince = SystemClock.elapsedRealtime()
                         fpsLogged = false
-                        log("HDMI 输入：出流 ${W}x$H（${surfaces.size} 扇窗，请求 ${if (reqFps != null) "${fpsLabel}" else "默认"}fps）", "INFO")
+                        log("HDMI 输入：出流 ${W}x$H（${surfaces.size} 扇窗，请求 ${if (reqFps != null) "${fpsLabel}" else "默认"}fps，可用 ${availableMemMb()}MB）", "INFO")
                         setStreaming(true)
                     } catch (e: Exception) {
                         if (reqFps != null) {
@@ -367,13 +394,51 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
         setStreaming(false)
     }
 
+    /** 无窗口宽限：整屏重建的 detach→attach 间隙里别收相机（见 IDLE_CLOSE_MS） */
+    private val idleCloseRunnable = Runnable {
+        idleCloseScheduled = false
+        if (surfaces.isEmpty() && (device != null || session != null)) {
+            generation++
+            closeLocked()
+            openTargets = emptyList()
+            log("HDMI 输入：无窗口 ${IDLE_CLOSE_MS / 1000} 秒，收回采集", "INFO")
+        }
+    }
+
+    private fun scheduleIdleClose() {
+        if (idleCloseScheduled) return
+        idleCloseScheduled = true
+        handler.postDelayed(idleCloseRunnable, IDLE_CLOSE_MS)
+    }
+
+    private fun cancelIdleClose() {
+        if (!idleCloseScheduled) return
+        idleCloseScheduled = false
+        handler.removeCallbacks(idleCloseRunnable)
+    }
+
+    /** 下一次重试的等待：3s 起翻倍、封顶 60s（连续失败次数由 scheduleRetry 递增） */
+    private fun nextRetryDelayMs(): Long =
+        (RETRY_BASE_MS shl retryAttempt.coerceAtMost(5)).coerceAtMost(RETRY_MAX_MS)
+
+    private fun availableMemMb(): Int = try {
+        val am = appContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val mi = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mi)
+        (mi.availMem shr 20).toInt()
+    } catch (e: Exception) {
+        0
+    }
+
     private fun scheduleRetry() {
         if (retryScheduled) return
         retryScheduled = true
+        val delay = nextRetryDelayMs()
+        if (retryAttempt < 10) retryAttempt++
         handler.postDelayed({
             retryScheduled = false
             if (surfaces.isNotEmpty() && device == null && !opening) restartLocked()
-        }, RETRY_MS)
+        }, delay)
     }
 
     /**
@@ -411,6 +476,8 @@ class HdmiCapture(context: Context, private val log: (msg: String, level: String
     private fun setStreaming(v: Boolean) {
         if (streaming == v) return
         streaming = v
+        // 真的出流了：退避计数清零，下次故障重新从 3s 起
+        if (v) retryAttempt = 0
         main.post { onStreamState?.invoke(v) }
     }
 }
