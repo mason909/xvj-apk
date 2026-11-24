@@ -2000,8 +2000,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 主线程：收放 LOGO 辅助网格（logo_grid）。开着时在**每扇可见素材窗的矩形内**各画一块等像素方格，
-     * 压在窗口之上、LOGO 层之下 —— 网格跟着窗口走而不是铺满整块画布，LOGO 相对所在窗的宽高比一眼可读。
+     * 主线程：收放 LOGO 辅助网格（logo_grid）。开着时在**每扇可见素材窗的矩形内**各画一块 12×12 等分方格，
+     * 压在窗口之上、LOGO 层之下 —— 格子随窗口形状拉伸，每格恰是窗宽/12 × 窗高/12，
+     * LOGO 的 x/y/w/h 本来就是窗口百分比，一眼就能对着格子数出比例。点歌窗不出网格。
      * 懒建后不再删；关掉只置 GONE，下次打开零开销。每次 refreshLogoLayer 都会再走一遍，
      * 因为窗口重建会往根上后加子视图，网格不重新置顶就会被新窗口盖住。
      */
@@ -2026,13 +2027,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 每扇可见素材窗的落点矩形 [x, y, w, h]（屏内像素）。与窗口容器、LOGO 成员同一把尺：
+     * 每扇参与网格的素材窗落点矩形 [x, y, w, h]（屏内像素）。与窗口容器、LOGO 成员同一把尺：
      * 走 windowGeom（输出基准换算），同格共享解码的成员窗也各得各的真实矩形，不是工作组容器。
+     * 点歌窗（HDMI 内容）不参与：LOGO 网格是给素材窗校比例用的，压在点歌画面上只会捣乱。
      */
     private fun logoGridRects(): List<FloatArray> {
         val scenes = appliedScenes ?: return emptyList()
         val out = ArrayList<FloatArray>()
         for ((winId, w) in enabledWindowsSorted(scenes)) {
+            if (windowContentSigs[winId]?.startsWith("HDMI|") == true) continue
             val view = windowViews[winId] ?: continue
             if (view.visibility != View.VISIBLE) continue
             val g = windowGeom(w)
@@ -2042,8 +2045,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 逐窗等像素方格：只在该窗矩形内画线，格边长取窗高 1/12、横竖同一像素数 ⇒ 落屏是真正的正方形
-     * （与窗口几何同一把尺：基准=屏真实像素时两轴分母相等）。线宽随窗高走，8K 上 3px、1080p 上 2px。
+     * 逐窗等分方格：每扇窗固定 12×12 格，格宽=窗宽/12、格高=窗高/12 —— 格子跟着窗口形状拉伸，
+     * 不是正方形，换来的是"每格=8.33% 窗宽/窗高"，LOGO 的百分比几何可以直接数格核对。
+     * 线宽随窗高走，8K 上 3px、1080p 上 2px。
      */
     private inner class GridOverlayView(ctx: Context) : View(ctx) {
         private val paint = Paint().apply {
@@ -2063,18 +2067,13 @@ class MainActivity : AppCompatActivity() {
                 val l = r[0]; val t = r[1]; val w = r[2]; val h = r[3]
                 if (w <= 0f || h <= 0f) continue
                 paint.strokeWidth = (h / 720f).coerceIn(2f, 6f)
-                val cell = (h / 12f).coerceAtLeast(24f)
-                val right = l + w
-                val bottom = t + h
-                var x = l
-                while (x <= right) {
-                    canvas.drawLine(x, t, x, bottom, paint)
-                    x += cell
-                }
-                var y = t
-                while (y <= bottom) {
-                    canvas.drawLine(l, y, right, y, paint)
-                    y += cell
+                val stepX = w / 12f
+                val stepY = h / 12f
+                for (i in 0..12) {
+                    val x = l + stepX * i
+                    canvas.drawLine(x, t, x, t + h, paint)
+                    val y = t + stepY * i
+                    canvas.drawLine(l, y, l + w, y, paint)
                 }
             }
         }
