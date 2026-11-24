@@ -2951,8 +2951,8 @@ class MainActivity : AppCompatActivity() {
      *   exit_desktop        退出到桌面：释放画面并把原厂桌面顶到身前，进程/MQTT 全活着（与 stop 的差别见【A-15】）
      *   reopen_desktop      唤回画面：root 把自己顶回前台，回到前台那次按 prefs 的 scenes_json 重建
      *   reboot              远程重启整台设备（管理台设备卡「重启设备」；root reboot，无 root 只记日志）
-     *   secondary_display   开关 1080/eDP 副屏（管理台设备卡「副屏」；root 写 DRM 连接器，无 root 只记日志，
-     *                       实际状态由心跳 secondary_display 回传，见【A-18】）
+     *   secondary_display   已停用：单口全幅改造后 1080/eDP 由启动看护常关，收到只记一行、不写 DRM
+     *                       （心跳 secondary_display 仍照常回传，编辑器裁画布要用，见【A-18】）
      *   config              改 mqtt_server / loop（只影响单播放器 player，不影响窗口播放器）
      *   sync_room_materials 房间素材全量对账（服务端【S-07】/授权链路发出）
      *   update_windows      轻量窗口重排，不下素材（编辑器 live 实时预览）
@@ -3032,15 +3032,12 @@ class MainActivity : AppCompatActivity() {
                         shotExecutor.execute { captureAndUploadScreenshot(uploadUrl, shotToken) }
                     }
                 }
-                // 副屏开关（管理台设备卡「副屏」）：1080/eDP 那条显示链开机默认关（vendor init rc），
-                // 这里只做运行时切换。和 reboot 一样要 root，无 root 只记一行拒绝。
-                // 执行完补一跳心跳：开关是"点了立刻想看到结果"的动作，不该等下一个 30 秒周期。
+                // 副屏开关（管理台设备卡「副屏」）：显示改造为单口全幅后 1080/eDP 由启动看护常关，
+                // 开了也没有内容、还会被看护几秒内改回去（白闪一下）。管理台按钮已置灰，这里再兜一层：
+                // 收到也只记一行、不动 DRM，别和看护打架。
                 "secondary_display" -> {
-                    val on = cmd.optBoolean("on", false)
-                    logToFile("副屏开关：${if (on) "开启" else "关闭"} 1080/eDP 显示链", "INFO", "MQTT", "DISPLAY")
-                    Thread {
-                        if (applySecondaryDisplay(on)) mqttHandler.post { sendStatus("online") }
-                    }.start()
+                    logToFile("副屏开关忽略：单口全幅改造后 1080 口由看护常关（请求 on=${cmd.optBoolean("on", false)}）",
+                        "WARN", "MQTT", "DISPLAY")
                 }
                 "config" -> {
                     // 更新配置
@@ -4764,10 +4761,11 @@ class MainActivity : AppCompatActivity() {
         }.apply { isDaemon = true }.start()
     }
 
-    // ========== 【A-18】副屏（1080/eDP）运行时开关 ==========
+    // ========== 【A-18】副屏（1080/eDP）状态（开关已停用，只读） ==========
     /**
      * 副屏（1080/eDP）此刻是否通着。读 DRM 连接器的 status 文件，不靠内存记账 ——
-     * 写 off 之后内核会立刻改成 disconnected，以文件为准才反映真实链路。
+     * 启动看护把它写成 off 之后内核会改成 disconnected，以文件为准才反映真实链路。
+     * 心跳（供编辑器裁画布）与 [canvasView]（主屏是否只承担右半）都以它为判据。
      * @return true/false；本机没有这条显示链（文件不存在）或读失败时 null（心跳就不带这个字段）
      */
     private fun readSecondaryDisplayOn(): Boolean? {
@@ -4777,34 +4775,6 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             null
         }
-    }
-
-    /**
-     * 写 DRM 连接器状态来开关副屏。写 status 只改内核侧连接状态，
-     * 再写 uevent change 才会让 HWC/DisplayManager 重新探一次；台架实测 on 约 4 秒多出一块
-     * 1920×1080 扩展屏、off 约 10 秒收回（sysfs 读数立即翻转，显示解绑是异步的）。
-     * 与 reboot 共用 su 通道：量产 user 版没有 su 时只记一行拒绝，不弹授权框吊住线程。
-     * @return 命令是否执行成功（不代表显示已完全切换，实际状态以心跳读数与 dumpsys 为准）
-     */
-    private fun applySecondaryDisplay(on: Boolean): Boolean {
-        if (!File("/sys/class/drm/card0-eDP-1/status").exists()) {
-            logToFile("副屏开关放弃：本机没有 /sys/class/drm/card0-eDP-1（没有 1080/eDP 显示链）",
-                "WARN", "MQTT", "DISPLAY")
-            return false
-        }
-        if (!silentInstallReady()) {
-            logToFile("副屏开关放弃：本机没有 root，写不了 DRM 状态（量产机需系统签名或厂商特权接口）",
-                "WARN", "MQTT", "DISPLAY")
-            return false
-        }
-        val state = if (on) "on" else "off"
-        val r = execAsRoot(
-            "echo $state > /sys/class/drm/card0-eDP-1/status && echo change > /sys/class/drm/card0-eDP-1/uevent",
-            8000)
-        val ok = r.first == 0
-        logToFile("副屏开关：写入 $state ${if (ok) "成功" else "失败(code=${r.first})"}: ${r.second}",
-            if (ok) "INFO" else "ERROR", "MQTT", "DISPLAY")
-        return ok
     }
 
     // ========== 【A-16】实时截图（云端【S-15】的设备侧） ==========
@@ -5876,20 +5846,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 本机承担画布哪一块（设计坐标 [x, y, w, h]）。双屏合一的房间基准（宽高比 ≥ 2.4，16:9/21:9 都到不了）
+     * 且本机 1080/eDP 链由启动看护常关时，本机只是那块画布的主屏半屏 —— 台架 8K 口现在出来的
+     * 一块 3840×2160，正是 7680×2160 画布的右半 —— 所以只取右半、1:1 落屏（与编辑器 _canvasView 同一口径）。
+     * 副屏通着、本机没有这条显示链（null，编辑器画整幅）或屏自己就够宽（原生 7680）时照旧整幅。
+     */
+    private fun canvasView(screen: IntArray = screenPx()): IntArray {
+        if (designW < designH * 2.4f) return intArrayOf(0, 0, designW, designH)
+        if (readSecondaryDisplayOn() != false) return intArrayOf(0, 0, designW, designH)
+        if (screen[0].toFloat() / screen[1] >= 2.4f) return intArrayOf(0, 0, designW, designH)
+        return intArrayOf(designW / 2, 0, designW / 2, designH)
+    }
+
+    /**
      * 窗口几何 [x, y, width, height]（设备 px）：编辑器画布与这里共用同一把尺（房间 config.output，
-     * 没设时 [DESIGN_W]×[DESIGN_H] 设计稿），坐标与尺寸按 屏宽/基准宽、屏高/基准高 两个轴向分别换算 ——
-     * 基准取这台屏的真实像素时两个分母相等，画布上的正方形落屏还是正方形；取设计稿铺到 20:9 的屏上则拉成 1.25:1。
+     * 没设时 [DESIGN_W]×[DESIGN_H] 设计稿），先按 [canvasView] 取本机承担的那一块（单口主屏只取右半），
+     * 再把设计坐标按 屏宽/可见区宽、屏高/可见区高 两个轴向分别换算 —— 可见区与屏同比例时正方形落屏还是正方形。
      * 上下限不是为了好看，是为了兜住手写 config 的极端值：width=999999 会真去申请一百万像素的
      * TextureView，平板上是会 OOM 的。界外一律按基准的倍数给（-1×基准 到 2×基准），换一把尺不用改字面量。
      * 全量创建与 update_windows 轻量路径共用本函数，两边不会再夹出两套口径。
      */
     private fun windowGeom(w: JSONObject): IntArray {
         val screen = screenPx()
-        val sx = screen[0].toFloat() / designW
-        val sy = screen[1].toFloat() / designH
+        val view = canvasView(screen)
+        val sx = screen[0].toFloat() / view[2]
+        val sy = screen[1].toFloat() / view[3]
         return intArrayOf(
-            Math.round(w.optInt("x", 0).coerceIn(-designW, designW * 2) * sx),
-            Math.round(w.optInt("y", 0).coerceIn(-designH, designH * 2) * sy),
+            Math.round((w.optInt("x", 0).coerceIn(-designW, designW * 2) - view[0]) * sx),
+            Math.round((w.optInt("y", 0).coerceIn(-designH, designH * 2) - view[1]) * sy),
             Math.round(w.optInt("width", designW).coerceIn(64, designW * 2) * sx),
             Math.round(w.optInt("height", designH).coerceIn(64, designH * 2) * sy)
         )
