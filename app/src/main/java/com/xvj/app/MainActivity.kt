@@ -2951,8 +2951,7 @@ class MainActivity : AppCompatActivity() {
      *   exit_desktop        退出到桌面：释放画面并把原厂桌面顶到身前，进程/MQTT 全活着（与 stop 的差别见【A-15】）
      *   reopen_desktop      唤回画面：root 把自己顶回前台，回到前台那次按 prefs 的 scenes_json 重建
      *   reboot              远程重启整台设备（管理台设备卡「重启设备」；root reboot，无 root 只记日志）
-     *   secondary_display   已停用：单口全幅改造后 1080/eDP 由启动看护常关，收到只记一行、不写 DRM
-     *                       （心跳 secondary_display 仍照常回传，编辑器裁画布要用，见【A-18】）
+     *   secondary_display   开关副屏（1080/eDP）：写 DRM 状态 + /data/xvj-edp.on 标记，看护按标记保持（见【A-18】）
      *   config              改 mqtt_server / loop（只影响单播放器 player，不影响窗口播放器）
      *   sync_room_materials 房间素材全量对账（服务端【S-07】/授权链路发出）
      *   update_windows      轻量窗口重排，不下素材（编辑器 live 实时预览）
@@ -3032,12 +3031,12 @@ class MainActivity : AppCompatActivity() {
                         shotExecutor.execute { captureAndUploadScreenshot(uploadUrl, shotToken) }
                     }
                 }
-                // 副屏开关（管理台设备卡「副屏」）：显示改造为单口全幅后 1080/eDP 由启动看护常关，
-                // 开了也没有内容、还会被看护几秒内改回去（白闪一下）。管理台按钮已置灰，这里再兜一层：
-                // 收到也只记一行、不动 DRM，别和看护打架。
+                // 副屏开关（管理台设备卡「副屏」）：APK 写 DRM 连接器状态 + /data/xvj-edp.on 标记，
+                // 启动看护按标记把这条链保持住（HWC 几分钟后会热插拔重探改回 off，靠看护拉回，见【A-18】）。
                 "secondary_display" -> {
-                    logToFile("副屏开关忽略：单口全幅改造后 1080 口由看护常关（请求 on=${cmd.optBoolean("on", false)}）",
-                        "WARN", "MQTT", "DISPLAY")
+                    val on = cmd.optBoolean("on", false)
+                    logToFile("副屏开关：${if (on) "开启" else "关闭"} 1080/eDP 显示链", "INFO", "MQTT", "DISPLAY")
+                    Thread { if (applySecondaryDisplay(on)) mqttHandler.post { sendStatus("online") } }.start()
                 }
                 "config" -> {
                     // 更新配置
@@ -4761,10 +4760,10 @@ class MainActivity : AppCompatActivity() {
         }.apply { isDaemon = true }.start()
     }
 
-    // ========== 【A-18】副屏（1080/eDP）状态（开关已停用，只读） ==========
+    // ========== 【A-18】副屏（1080/eDP）开关与状态 ==========
     /**
      * 副屏（1080/eDP）此刻是否通着。读 DRM 连接器的 status 文件，不靠内存记账 ——
-     * 启动看护把它写成 off 之后内核会改成 disconnected，以文件为准才反映真实链路。
+     * 链路由启动看护按标记文件守着，内核状态才是唯一真值。
      * 心跳（供编辑器裁画布）与 [canvasView]（主屏是否只承担右半）都以它为判据。
      * @return true/false；本机没有这条显示链（文件不存在）或读失败时 null（心跳就不带这个字段）
      */
@@ -4775,6 +4774,33 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             null
         }
+    }
+
+    /**
+     * 开关副屏：写 DRM 连接器状态 + 标记文件，之后由看护（/vendor/etc/xvj-edp-guard.sh）每 5 秒保持。
+     * 为什么要标记：HWC 会在开机约 2.5 分钟后热插拔重探、把 eDP 改回 off，单靠写一次留不住。
+     * 顺序不能反：开启先落标记再写 on；关闭先删标记再写 off ——
+     * 反了会在两步之间被看护按旧标记拉回，桌面闪一下。
+     */
+    private fun applySecondaryDisplay(on: Boolean): Boolean {
+        val statusFile = File("/sys/class/drm/card0-eDP-1/status")
+        if (!statusFile.exists()) {
+            logToFile("副屏开关：本机没有 eDP 显示链（${statusFile.path} 不存在）", "WARN", "MQTT", "DISPLAY")
+            return false
+        }
+        if (!silentInstallReady()) {
+            logToFile("副屏开关：本机没有 root，无法写 DRM 状态", "WARN", "MQTT", "DISPLAY")
+            return false
+        }
+        val state = if (on) "on" else "off"
+        val flag = if (on) "touch /data/xvj-edp.on" else "rm -f /data/xvj-edp.on"
+        val r = execAsRoot(
+            "$flag && echo $state > /sys/class/drm/card0-eDP-1/status && echo change > /sys/class/drm/card0-eDP-1/uevent",
+            8000)
+        val ok = r.first == 0
+        logToFile("副屏开关：写入 $state ${if (ok) "成功" else "失败(code=${r.first})"}: ${r.second}",
+            if (ok) "INFO" else "ERROR", "MQTT", "DISPLAY")
+        return ok
     }
 
     // ========== 【A-16】实时截图（云端【S-15】的设备侧） ==========
@@ -5847,9 +5873,10 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 本机承担画布哪一块（设计坐标 [x, y, w, h]）。双屏合一的房间基准（宽高比 ≥ 2.4，16:9/21:9 都到不了）
-     * 且本机 1080/eDP 链由启动看护常关时，本机只是那块画布的主屏半屏 —— 台架 8K 口现在出来的
-     * 一块 3840×2160，正是 7680×2160 画布的右半 —— 所以只取右半、1:1 落屏（与编辑器 _canvasView 同一口径）。
-     * 副屏通着、本机没有这条显示链（null，编辑器画整幅）或屏自己就够宽（原生 7680）时照旧整幅。
+     * 且本机 1080/eDP 链关着（默认，或管理台关了副屏；见【A-18】）时，本机只是那块画布的主屏半屏 ——
+     * 台架 8K 口现在出来的是一块 3840×2160，正是 7680×2160 画布的右半 ——
+     * 所以只取右半、1:1 落屏（与编辑器 _canvasView 同一口径）。
+     * 副屏开着、本机没有这条显示链（null，编辑器画整幅）或屏自己就够宽（原生 7680）时照旧整幅。
      */
     private fun canvasView(screen: IntArray = screenPx()): IntArray {
         if (designW < designH * 2.4f) return intArrayOf(0, 0, designW, designH)
