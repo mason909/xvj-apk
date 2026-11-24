@@ -142,11 +142,13 @@ package com.xvj.app
 
 
 import android.Manifest
+import android.app.Presentation
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -154,6 +156,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Display
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -337,6 +340,20 @@ class MainActivity : AppCompatActivity() {
      */
     private var panelBlackout: View? = null
     private var panelBlackoutOn = false
+
+    // ========== 副屏（异显档 B 路线的独立渲染）==========
+    // 主屏逻辑是房间基准的左半，右边那条带子交给一块 Presentation 单独渲染。
+    // 外部显示上没有任何窗口时，系统会把它当"镜像屏"克隆主屏画面（2026-11-24 台架 HWC 取证）；
+    // 挂上 Presentation 它才变成独立内容。auxRoot 为空 = 本机此刻没有副屏在渲染（单口/切片档/副屏移出）。
+    private var auxPresentation: Presentation? = null
+    /** Presentation 里的黑底根容器：副屏窗口都挂在这上面，坐标按 [auxBand] 换算 */
+    private var auxRoot: FrameLayout? = null
+    /** 当前副屏的 displayId（-1 = 没有）：热插拔时靠它比对出"副屏在不在"的变化 */
+    private var auxDisplayId = -1
+    /** 墙板「全关」在副屏上的盖布：与主屏 panelBlackout 同一语义、各挂各的根 */
+    private var auxPanelBlackout: View? = null
+    /** 显示增删监听（副屏热插拔）；只在没有退出到桌面时触发重建 */
+    private var displayListener: DisplayManager.DisplayListener? = null
     /** 界面是否在前台（onResume 起、onPause 落）：云端「唤回」据此决定自己顶回来还是等现场按键 */
     private var activityForeground = false
     /** 还在桌面身后时收到的唤回：先记账，回到前台那次 onResume 补建画面 */
@@ -765,6 +782,9 @@ class MainActivity : AppCompatActivity() {
             stale.finish()
         }
         liveInstance = this
+
+        // 副屏（异显档）热插拔：接入/移出时重开演示窗口并按配置重建（见 syncAuxPresentation）
+        startDisplayWatch()
 
         // 上次是授权态就先按缓存开播，不等 MQTT 往返（见 restoreCachedScenes）
         restoreCachedScenes()
@@ -1251,18 +1271,28 @@ class MainActivity : AppCompatActivity() {
         val root = flSurface ?: return
         for ((winId, ov) in windowStatusOverlays.toList()) {
             if (!windowViews.containsKey(winId)) {
-                root.removeView(ov.holder)
+                // 面板跟着窗口挂：副屏窗口的面板在 Presentation 根上，按实际父容器摘
+                (ov.holder.parent as? ViewGroup)?.removeView(ov.holder)
                 windowStatusOverlays.remove(winId)
             }
         }
         for (winId in windowViews.keys) {
             val g = overlayGeomOf(winId) ?: continue
-            val ov = windowStatusOverlays.getOrPut(winId) {
-                WindowStatusOverlay().also {
-                    root.addView(it.holder, FrameLayout.LayoutParams(1, 1).apply {
-                        gravity = Gravity.TOP or Gravity.START
-                    })
-                }
+            // 面板跟窗口同一块根：副屏窗口的面板要挂在 Presentation 里，坐标才和窗口同一套
+            val anchor = windowViews[winId]?.parent as? FrameLayout ?: root
+            var ov = windowStatusOverlays[winId]
+            if (ov == null) {
+                ov = WindowStatusOverlay()
+                anchor.addView(ov.holder, FrameLayout.LayoutParams(1, 1).apply {
+                    gravity = Gravity.TOP or Gravity.START
+                })
+                windowStatusOverlays[winId] = ov
+            } else if (ov.holder.parent !== anchor) {
+                // 窗口换了屏（副屏接入/移出后重建）：面板跟着换根，否则会留在旧根上不显示
+                (ov.holder.parent as? ViewGroup)?.removeView(ov.holder)
+                anchor.addView(ov.holder, FrameLayout.LayoutParams(1, 1).apply {
+                    gravity = Gravity.TOP or Gravity.START
+                })
             }
             val lp = ov.holder.layoutParams as? FrameLayout.LayoutParams
                 ?: FrameLayout.LayoutParams(1, 1).apply { gravity = Gravity.TOP or Gravity.START }
@@ -1895,10 +1925,13 @@ class MainActivity : AppCompatActivity() {
         val allowB = logoIdsOf(wins.optJSONArray("B"))
         if (allowA.isEmpty() && allowB.isEmpty()) return emptyList()
         val out = ArrayList<ShareCanvasView.Member>()
+        val band = auxBand()
         for ((winId, w) in enabledWindowsSorted(scenes)) {
             if (winId !in allowA && winId !in allowB) continue
             val view = windowViews[winId] ?: continue
             if (view.visibility != View.VISIBLE) continue
+            // LOGO 画布只挂在主根上：副屏窗口暂不叠 LOGO（一块画布不能同时挂两块根）
+            if (band != null && windowOnAux(w, band)) continue
             // 第二道闸：这一窗此刻播的那一格开了 LOGO 才出（与云端 playSettingsValue 同一条件）
             val folderKey = videoSurfaces[winId]?.folderKey?.takeIf { it.isNotEmpty() }
                 ?: resolveWindowFolder(scenes, w.optJSONObject("content") ?: JSONObject(), winId)
@@ -2047,9 +2080,12 @@ class MainActivity : AppCompatActivity() {
         val rows = 12
         val cols = Math.round(rows * srcW.toFloat() / srcH).coerceIn(2, 64)
         val out = ArrayList<FloatArray>()
+        val band = auxBand()
         for ((winId, w) in enabledWindowsSorted(scenes)) {
             if (winId !in allowA && winId !in allowB) continue
             if (windowContentSigs[winId]?.startsWith("HDMI|") == true) continue
+            // 网格与 LOGO 画布同根（主根）：副屏窗口不出网格
+            if (band != null && windowOnAux(w, band)) continue
             val view = windowViews[winId] ?: continue
             if (view.visibility != View.VISIBLE) continue
             val g = windowGeom(w)
@@ -3857,6 +3893,8 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         hideSystemUI()
         player?.play()
+        // 副屏演示窗口在前后台切换/息屏唤醒后可能被系统撤掉：回到前台复查一次（状态没变就是空转）
+        if (combinedCanvas) onAuxDisplaysChanged("回前台复查")
         // 从"安装未知应用"授权页返回：复查权限后续装挂起的 APK（见 retryPendingInstall）
         if (pendingInstallApk != null) {
             installRetryHandler.removeCallbacksAndMessages(null)
@@ -3916,6 +3954,12 @@ class MainActivity : AppCompatActivity() {
         // 低水位看护也停：下面 removeCallbacksAndMessages 虽会带走它，这里显式收掉可防以后改成别的 Handler
         lowWaterWatchdog?.let { mqttHandler.removeCallbacks(it) }
         lowWaterWatchdog = null
+        // 副屏：先摘监听再收演示窗口（窗口里的视图随 releaseAllWindows 一起摘）
+        displayListener?.let { l ->
+            (getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)?.unregisterDisplayListener(l)
+        }
+        displayListener = null
+        dismissAuxPresentation()
         // mqttHandler 上挂着窗口启播、rev 记账、重连倒计时、进度条刷新，全部按"界面还在"写的，
         // 必须在 releaseAllWindows 之前清空，否则播放器 release 后仍有 post 排队进来
         mqttHandler.removeCallbacksAndMessages(null)
@@ -5070,7 +5114,8 @@ class MainActivity : AppCompatActivity() {
         destroyShareGroups()
 
         // 移除旧的窗口视图
-        windowViews.values.forEach { flSurface?.removeView(it) }
+        // 按实际父容器摘：副屏窗口挂在 Presentation 的根上，写死 flSurface 会漏摘
+        windowViews.values.forEach { (it.parent as? ViewGroup)?.removeView(it) }
         windowViews.clear()
         windowContentSigs.clear()
         windowNames.clear()
@@ -5119,6 +5164,8 @@ class MainActivity : AppCompatActivity() {
      * 回收跑后台线程，完成后 post 回来接着建。必须在主线程调用。
      */
     private fun createWindowsForScenes(scenes: JSONObject, fp: String) {
+        // 副屏演示窗口先备好：窗口挂到哪块根（主根 / Presentation）由它决定，见 rootForWindow
+        syncAuxPresentation()
         // 收集所有场景的窗口，A 和 B 的 windows 合并后统一渲染
         // 每个窗口播什么由自身 content 决定，不需要"当前幕"概念（485 墙板走独立链路，见 applyPanelSource）
         val allWindows = mergeSceneWindows(scenes)
@@ -5154,8 +5201,11 @@ class MainActivity : AppCompatActivity() {
                 PlanWindow(winId, w, content, resolveWindowFolder(scenes, content, winId))
             }
             planFolders = plan.mapNotNull { it.folderId }.distinct()
-            // 纯色 / HDMI 窗口本来就零解码，不掺进共享组
+            // 纯色 / HDMI 窗口本来就零解码，不掺进共享组；副屏那几扇也单独解码 ——
+            // 共享画布是一块挂在主根上的 GL，跨两块屏的成员并不进同一张画布（见副屏渲染段注释）
+            val band = auxBand()
             val groupsByFolder = plan.filter { isVideoContentType(it.content) && it.folderId != null }
+                .filter { band == null || !windowOnAux(it.win, band) }
                 .groupBy { it.folderId!! }
                 .filterValues { it.size >= 2 }
             // 组的画布放在"该组最上层那扇成员"原来的 z 位置：下面的窗口照常透出来，
@@ -5230,6 +5280,8 @@ class MainActivity : AppCompatActivity() {
         if (appliedWindowOrder.isEmpty() || previews.isNotEmpty()) return false
         val desired = enabledWindowsSorted(scenes)
         if (desired.map { it.first } != appliedWindowOrder) return false
+        // 副屏接入/移出后旧视图还挂在另一块根上：原地改换不了父容器，回退全量重建
+        if (windowParentMismatch(desired)) return false
 
         val plan = desired.map { (winId, w) ->
             val content = w.optJSONObject("content") ?: JSONObject()
@@ -5237,7 +5289,10 @@ class MainActivity : AppCompatActivity() {
         }
         // 同格 ≥2 扇才成组：组按"成员构成"比对，不按格子名 —— 墙板换格/勾了跟随是同一组人整组换到另一格，
         // 解码路数与画布都不变，原地换清单就够；只有成员增删（含两组并到一格）才必须重建。
+        // 口径与 createWindowsForScenes 一致：副屏窗口不进主根上的共享画布。
+        val band = auxBand()
         val desiredGroups = plan.filter { isVideoContentType(it.content) && it.folderId != null }
+            .filter { band == null || !windowOnAux(it.win, band) }
             .groupBy { it.folderId!! }.filterValues { it.size >= 2 }
             .mapValues { entry -> entry.value.map { it.winId }.toSet() }
         if (shareGroups.values.map { it.members.toSet() }.toSet() != desiredGroups.values.toSet()) return false
@@ -5461,6 +5516,8 @@ class MainActivity : AppCompatActivity() {
         // 播放设置不在窗口 content 里，内容签名比不出它：只改顺序（随机/顺序）时必须判成结构变化回退重建，
         // 否则轻路径改改几何就返回，playlist 不重排、设置看着保存了却永远不生效
         var structural = desiredIds != appliedWindowOrder || playSettingsJson(scenes) != appliedPlaySettingsJson
+        // 副屏状态变了（接入/移出）视图该换根：这不是几何变化，交给全量重建
+        if (!structural && windowParentMismatch(desired)) structural = true
         if (!structural) {
             for ((winId, w) in desired) {
                 if (windowContentSigs[winId] != contentSignature(w.optJSONObject("content") ?: JSONObject())) {
@@ -5630,16 +5687,18 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.TOP or Gravity.START
         }
 
-        flSurface?.addView(container, params)
+        // 挂到哪块根由窗口归属决定：副屏窗口进 Presentation，其余在主根（见 rootForWindow）
+        val root = rootForWindow(w) ?: return
+        root.addView(container, params)
         // 全关黑布必须留在最上层：重建时新窗口是后加进来的，会把盖布压到下面
-        panelBlackout?.bringToFront()
+        if (root === auxRoot) auxPanelBlackout?.bringToFront() else panelBlackout?.bringToFront()
         windowViews[winId] = container
         windowContentSigs[winId] = contentSignature(content)
         windowNames[winId] = w.optString("name", "")
         // 布局完成后应用截取/旋转/镜像（取景与矩阵中心都依赖实际视图尺寸），未就绪则等首次布局再补
         container.post { applyTransformWhenReady(view, w) }
         val cr = cropRect(w)
-        Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y) opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)} crop=(${cr[0]},${cr[1]},${cr[2]},${cr[3]})")
+        Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y)${if (root === auxRoot) " [副屏]" else ""} opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)} crop=(${cr[0]},${cr[1]},${cr[2]},${cr[3]})")
     }
 
     /**
@@ -5871,6 +5930,141 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 副屏真实像素（Presentation 的 Display）；拿不到时按 1080p 兜底（与异显档的口径一致） */
+    @Suppress("DEPRECATION")
+    private fun auxScreenPx(): IntArray {
+        val d = auxPresentation?.display ?: return intArrayOf(1920, 1080)
+        val dm = DisplayMetrics()
+        d.getRealMetrics(dm)
+        return intArrayOf(dm.widthPixels, dm.heightPixels)
+    }
+
+    /** 房间基准是不是"双屏合一"画布：宽高比 ≥ 2.4（16:9 / 21:9 都到不了）。左半 16:9 归主屏，右边带子归副屏 */
+    private val combinedCanvas: Boolean get() = designW >= designH * 2.4f
+
+    /**
+     * 副屏在基准里占的那条带 [x, y, w, h]（设计坐标）：主屏 16:9 从 0 起，剩下的宽度归副屏、同比例居中。
+     * 5760×2160 → [3840, 540, 1920, 1080]；7680×2160 → [3840, 0, 3840, 2160]。
+     * null = 不是双屏基准，或本机此刻没有副屏在渲染（单口 / 切片档 / 副屏移出）。
+     */
+    private fun auxBand(): IntArray? {
+        if (!combinedCanvas || auxRoot == null) return null
+        val mainW = Math.round(designH * 16f / 9f)
+        val auxW = designW - mainW
+        if (auxW <= 0) return null
+        val auxH = Math.round(auxW * 9f / 16f).coerceAtMost(designH)
+        return intArrayOf(mainW, (designH - auxH) / 2, auxW, auxH)
+    }
+
+    /** 这扇窗归副屏吗：窗口中心落在副屏带里就算（跨带的窗按中心整扇归一边，不切开） */
+    private fun windowOnAux(w: JSONObject, band: IntArray? = auxBand()): Boolean {
+        val b = band ?: return false
+        return w.optInt("x", 0) + w.optInt("width", designW) / 2 >= b[0]
+    }
+
+    /** 这扇窗的视图该挂哪个根：副屏窗口进 Presentation，其余都在主根上（窗口面板/LOGO 同口径） */
+    private fun rootForWindow(w: JSONObject): FrameLayout? =
+        if (auxBand() != null && windowOnAux(w)) auxRoot else flSurface
+
+    /** 屏上视图该挂的根和它此刻挂的不一致（副屏接入/移出/关）：结构变化，原地改不出来，必须整屏重建 */
+    private fun windowParentMismatch(windows: List<Pair<String, JSONObject>>): Boolean {
+        for ((winId, w) in windows) {
+            val v = windowViews[winId] ?: continue
+            if (v.parent !== rootForWindow(w)) return true
+        }
+        return false
+    }
+
+    // ========== 副屏演示窗口（异显档：外屏独立内容）==========
+    //
+    // 为什么不靠切片档：切片档（dual4k/dual）是 HWC 在一张 5760/7680 画布上切两个取景口，
+    // 只要副屏亮着两路就被锁在 30fps（全 client 合成）。异显档（HWC Mode=2）两块逻辑屏各扫各的 buffer，
+    // 60fps 不受影响；代价是 SF 把外屏当"镜像消费者"克隆主屏 —— 没有窗口时两根线是同一画面
+    //（2026-11-24 台架 HWC 取证：镜像层与主屏共用 surface，独立 buffer）。
+    // 挂一块 Presentation 到那块屏上，系统就不再克隆，副屏由我们自己画：房间基准右带 → 副屏满屏。
+
+    /** 主线程：按当前基准/副屏状态开或关 Presentation，返回"现在是否有副屏在渲染" */
+    private fun syncAuxPresentation(): Boolean {
+        if (!combinedCanvas) {
+            dismissAuxPresentation()
+            return false
+        }
+        val dm = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager ?: return false
+        // 优先取系统归为"演示显示"的非默认屏；分类为空时退回"任何亮着的非默认屏"——
+        // 异显档的 eDP 在 RK 的 SF 里未必带 FLAG_PRESENTATION，只认分类会漏掉它，副屏退回克隆
+        val target = dm.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)
+            .firstOrNull { it.displayId != Display.DEFAULT_DISPLAY }
+            ?: dm.displays.firstOrNull { it.displayId != Display.DEFAULT_DISPLAY && it.state == Display.STATE_ON }
+        if (target == null) {
+            dismissAuxPresentation()
+            return false
+        }
+        val cur = auxPresentation
+        if (cur != null && cur.display.displayId == target.displayId) return true
+        dismissAuxPresentation()
+        return try {
+            val root = FrameLayout(this)
+            root.setBackgroundColor(Color.BLACK)
+            val p = Presentation(this, target, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+            p.setContentView(root)
+            p.setCancelable(false)
+            p.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+            p.show()
+            auxPresentation = p
+            auxRoot = root
+            auxDisplayId = target.displayId
+            val px = auxScreenPx()
+            logToFile("副屏演示窗口已开：display ${target.displayId} ${target.name} ${px[0]}×${px[1]}",
+                "INFO", "WINDOW", "AUX")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "副屏演示窗口打开失败: ${e.message}")
+            logToFile("副屏演示窗口打开失败：${e.message}", "WARN", "WINDOW", "AUX")
+            auxPresentation = null
+            auxRoot = null
+            auxPanelBlackout = null
+            auxDisplayId = -1
+            false
+        }
+    }
+
+    /** 收掉 Presentation（基准不再是双屏 / 外屏移出 / 进程收摊）：副屏窗口随视图一起没，交给调用方先释放窗口 */
+    private fun dismissAuxPresentation() {
+        auxPanelBlackout = null
+        auxRoot = null
+        auxDisplayId = -1
+        val p = auxPresentation ?: return
+        auxPresentation = null
+        try { p.dismiss() } catch (e: Exception) {}
+    }
+
+    /** 副屏热插拔监听：显示增删走主线程，只在"有没有副屏"真变了的时候重开窗口并按配置重建 */
+    private fun startDisplayWatch() {
+        if (displayListener != null) return
+        val dm = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager ?: return
+        val l = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) { onAuxDisplaysChanged("接入显示 $displayId") }
+            override fun onDisplayRemoved(displayId: Int) { onAuxDisplaysChanged("移出显示 $displayId") }
+            override fun onDisplayChanged(displayId: Int) {}
+        }
+        dm.registerDisplayListener(l, mqttHandler)
+        displayListener = l
+    }
+
+    /** 主线程：副屏状态变了（接入/移出）就重开演示窗口并整屏重建 —— 窗口要换根，原地换算不出来 */
+    private fun onAuxDisplaysChanged(why: String) {
+        if (exited) return
+        val before = auxDisplayId
+        val on = syncAuxPresentation()
+        if ((before != -1) == on) return
+        logToFile("副屏状态变化（$why）：${if (on) "已接入，按新配置重建画面" else "已断开，副屏窗口收回主屏"}",
+            "INFO", "WINDOW", "AUX")
+        val cached = appliedScenes ?: prefs.getString("scenes_json", null)?.let {
+            try { JSONObject(it) } catch (e: Exception) { null }
+        }
+        if (cached != null) applySceneConfigs(cached, force = true)
+    }
+
     /**
      * 本机承担画布哪一块（设计坐标 [x, y, w, h]）。双屏合一的房间基准（宽高比 ≥ 2.4，16:9/21:9 都到不了）
      * 且本机 1080/eDP 链关着（默认，或管理台关了副屏；见【A-18】）时，本机只是那块画布的主屏半屏 ——
@@ -5879,6 +6073,9 @@ class MainActivity : AppCompatActivity() {
      * 副屏开着、本机没有这条显示链（null，编辑器画整幅）或屏自己就够宽（原生 7680）时照旧整幅。
      */
     private fun canvasView(screen: IntArray = screenPx()): IntArray {
+        // 副屏在渲染：主屏只承担左半（16:9 主区），右带归副屏 —— 换算见 windowGeom 的 auxBand 分支
+        val band = auxBand()
+        if (band != null) return intArrayOf(0, 0, band[0], designH)
         if (designW < designH * 2.4f) return intArrayOf(0, 0, designW, designH)
         if (readSecondaryDisplayOn() != false) return intArrayOf(0, 0, designW, designH)
         if (screen[0].toFloat() / screen[1] >= 2.4f) return intArrayOf(0, 0, designW, designH)
@@ -5895,7 +6092,17 @@ class MainActivity : AppCompatActivity() {
      */
     private fun windowGeom(w: JSONObject): IntArray {
         val screen = screenPx()
-        val view = canvasView(screen)
+        val band = auxBand()
+        if (band != null) {
+            // 副屏窗口按副屏真实像素换算；主屏窗口只认左半（[0,0,mainW,designH]），两轴各算各的
+            return if (windowOnAux(w, band)) geomIn(w, band, auxScreenPx())
+            else geomIn(w, intArrayOf(0, 0, band[0], designH), screen)
+        }
+        return geomIn(w, canvasView(screen), screen)
+    }
+
+    /** 把设计坐标按本屏承担的基准区 [view] 换算到本屏真实像素 [screen]（全量创建与轻量更新共用） */
+    private fun geomIn(w: JSONObject, view: IntArray, screen: IntArray): IntArray {
         val sx = screen[0].toFloat() / view[2]
         val sy = screen[1].toFloat() / view[3]
         return intArrayOf(
@@ -6811,7 +7018,8 @@ class MainActivity : AppCompatActivity() {
         videoSurfaces.clear()
         // 共享解码单元紧跟播放器之后拆（那块 Surface 是解码器的输出端，先放播放器才谈得上收画布）
         destroyShareGroups()
-        windowViews.values.forEach { flSurface?.removeView(it) }
+        // 按实际父容器摘：副屏窗口挂在 Presentation 的根上，写死 flSurface 会漏摘
+        windowViews.values.forEach { (it.parent as? ViewGroup)?.removeView(it) }
         windowViews.clear()
         windowContentSigs.clear()
         windowNames.clear()
@@ -7103,9 +7311,21 @@ class MainActivity : AppCompatActivity() {
             }
             panelBlackout = v
             v.bringToFront()
+            // 副屏同口径：全关时那边也盖黑，两块屏一起黑下去才叫"全关"
+            auxRoot?.let { ar ->
+                val av = auxPanelBlackout ?: View(this).apply {
+                    setBackgroundColor(Color.BLACK)
+                    ar.addView(this, FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                }
+                auxPanelBlackout = av
+                av.bringToFront()
+            }
         } else {
             panelBlackout?.let { root.removeView(it) }
             panelBlackout = null
+            auxPanelBlackout?.let { auxRoot?.removeView(it) }
+            auxPanelBlackout = null
         }
         // 提示文字属于运维层：debug 开着时要压在黑布上面，关着时整层不见
         applyDebugUi()
