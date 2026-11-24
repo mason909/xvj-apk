@@ -1867,8 +1867,9 @@ class MainActivity : AppCompatActivity() {
             mqttHandler.post { refreshLogoLayer(scenes) }
             return
         }
-        // 辅助网格与 LOGO 层同一趟收口：窗口重建后网格要重新置顶到 LOGO 之下、窗口之上
-        applyLogoGrid()
+        // 辅助网格与 LOGO 层同一趟收口：窗口重建后网格要重新置顶到 LOGO 之下、窗口之上；
+        // 显式带 scenes —— refreshLogoLayer 的两处调用都先于 appliedScenes 落值，读默认值会慢一拍
+        applyLogoGrid(scenes)
         val cfg = logoJson
         if (cfg == null || exited) { hideLogoLayer(); return }
         val members = buildLogoMembers(scenes, cfg)
@@ -2000,13 +2001,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 主线程：收放 LOGO 辅助网格（logo_grid）。开着时在**每扇可见素材窗的矩形内**各画一块 12×12 等分方格，
-     * 压在窗口之上、LOGO 层之下 —— 格子随窗口形状拉伸，每格恰是窗宽/12 × 窗高/12，
-     * LOGO 的 x/y/w/h 本来就是窗口百分比，一眼就能对着格子数出比例。点歌窗不出网格。
+     * 主线程：收放 LOGO 辅助网格（logo_grid）。开着时在**每扇 LOGO 窗的 LOGO 框内**画格：
+     * 框的几何与 LOGO 自己同一份 logoGeoFor（改 w/h/x/y 网格跟着一起变），格数按 LOGO 源宽高比分——
+     * 源空间里的方格落屏后与被拉伸的 LOGO 保持同一变形率，格子看着方 = LOGO 没有被拉变形。
+     * 点歌窗不出网格；压在 LOGO 层之下、窗口之上。
      * 懒建后不再删；关掉只置 GONE，下次打开零开销。每次 refreshLogoLayer 都会再走一遍，
      * 因为窗口重建会往根上后加子视图，网格不重新置顶就会被新窗口盖住。
      */
-    private fun applyLogoGrid() {
+    private fun applyLogoGrid(scenes: JSONObject? = appliedScenes) {
         val root = flSurface ?: return
         if (!prefs.getBoolean("logo_grid", false)) {
             logoGridContainer?.let { if (it.visibility != View.GONE) it.visibility = View.GONE }
@@ -2019,7 +2021,7 @@ class MainActivity : AppCompatActivity() {
             root.addView(this, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         }.also { logoGridContainer = it }
-        logoGrid?.setRects(logoGridRects())
+        logoGrid?.setRects(logoGridRects(scenes))
         if (container.visibility != View.VISIBLE) container.visibility = View.VISIBLE
         container.bringToFront()
         logoContainer?.let { if (it.visibility == View.VISIBLE) it.bringToFront() }
@@ -2027,27 +2029,53 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 每扇参与网格的素材窗落点矩形 [x, y, w, h]（屏内像素）。与窗口容器、LOGO 成员同一把尺：
-     * 走 windowGeom（输出基准换算），同格共享解码的成员窗也各得各的真实矩形，不是工作组容器。
-     * 点歌窗（HDMI 内容）不参与：LOGO 网格是给素材窗校比例用的，压在点歌画面上只会捣乱。
+     * 每个 LOGO 框的网格参数 [boxL, boxT, boxW, boxH, clipL, clipT, clipR, clipB, cols, rows]：
+     * 框 = logoGeoFor 算出的 LOGO 矩形（与 buildLogoMembers 同一把尺），clip = 框与窗口的交集；
+     * cols/rows 取源宽高比（行固定 12、列 = 12×源宽/源高），源里的方格落屏后与 LOGO 同倍率拉伸。
+     * 范围 = 当前幕 logo.windows 名单里、可见、非点歌窗（HDMI）的窗。
      */
-    private fun logoGridRects(): List<FloatArray> {
-        val scenes = appliedScenes ?: return emptyList()
+    private fun logoGridRects(scenes: JSONObject?): List<FloatArray> {
+        if (scenes == null) return emptyList()
+        val cfg = logoJson ?: return emptyList()
+        val wins = cfg.optJSONObject("windows") ?: return emptyList()
+        val allowA = logoIdsOf(wins.optJSONArray("A"))
+        val allowB = logoIdsOf(wins.optJSONArray("B"))
+        if (allowA.isEmpty() && allowB.isEmpty()) return emptyList()
+        val vs = logoPlayer?.videoSize
+        val srcW = if (vs != null && vs.width > 0 && vs.height > 0) vs.width else 1
+        val srcH = if (vs != null && vs.width > 0 && vs.height > 0) vs.height else 1
+        val rows = 12
+        val cols = Math.round(rows * srcW.toFloat() / srcH).coerceIn(2, 64)
         val out = ArrayList<FloatArray>()
         for ((winId, w) in enabledWindowsSorted(scenes)) {
+            if (winId !in allowA && winId !in allowB) continue
             if (windowContentSigs[winId]?.startsWith("HDMI|") == true) continue
             val view = windowViews[winId] ?: continue
             if (view.visibility != View.VISIBLE) continue
             val g = windowGeom(w)
-            out.add(floatArrayOf(g[0].toFloat(), g[1].toFloat(), g[2].toFloat(), g[3].toFloat()))
+            val winLeft = g[0].toFloat()
+            val winTop = g[1].toFloat()
+            val winW = g[2].toFloat().coerceAtLeast(1f)
+            val winH = g[3].toFloat().coerceAtLeast(1f)
+            val geo = logoGeoFor(cfg, winId)
+            val boxW = (winW * geo[2]).coerceAtLeast(1f)
+            val boxH = (winH * geo[3]).coerceAtLeast(1f)
+            val boxLeft = winLeft + winW / 2f + (geo[0] / 200f) * winW - boxW / 2f
+            val boxTop = winTop + winH / 2f + (geo[1] / 200f) * winH - boxH / 2f
+            val il = maxOf(boxLeft, winLeft)
+            val it2 = maxOf(boxTop, winTop)
+            val ir = minOf(boxLeft + boxW, winLeft + winW)
+            val ib = minOf(boxTop + boxH, winTop + winH)
+            if (ir - il < 1f || ib - it2 < 1f) continue
+            out.add(floatArrayOf(boxLeft, boxTop, boxW, boxH, il, it2, ir, ib, cols.toFloat(), rows.toFloat()))
         }
         return out
     }
 
     /**
-     * 逐窗等分方格：每扇窗固定 12×12 格，格宽=窗宽/12、格高=窗高/12 —— 格子跟着窗口形状拉伸，
-     * 不是正方形，换来的是"每格=8.33% 窗宽/窗高"，LOGO 的百分比几何可以直接数格核对。
-     * 线宽随窗高走，8K 上 3px、1080p 上 2px。
+     * LOGO 框内的源空间方格：行=rows、列=cols 等分整只 LOGO 框，画时按框的 clip 与窗口求交裁边，
+     * 所以框被窗口切掉的部分不出线，格子相位仍锚在完整框上（与 LOGO 的 crop 采样同源）。
+     * 线宽随框高走，8K 上 3px、1080p 上 2px。
      */
     private inner class GridOverlayView(ctx: Context) : View(ctx) {
         private val paint = Paint().apply {
@@ -2064,17 +2092,22 @@ class MainActivity : AppCompatActivity() {
 
         override fun onDraw(canvas: Canvas) {
             for (r in rects) {
-                val l = r[0]; val t = r[1]; val w = r[2]; val h = r[3]
-                if (w <= 0f || h <= 0f) continue
-                paint.strokeWidth = (h / 720f).coerceIn(2f, 6f)
-                val stepX = w / 12f
-                val stepY = h / 12f
-                for (i in 0..12) {
-                    val x = l + stepX * i
-                    canvas.drawLine(x, t, x, t + h, paint)
-                    val y = t + stepY * i
-                    canvas.drawLine(l, y, l + w, y, paint)
+                val boxL = r[0]; val boxT = r[1]; val boxW = r[2]; val boxH = r[3]
+                val clipL = r[4]; val clipT = r[5]; val clipR = r[6]; val clipB = r[7]
+                val cols = r[8].toInt(); val rows = r[9].toInt()
+                if (boxW <= 0f || boxH <= 0f || cols < 1 || rows < 1) continue
+                paint.strokeWidth = (boxH / 720f).coerceIn(2f, 6f)
+                val save = canvas.save()
+                canvas.clipRect(clipL, clipT, clipR, clipB)
+                for (i in 0..cols) {
+                    val x = boxL + boxW * i / cols
+                    canvas.drawLine(x, clipT, x, clipB, paint)
                 }
+                for (j in 0..rows) {
+                    val y = boxT + boxH * j / rows
+                    canvas.drawLine(clipL, y, clipR, y, paint)
+                }
+                canvas.restoreToCount(save)
             }
         }
     }
@@ -2104,6 +2137,8 @@ class MainActivity : AppCompatActivity() {
         p.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (logoPlayer === p) canvas.setDecoderSize(videoSize.width, videoSize.height)
+                // 网格的列数是按源宽高比分的，源尺寸一到就重画一次
+                applyLogoGrid()
             }
             override fun onPlayerError(error: PlaybackException) {
                 logToFile("LOGO 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "WINDOW", "LOGO")
@@ -5545,7 +5580,7 @@ class MainActivity : AppCompatActivity() {
         // 被关掉的那扇窗，窗口正中的运维面板要一起跟着藏起来
         applyStatusUi()
         // 点歌窗显隐变了，逐窗网格的矩形清单也跟着变（关掉的窗不该留一块空网格）
-        applyLogoGrid()
+        applyLogoGrid(scenes)
     }
 
     /** 创建单个窗口视图并加入 flSurface */
