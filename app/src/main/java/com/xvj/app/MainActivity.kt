@@ -36,7 +36,7 @@
  *         本机连点只管"退出"，回来靠桌面图标 / HOME 键 / 云端唤回）
  * 【A-16】实时截图（云端令牌回传，见 captureAndUploadScreenshot）
  * 【A-17】LOGO 叠加层（config.logo；applyLogoField / refreshLogoLayer / buildLogoMembers /
- *         startLogoPlayer / startLogoDownload；一路解码 + ShareCanvasView(lumaKey) 按窗画入）
+ *         startLogoPlayer / startLogoDownload；主屏与副屏各一层：各自解码 + ShareCanvasView(lumaKey) 按窗画入）
  * （A-05 已随"单播放器点播"旧链路一起删除，编号保留空位）
  * ─────────────────────────────────────────────────
  * 
@@ -384,23 +384,39 @@ class MainActivity : AppCompatActivity() {
     private var lowWaterHealRunning = false
 
     // ========== LOGO 叠加层（config.logo）==========
-    // 房间级一份 LOGO 视频 + 每扇素材窗里的落点。设备端自己画：一路解码 + 一块全屏以外的
-    // ShareCanvasView(lumaKey) 按每扇窗自己的矩形各画一遍，纯黑底按亮度键透出下层。
+    // 房间级一份 LOGO 视频 + 每扇素材窗里的落点。设备端自己画：ShareCanvasView(lumaKey) 按每扇窗
+    // 自己的矩形各画一遍，纯黑底按亮度键透出下层。主屏/副屏两块根各一份实例（见 LogoLayer）。
     /** 云端下发的 LOGO 配置（已归一；null = 没设）。prefs 里 logo_json 是它的冷启动缓存 */
     private var logoJson: JSONObject? = null
-    private var logoContainer: FrameLayout? = null
-    private var logoCanvas: ShareCanvasView? = null
-    private var logoPlayer: ExoPlayer? = null
-    /** 当前 LOGO 播放器喂的是哪个文件（路径）；换文件要重建播放器 */
-    private var logoPlayingFile: String = ""
     /** LOGO 文件正在后台下载：期间不重复排任务，落地后由下载线程回头刷一层 */
     @Volatile private var logoDownloading = false
 
     // ========== LOGO 设置辅助网格（config.logo_grid）==========
     // 管理台打开「LOGO设置」时每扇素材窗里各垫一块等像素方格，帮人肉眼判断 LOGO 在这扇窗里是否被拉变形。
     // 层级压在窗口之上、LOGO 层之下；不进 rev，和 window_names 同款轻量下发（set_logo_grid）。
-    private var logoGridContainer: FrameLayout? = null
-    private var logoGrid: GridOverlayView? = null
+
+    /**
+     * 一块根上的 LOGO 层：容器 + 画布 + 自己的解码器 + 自己的辅助网格。
+     * 主屏与副屏各一份 —— TextureView 的解码 Surface 一对一，喂不了两块根，副屏要叠 LOGO 只能多开一路解码。
+     */
+    private class LogoLayer {
+        var container: FrameLayout? = null
+        var canvas: ShareCanvasView? = null
+        var player: ExoPlayer? = null
+        /** 当前播放器喂的是哪个文件（路径）；换文件、或播放器已进错误态，都要重开流水线 */
+        var file: String = ""
+        var gridContainer: FrameLayout? = null
+        var grid: GridOverlayView? = null
+        /** 解码错误自愈：已重试次数（拿到视频尺寸即清零）与挂起中的那颗重试 */
+        var retries = 0
+        var retry: Runnable? = null
+    }
+
+    private val logoMain = LogoLayer()
+    private val logoAux = LogoLayer()
+    /** 解码失败自愈：最多 3 次，间隔从 2s 起指数退避（2/4/8s），连续失败就不再空转 */
+    private val LOGO_RETRY_MAX = 3
+    private val LOGO_RETRY_MS = 2000L
 
     // ========== 运维层（状态文字 + 素材同步进度条）==========
     /** 成功类回执亮一下就走；失败/拒绝类没有限时，停到下一次状态覆盖为止 */
@@ -1886,10 +1902,10 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 按"屏上这份 scenes + 当前 logo 配置"落一次 LOGO 层。幂等，所有触发点都汇到这里
-     * （配置落地 / 实时更新 / 墙板切格 / 下载完成）：
+     * （配置落地 / 实时更新 / 墙板切格 / 下载完成）：主屏与副屏各算各的成员，各自落一层。
      *  - 没配 / 退出到桌面 / 没有窗口同时过两道闸 → 藏起来（暂停解码）；
      *  - 文件不在 → 藏起来并排一次下载（在飞去重），下完回头再来一遍；
-     *  - 有成员 → 起播（同文件复用播放器）+ 显示。
+     *  - 有成员 → 起播（同文件且流水线还活着就复用）+ 显示。
      * 可从任意线程调用（MQTT 线程的处理器直接调）。
      */
     private fun refreshLogoLayer(scenes: JSONObject? = appliedScenes) {
@@ -1901,24 +1917,31 @@ class MainActivity : AppCompatActivity() {
         // 显式带 scenes —— refreshLogoLayer 的两处调用都先于 appliedScenes 落值，读默认值会慢一拍
         applyLogoGrid(scenes)
         val cfg = logoJson
-        if (cfg == null || exited) { hideLogoLayer(); return }
-        val members = buildLogoMembers(scenes, cfg)
-        if (members.isEmpty()) { hideLogoLayer(); return }
-        val file = logoFileOf(cfg)
-        if (file == null || !file.exists() || file.length() == 0L) {
-            hideLogoLayer()
-            startLogoDownload(cfg)
+        val file = cfg?.let { logoFileOf(it) }?.takeIf { it.exists() && it.length() > 0L }
+        if (cfg == null || exited || file == null) {
+            hideLogoLayer(logoMain)
+            hideLogoLayer(logoAux)
+            if (cfg != null && !exited && file == null) startLogoDownload(cfg)
             return
         }
-        startLogoPlayer(file)
-        showLogoLayer(members)
+        applyLogoLayer(logoMain, buildLogoMembers(scenes, cfg, aux = false), file)
+        // 副屏根不在（单屏房 / 副屏关着 / Presentation 没起来）时副屏层根本不建，成员一律算空
+        applyLogoLayer(logoAux, if (auxRoot == null) emptyList() else buildLogoMembers(scenes, cfg, aux = true), file)
+    }
+
+    /** 主线程：一层（一块根）的成员落屏 —— 没成员就藏，有成员就起播并显示 */
+    private fun applyLogoLayer(layer: LogoLayer, members: List<ShareCanvasView.Member>, file: File) {
+        if (members.isEmpty()) { hideLogoLayer(layer); return }
+        startLogoPlayer(layer, file)
+        showLogoLayer(layer, members)
     }
 
     /**
-     * 这份 scenes 里该有哪几个 LOGO 矩形。坐标是屏内像素（与窗口容器同一坐标系），
-     * 盒与窗口求交后再把"裁掉了多少"换算成归一化取景区，画布按 crop 采样就不会画到窗口外。
+     * 这份 scenes 里该有哪几个 LOGO 矩形（`aux` 选主屏那批还是副屏那批）。坐标是**所属屏的屏内像素**
+     * （与窗口容器同一坐标系，windowGeom 已按根换算过），盒与窗口求交后再把"裁掉了多少"换算成归一化取景区，
+     * 画布按 crop 采样就不会画到窗口外。
      */
-    private fun buildLogoMembers(scenes: JSONObject?, cfg: JSONObject): List<ShareCanvasView.Member> {
+    private fun buildLogoMembers(scenes: JSONObject?, cfg: JSONObject, aux: Boolean): List<ShareCanvasView.Member> {
         if (scenes == null) return emptyList()
         val wins = cfg.optJSONObject("windows") ?: return emptyList()
         val allowA = logoIdsOf(wins.optJSONArray("A"))
@@ -1929,8 +1952,8 @@ class MainActivity : AppCompatActivity() {
             if (winId !in allowA && winId !in allowB) continue
             val view = windowViews[winId] ?: continue
             if (view.visibility != View.VISIBLE) continue
-            // LOGO 画布只挂在主根上：副屏窗口暂不叠 LOGO（一块画布不能同时挂两块根）
-            if (auxDesigned(w)) continue
+            // 一层只管自己那块根上的窗：主屏层跳过副屏带，副屏层跳过主屏
+            if (auxDesigned(w) != aux) continue
             // 第二道闸：这一窗此刻播的那一格开了 LOGO 才出（与云端 playSettingsValue 同一条件）
             val folderKey = videoSurfaces[winId]?.folderKey?.takeIf { it.isNotEmpty() }
                 ?: resolveWindowFolder(scenes, w.optJSONObject("content") ?: JSONObject(), winId)
@@ -1977,10 +2000,10 @@ class MainActivity : AppCompatActivity() {
      * 层级：窗口之上、墙板黑布与运维面板之下 —— 后两者每次都要重新 bringToFront，
      * 因为容器是运行期子视图，不抬一次就会被新加的窗口/面板压住。
      */
-    private fun showLogoLayer(members: List<ShareCanvasView.Member>) {
-        if (members.isEmpty()) { hideLogoLayer(); return }
-        val canvas = ensureLogoCanvas() ?: return
-        val container = logoContainer ?: return
+    private fun showLogoLayer(layer: LogoLayer, members: List<ShareCanvasView.Member>) {
+        if (members.isEmpty()) { hideLogoLayer(layer); return }
+        val canvas = ensureLogoCanvas(layer) ?: return
+        val container = layer.container ?: return
         var minX = members[0].left
         var minY = members[0].top
         var maxX = minX + members[0].width
@@ -2005,30 +2028,33 @@ class MainActivity : AppCompatActivity() {
         canvas.setMembers(members.map { it.copy(left = it.left - minX, top = it.top - minY) })
         container.visibility = View.VISIBLE
         container.bringToFront()
-        panelBlackout?.bringToFront()
-        logoPlayer?.play()
+        blackoutOf(layer)?.bringToFront()
+        layer.player?.play()
         applyStatusUi()
     }
 
+    /** 这一层自己那块根上的墙板黑布（盖在 LOGO 之上，两块根各自一份） */
+    private fun blackoutOf(layer: LogoLayer): View? = if (layer === logoAux) auxPanelBlackout else panelBlackout
+
     /** 藏起 LOGO 层：视图 GONE（成员清空后画布不清屏，不藏会停在最后一帧）+ 播放器暂停省解码 */
-    private fun hideLogoLayer() {
-        logoContainer?.let { if (it.visibility != View.GONE) it.visibility = View.GONE }
-        logoCanvas?.setMembers(emptyList())
-        logoPlayer?.pause()
+    private fun hideLogoLayer(layer: LogoLayer) {
+        layer.container?.let { if (it.visibility != View.GONE) it.visibility = View.GONE }
+        layer.canvas?.setMembers(emptyList())
+        layer.player?.pause()
     }
 
-    /** 懒建 LOGO 画布（lumaKey 亮度键）与容器：1×1 占位挂在窗口根上，显隐与几何由 showLogoLayer 管 */
-    private fun ensureLogoCanvas(): ShareCanvasView? {
-        logoCanvas?.let { return it }
-        val root = flSurface ?: return null
+    /** 懒建 LOGO 画布（lumaKey 亮度键）与容器：1×1 占位挂在这层的根上，显隐与几何由 showLogoLayer 管 */
+    private fun ensureLogoCanvas(layer: LogoLayer): ShareCanvasView? {
+        layer.canvas?.let { return it }
+        val root = (if (layer === logoAux) auxRoot else flSurface) ?: return null
         val canvas = ShareCanvasView(this, lumaKey = true)
         val container = FrameLayout(this).apply { visibility = View.GONE }
         container.addView(canvas, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         root.addView(container, FrameLayout.LayoutParams(1, 1).apply { gravity = Gravity.TOP or Gravity.START })
-        panelBlackout?.bringToFront()
-        logoContainer = container
-        logoCanvas = canvas
+        blackoutOf(layer)?.bringToFront()
+        layer.container = container
+        layer.canvas = canvas
         return canvas
     }
 
@@ -2041,39 +2067,50 @@ class MainActivity : AppCompatActivity() {
      * 因为窗口重建会往根上后加子视图，网格不重新置顶就会被新窗口盖住。
      */
     private fun applyLogoGrid(scenes: JSONObject? = appliedScenes) {
-        val root = flSurface ?: return
-        if (!prefs.getBoolean("logo_grid", false)) {
-            logoGridContainer?.let { if (it.visibility != View.GONE) it.visibility = View.GONE }
+        val on = prefs.getBoolean("logo_grid", false)
+        applyLogoGridOf(logoMain, flSurface, on, scenes, aux = false)
+        applyLogoGridOf(logoAux, auxRoot, on, scenes, aux = true)
+    }
+
+    /**
+     * 一块根上的辅助网格落一次。`root` 为 null（副屏关着）时这层根本不建，也不动已有视图 ——
+     * Presentation 收摊时它的孩子一起没了，引用由 dismissAuxPresentation 清。
+     */
+    private fun applyLogoGridOf(layer: LogoLayer, root: FrameLayout?, on: Boolean,
+                                scenes: JSONObject?, aux: Boolean) {
+        if (!on) {
+            layer.gridContainer?.let { if (it.visibility != View.GONE) it.visibility = View.GONE }
             return
         }
-        val container = logoGridContainer ?: FrameLayout(this).apply {
-            addView(GridOverlayView(this@MainActivity).also { logoGrid = it }, FrameLayout.LayoutParams(
+        if (root == null) return
+        val container = layer.gridContainer ?: FrameLayout(this).apply {
+            addView(GridOverlayView(this@MainActivity).also { layer.grid = it }, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             visibility = View.GONE
             root.addView(this, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        }.also { logoGridContainer = it }
-        logoGrid?.setRects(logoGridRects(scenes))
+        }.also { layer.gridContainer = it }
+        layer.grid?.setRects(logoGridRects(scenes, layer, aux))
         if (container.visibility != View.VISIBLE) container.visibility = View.VISIBLE
         container.bringToFront()
-        logoContainer?.let { if (it.visibility == View.VISIBLE) it.bringToFront() }
-        panelBlackout?.bringToFront()
+        layer.container?.let { if (it.visibility == View.VISIBLE) it.bringToFront() }
+        blackoutOf(layer)?.bringToFront()
     }
 
     /**
      * 每个 LOGO 框的网格参数 [boxL, boxT, boxW, boxH, clipL, clipT, clipR, clipB, cols, rows]：
      * 框 = logoGeoFor 算出的 LOGO 矩形（与 buildLogoMembers 同一把尺），clip = 框与窗口的交集；
      * cols/rows 取源宽高比（行固定 12、列 = 12×源宽/源高），源里的方格落屏后与 LOGO 同倍率拉伸。
-     * 范围 = 当前幕 logo.windows 名单里、可见、非点歌窗（HDMI）的窗。
+     * 范围 = 当前幕 logo.windows 名单里、可见、非点歌窗（HDMI）、属于 `aux` 那块根的窗。
      */
-    private fun logoGridRects(scenes: JSONObject?): List<FloatArray> {
+    private fun logoGridRects(scenes: JSONObject?, layer: LogoLayer, aux: Boolean): List<FloatArray> {
         if (scenes == null) return emptyList()
         val cfg = logoJson ?: return emptyList()
         val wins = cfg.optJSONObject("windows") ?: return emptyList()
         val allowA = logoIdsOf(wins.optJSONArray("A"))
         val allowB = logoIdsOf(wins.optJSONArray("B"))
         if (allowA.isEmpty() && allowB.isEmpty()) return emptyList()
-        val vs = logoPlayer?.videoSize
+        val vs = layer.player?.videoSize
         val srcW = if (vs != null && vs.width > 0 && vs.height > 0) vs.width else 1
         val srcH = if (vs != null && vs.width > 0 && vs.height > 0) vs.height else 1
         val rows = 12
@@ -2082,8 +2119,8 @@ class MainActivity : AppCompatActivity() {
         for ((winId, w) in enabledWindowsSorted(scenes)) {
             if (winId !in allowA && winId !in allowB) continue
             if (windowContentSigs[winId]?.startsWith("HDMI|") == true) continue
-            // 网格与 LOGO 画布同根（主根）：副屏窗口不出网格
-            if (auxDesigned(w)) continue
+            // 网格跟着自己那块根走
+            if (auxDesigned(w) != aux) continue
             val view = windowViews[winId] ?: continue
             if (view.visibility != View.VISIBLE) continue
             val g = windowGeom(w)
@@ -2147,48 +2184,93 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 起 LOGO 解码器。同文件复用现有播放器（重复刷新配置不重开流水线）；
+     * 起这一层的 LOGO 解码器。同文件、流水线还活着（没进错误态）就复用（重复刷新配置不重开）；
      * 解码端 Surface 由画布拿到 TextureView st 之后回调过来（与共享解码组同一条交接）。
      */
-    private fun startLogoPlayer(file: File) {
+    private fun startLogoPlayer(layer: LogoLayer, file: File) {
         val path = file.absolutePath
-        val canvas = ensureLogoCanvas() ?: return
-        logoPlayer?.let { p ->
-            if (logoPlayingFile == path) {
+        val canvas = ensureLogoCanvas(layer) ?: return
+        val switching = layer.file != path
+        layer.player?.let { p ->
+            // STATE_IDLE 是解码器报错/被释放后的状态，这时 play() 唤不回流水线，必须走下面的重建
+            if (layer.file == path && p.playbackState != Player.STATE_IDLE) {
                 if (!p.isPlaying) p.play()
                 return
             }
         }
-        releaseLogoPlayer()
+        releaseLogoPlayer(layer)
+        if (switching) layer.retries = 0
         val p = buildExoPlayer().apply {
             repeatMode = Player.REPEAT_MODE_ALL
             playWhenReady = true
             volume = 0f
         }
-        logoPlayer = p
-        logoPlayingFile = path
-        canvas.onDecoderSurface = { surf -> if (logoPlayer === p) p.setVideoSurface(surf) }
+        layer.player = p
+        layer.file = path
+        canvas.onDecoderSurface = { surf -> if (layer.player === p) p.setVideoSurface(surf) }
         p.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
-                if (logoPlayer === p) canvas.setDecoderSize(videoSize.width, videoSize.height)
+                if (layer.player === p) {
+                    canvas.setDecoderSize(videoSize.width, videoSize.height)
+                    layer.retries = 0   // 解得出画面就算活了，自愈计数归零
+                }
                 // 网格的列数是按源宽高比分的，源尺寸一到就重画一次
                 applyLogoGrid()
             }
             override fun onPlayerError(error: PlaybackException) {
                 logToFile("LOGO 播放器错误: ${error.errorCodeName} ${error.message ?: ""}", "ERROR", "WINDOW", "LOGO")
+                scheduleLogoRetry(layer, file, error.errorCodeName)
             }
         })
         p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
         p.prepare()
-        logToFile("LOGO 起播: ${file.name}（${file.length() / 1024}KB）", "INFO", "WINDOW", "LOGO")
+        logToFile("LOGO 起播: ${file.name}（${file.length() / 1024}KB）${if (layer === logoAux) " [副屏]" else ""}",
+            "INFO", "WINDOW", "LOGO")
     }
 
-    /** 放掉 LOGO 解码器（换文件 / 窗口全释放 / Activity 销毁）；画布本身另由 shutdown 收 */
-    private fun releaseLogoPlayer() {
-        logoCanvas?.onDecoderSurface = null
-        logoPlayer?.release()
-        logoPlayer = null
-        logoPlayingFile = ""
+    /**
+     * 解码器被打死之后的自愈。台架取证（2026-11-25 11:41:59）触发点是拆窗后的低内存回收：
+     * killDecodeHal 杀 codec2 HAL 时窗口播放器已经 release 干净，唯一还挂在这块 HAL 上的就是 LOGO，
+     * 于是它必然报 ERROR_CODE_DECODING_FAILED；而错误态的 ExoPlayer 不再 prepare 就永远停在最后一帧
+     * ——观感就是"LOGO 卡住不动"，刷新配置也救不回来。退避重开 2s/4s/8s，三次都解不出画面就放弃
+     * （素材本身坏了不该空转）。
+     */
+    private fun scheduleLogoRetry(layer: LogoLayer, file: File, code: String) {
+        if (layer.retry != null) return
+        if (layer.retries >= LOGO_RETRY_MAX) {
+            logToFile("LOGO 解码连续失败 ${layer.retries} 次（$code），停止自愈", "WARN", "WINDOW", "LOGO")
+            return
+        }
+        layer.retries++
+        val task = Runnable {
+            layer.retry = null
+            if (exited) return@Runnable
+            logToFile("LOGO 解码失败后第 ${layer.retries} 次重开（$code）", "WARN", "WINDOW", "LOGO")
+            startLogoPlayer(layer, file)
+        }
+        layer.retry = task
+        mqttHandler.postDelayed(task, LOGO_RETRY_MS shl (layer.retries - 1))
+    }
+
+    /** 放掉这一层的解码器（换文件 / 副屏收摊 / Activity 销毁）；画布本身另由 shutdown 收 */
+    private fun releaseLogoPlayer(layer: LogoLayer) {
+        layer.retry?.let { mqttHandler.removeCallbacks(it) }
+        layer.retry = null
+        layer.canvas?.onDecoderSurface = null
+        layer.player?.release()
+        layer.player = null
+        layer.file = ""
+    }
+
+    /** 整层收摊（副屏 Presentation 关掉 / 进程销毁）：解码器、画布、容器、网格引用一起清 */
+    private fun dropLogoLayer(layer: LogoLayer) {
+        releaseLogoPlayer(layer)
+        layer.retries = 0
+        layer.canvas?.shutdown()
+        layer.canvas = null
+        layer.container = null
+        layer.grid = null
+        layer.gridContainer = null
     }
 
     /**
@@ -3964,10 +4046,9 @@ class MainActivity : AppCompatActivity() {
         releaseAllWindows()
         releasePlayer()
         // LOGO 解码器必须在画布 shutdown 之前放：画布收摊要先把解码器的输出端一起收掉
-        releaseLogoPlayer()
-        logoCanvas?.shutdown()
-        logoCanvas = null
-        logoContainer = null
+        // （副屏那层 dismissAuxPresentation 已经收过，这里对它是空操作）
+        dropLogoLayer(logoMain)
+        dropLogoLayer(logoAux)
         // 停止定时器并发送离线状态
         stopStatusTimer()
         try {
@@ -6044,6 +6125,8 @@ class MainActivity : AppCompatActivity() {
 
     /** 收掉 Presentation（基准不再是双屏 / 外屏移出 / 进程收摊）：副屏窗口随视图一起没，交给调用方先释放窗口 */
     private fun dismissAuxPresentation() {
+        // 副屏那块 LOGO 层跟着根一起作废：解码器不放，白占一路；画布不 shutdown，GL 上下文留着也是漏
+        dropLogoLayer(logoAux)
         auxPanelBlackout = null
         auxRoot = null
         auxDisplayId = -1
@@ -7036,8 +7119,9 @@ class MainActivity : AppCompatActivity() {
         windowViews.clear()
         windowContentSigs.clear()
         windowNames.clear()
-        // 窗口都没了，LOGO 层也就没有落点（暂停解码，播放器实例留着等重建复用）
-        hideLogoLayer()
+        // 窗口都没了，LOGO 层也就没有落点（两块根一起暂停解码，播放器实例留着等重建复用）
+        hideLogoLayer(logoMain)
+        hideLogoLayer(logoAux)
         // 窗口没了，窗口正中那些面板一并摘掉；状态文字退回整屏居中面板（退出到桌面时就是它）
         refreshWindowStatusOverlays()
         // 屏上已经没有窗口了，"已应用配置"的指纹必须一起作废：
