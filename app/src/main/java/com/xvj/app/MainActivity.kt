@@ -521,6 +521,11 @@ class MainActivity : AppCompatActivity() {
      * 现在 ≥2 扇同格只起一路播放器，画面由一块 GL 画布按每扇窗自己的几何画 N 遍。
      */
     private val shareGroups = mutableMapOf<String, ShareGroup>()
+    /**
+     * 副屏那块根上的同格共享单元，键口径与 [shareGroups] 相同（都按格子名）。
+     * 单列一张表是为了主/副两屏同播一格时两个组能并存：键一样，合在一张表里会互相顶掉。
+     */
+    private val auxShareGroups = mutableMapOf<String, ShareGroup>()
     /** winId -> 它所属的共享单元：跟随窗也在这张表里（它们没有播放器，切格时靠它把账记回整组） */
     private val winShareGroup = mutableMapOf<String, ShareGroup>()
     /**
@@ -2507,8 +2512,10 @@ class MainActivity : AppCompatActivity() {
         // 共享组必须整组同格才成立：成员被墙板分到不同格子（或某一格解析不出素材）时组的构成就变了，
         // 原地重排做不到（解码路数跟着变），只能回全量重建。换格本来就低频；
         // 重复按的"下一支"原地推进、不换格，所以不走这里。
-        if ((!repeat || switching) && shareGroups.isNotEmpty() && follows.isNotEmpty()) {
-            val broken = shareGroups.values.any { grp -> grp.members.map { resolved[it] }.distinct().size > 1 }
+        if ((!repeat || switching) && (shareGroups.isNotEmpty() || auxShareGroups.isNotEmpty()) && follows.isNotEmpty()) {
+            // 主屏组、副屏组都要查：两块根上的成员被墙板/点歌机分到不同格子，都得回退整屏重建
+            val broken = (shareGroups.values + auxShareGroups.values)
+                .any { grp -> grp.members.map { resolved[it] }.distinct().size > 1 }
             if (broken) {
                 logToFile("${noun}触发 ${describeSource(source)} 会让共享解码组的成员分家，回退全量重建", "INFO", cat, "REBUILD")
                 applySceneConfigs(scenes, force = true)
@@ -5292,28 +5299,40 @@ class MainActivity : AppCompatActivity() {
                 windowNames[p.winId] = p.win.optString("name", "")
             }
             planFolders = livePlan.mapNotNull { it.folderId }.distinct()
-            // 纯色 / HDMI 窗口本来就零解码，不掺进共享组；副屏那几扇也单独解码 ——
-            // 共享画布是一块挂在主根上的 GL，跨两块屏的成员并不进同一张画布（见副屏渲染段注释）
-            val groupsByFolder = livePlan.filter { isVideoContentType(it.content) && it.folderId != null }
-                .filter { !auxDesigned(it.win) }
+            // 纯色 / HDMI 窗口本来就零解码，不掺进共享组。共享画布长在某一扇窗所属的那块根上，
+            // 所以主屏、副屏各分各的组：副屏那几扇同格只起一路，不在 Presentation 里再解一遍同一格
+            val videoPlan = livePlan.filter { isVideoContentType(it.content) && it.folderId != null }
+            val groupsByFolder = videoPlan.filter { !auxDesigned(it.win) }
+                .groupBy { it.folderId!! }
+                .filterValues { it.size >= 2 }
+            val auxGroupsByFolder = videoPlan.filter { auxDesigned(it.win) }
                 .groupBy { it.folderId!! }
                 .filterValues { it.size >= 2 }
             // 组的画布放在"该组最上层那扇成员"原来的 z 位置：下面的窗口照常透出来，
             // 被并集矩形盖到的别组窗口则按这一层的 z 被压过去（共享解码的唯一取舍，见 ShareCanvasView）
-            // 只记组成员的下标：同格的副屏窗不是成员，它排在更后面也不能把建组的位置顶走
+            // 只记组成员的下标：不是为了成员的窗（主/副另一块根上的同格窗）排在更后面也不能把建组的位置顶走
             val lastIdxOfGroup = HashMap<String, Int>()
+            val lastAuxIdxOfGroup = HashMap<String, Int>()
             for ((idx, p) in livePlan.withIndex()) {
                 val fk = p.folderId ?: continue
                 if (groupsByFolder[fk]?.any { it.winId == p.winId } == true) lastIdxOfGroup[fk] = idx
+                if (auxGroupsByFolder[fk]?.any { it.winId == p.winId } == true) lastAuxIdxOfGroup[fk] = idx
             }
             for ((idx, p) in livePlan.withIndex()) {
                 val fk = p.folderId
-                // 只看"这一扇是不是组成员"，不能只看格子名：副屏窗不进组（每组只在主根上画），
-                // 但它照样可能播主屏那组同一格 —— 按名字跳会把副屏窗整扇漏建（无视图、无播放器，永远黑）
-                val grpItems = if (fk != null) groupsByFolder[fk] else null
-                if (fk != null && grpItems != null && grpItems.any { it.winId == p.winId }) {
-                    if (lastIdxOfGroup[fk] == idx) createShareGroup(fk, grpItems)
-                    continue
+                // 只看"这一扇是不是组成员"，不能只看格子名：同一格可能在两块根上各有一组（主屏一组、
+                // 副屏一组），按名字跳会把另一块根上的窗整扇漏建（无视图、无播放器，永远黑）
+                if (fk != null) {
+                    val mainItems = groupsByFolder[fk]
+                    if (mainItems != null && mainItems.any { it.winId == p.winId }) {
+                        if (lastIdxOfGroup[fk] == idx) createShareGroup(fk, mainItems, aux = false)
+                        continue
+                    }
+                    val auxItems = auxGroupsByFolder[fk]
+                    if (auxItems != null && auxItems.any { it.winId == p.winId }) {
+                        if (lastAuxIdxOfGroup[fk] == idx) createShareGroup(fk, auxItems, aux = true)
+                        continue
+                    }
                 }
                 createWindowView(p.winId, p.win)
             }
@@ -5386,12 +5405,18 @@ class MainActivity : AppCompatActivity() {
         }
         // 同格 ≥2 扇才成组：组按"成员构成"比对，不按格子名 —— 墙板换格/勾了跟随是同一组人整组换到另一格，
         // 解码路数与画布都不变，原地换清单就够；只有成员增删（含两组并到一格）才必须重建。
-        // 口径与 createWindowsForScenes 一致：副屏窗口不进主根上的共享画布。
-        val desiredGroups = plan.filter { isVideoContentType(it.content) && it.folderId != null }
-            .filter { !auxDesigned(it.win) }
+        // 口径与 createWindowsForScenes 一致：主屏、副屏各按自己那块根分组，两个表各比各的。
+        val videoPlan = plan.filter { isVideoContentType(it.content) && it.folderId != null }
+        val desiredGroups = videoPlan.filter { !auxDesigned(it.win) }
+            .groupBy { it.folderId!! }.filterValues { it.size >= 2 }
+            .mapValues { entry -> entry.value.map { it.winId }.toSet() }
+        // 副屏没在渲染时那几扇窗根本没建（见 createWindowsForScenes 的 livePlan 过滤），期望值也得是空：
+        // 否则每次 update_windows 都以为组缺了，白走整屏重建
+        val desiredAuxGroups: Map<String, Set<String>> = if (auxRoot == null) emptyMap() else videoPlan.filter { auxDesigned(it.win) }
             .groupBy { it.folderId!! }.filterValues { it.size >= 2 }
             .mapValues { entry -> entry.value.map { it.winId }.toSet() }
         if (shareGroups.values.map { it.members.toSet() }.toSet() != desiredGroups.values.toSet()) return false
+        if (auxShareGroups.values.map { it.members.toSet() }.toSet() != desiredAuxGroups.values.toSet()) return false
         // 构成相同但格子换了：先把组名对齐（目标格已被别组占着就回退，换名等于并组，画布合不了）
         for ((folderKey, winIds) in desiredGroups) {
             val grp = winShareGroup[winIds.first()] ?: continue
@@ -5400,6 +5425,14 @@ class MainActivity : AppCompatActivity() {
             shareGroups.remove(grp.folderKey)
             grp.folderKey = folderKey
             shareGroups[folderKey] = grp
+        }
+        for ((folderKey, winIds) in desiredAuxGroups) {
+            val grp = winShareGroup[winIds.first()] ?: continue
+            if (grp.folderKey == folderKey) continue
+            if (auxShareGroups.containsKey(folderKey)) return false
+            auxShareGroups.remove(grp.folderKey)
+            grp.folderKey = folderKey
+            auxShareGroups[folderKey] = grp
         }
 
         val settingsChanged = playSettingsJson(scenes) != appliedPlaySettingsJson
@@ -5678,8 +5711,8 @@ class MainActivity : AppCompatActivity() {
             val cv = c.getChildAt(0)
             if (cv != null) c.post { applyTransformWhenReady(cv, w) }
         }
-        // 共享解码组按全组最新几何重排画面（并集矩形 + 每扇窗自己的矩形）
-        for (fk in shareGroups.keys.toList()) refreshShareGroup(fk)
+        // 共享解码组按全组最新几何重排画面（并集矩形 + 每扇窗自己的矩形）；主屏、副屏两块根一起
+        for (fk in (shareGroups.keys + auxShareGroups.keys).toSet()) refreshShareGroup(fk)
         // 窗口几何/透明度和落点账都换了：LOGO 层按新的窗矩形与 play_settings 重排一次
         refreshLogoLayer(scenes)
         // 窗口几何变了，窗口正中的运维面板跟着挪
@@ -5816,7 +5849,9 @@ class MainActivity : AppCompatActivity() {
         val leaderId: String,
         val container: FrameLayout,
         val canvas: ShareCanvasView,
-        val members: List<String>
+        val members: List<String>,
+        /** true = 画布长在副屏那块根（Presentation）上，不是主屏 flSurface */
+        val aux: Boolean = false
     )
 
     /** 这扇窗的内容是不是真素材轮播 —— 只有它谈得上共享解码（纯色/HDMI 本来就不起解码器）。
@@ -5827,9 +5862,20 @@ class MainActivity : AppCompatActivity() {
      * 建一个共享解码单元：同格 ≥2 扇窗只起一路播放器，其余窗口既不建 TextureView 也不建播放器。
      * 只在 applySceneConfigs（全量重建）里调用：组成员变化必然伴随窗口增删或内容变化，那两种都算结构变化，
      * 轻量路径一律回退到这里，所以 update_windows 永远不必改组的构成。
+     * @param aux true = 这帮成员在副屏那块根上（Presentation），画布挂 auxRoot、成员几何按副屏像素换算
+     * （windowGeom 自己认根），与主屏的同格组各自独立 —— 两块屏上各有一路解码，不再按窗数翻倍。
      * 只能在主线程调用（addView + 建播放器）。
      */
-    private fun createShareGroup(folderId: String, items: List<PlanWindow>) {
+    private fun createShareGroup(folderId: String, items: List<PlanWindow>, aux: Boolean) {
+        val root = if (aux) auxRoot else flSurface
+        if (root == null) {
+            // 副屏刚被拔掉/演示窗口没起来：这几扇窗这一轮不建，等副屏回来热插拔整屏重建补上
+            for (p in items) {
+                windowContentSigs[p.winId] = contentSignature(p.content)
+                windowNames[p.winId] = p.win.optString("name", "")
+            }
+            return
+        }
         val ordered = items.sortedBy { it.win.optInt("zIndex", 0) }
         val ids = ordered.map { it.winId }
         val leaderId = ids.sorted().first()
@@ -5837,10 +5883,10 @@ class MainActivity : AppCompatActivity() {
         val container = FrameLayout(this)
         container.addView(canvas, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        flSurface?.addView(container, FrameLayout.LayoutParams(1, 1).apply { gravity = Gravity.TOP or Gravity.START })
-        panelBlackout?.bringToFront()
-        val grp = ShareGroup(folderId, leaderId, container, canvas, ids)
-        shareGroups[folderId] = grp
+        root.addView(container, FrameLayout.LayoutParams(1, 1).apply { gravity = Gravity.TOP or Gravity.START })
+        (if (aux) auxPanelBlackout else panelBlackout)?.bringToFront()
+        val grp = ShareGroup(folderId, leaderId, container, canvas, ids, aux)
+        (if (aux) auxShareGroups else shareGroups)[folderId] = grp
         for (winId in ids) winShareGroup[winId] = grp
         // 一路解码器喂一块画布。解码端的 Surface 要等画布拿到 TextureView 的 st、建好 GL 上下文
         // 才诞生（比这里晚），所以交接走回调；素材分辨率变了（4K 混 1080p）由 VideoSize 回调报给
@@ -5863,8 +5909,8 @@ class MainActivity : AppCompatActivity() {
             videoSurfaces[p.winId] = VideoSurface(container, canvas, p.win, PlaySettings())
         }
         refreshShareGroup(folderId)
-        logToFile("同格 $folderId 共享解码：${ids.size} 扇窗只起 1 路播放器（基准 $leaderId，成员 ${ids.joinToString("、")}）",
-            "INFO", "WINDOW", "CREATE")
+        logToFile("同格 $folderId ${if (aux) "[副屏] " else ""}共享解码：${ids.size} 扇窗只起 1 路播放器" +
+            "（基准 $leaderId，成员 ${ids.joinToString("、")}）", "INFO", "WINDOW", "CREATE")
     }
 
     /**
@@ -5873,7 +5919,12 @@ class MainActivity : AppCompatActivity() {
      * 不必回退重建）。只能在主线程调用（读窗口配置、写 LayoutParams）。
      */
     private fun refreshShareGroup(folderKey: String) {
-        val grp = shareGroups[folderKey] ?: return
+        // 同一格可能主、副各有一组：两边都要按各自根上的最新几何重排
+        shareGroups[folderKey]?.let { refreshGroupCanvas(it) }
+        auxShareGroups[folderKey]?.let { refreshGroupCanvas(it) }
+    }
+
+    private fun refreshGroupCanvas(grp: ShareGroup) {
         val raw = ArrayList<ShareCanvasView.Member>()
         for (winId in grp.members) {
             val surf = videoSurfaces[winId] ?: continue
@@ -5925,13 +5976,15 @@ class MainActivity : AppCompatActivity() {
      * 但线程与 EGL 得在这里收干净，否则每次重建漏一条线程。
      */
     private fun destroyShareGroups() {
-        if (shareGroups.isEmpty()) return
-        for ((_, grp) in shareGroups.toList()) {
+        if (shareGroups.isEmpty() && auxShareGroups.isEmpty()) return
+        for (grp in shareGroups.values.toList() + auxShareGroups.values.toList()) {
             grp.canvas.shutdown()
-            flSurface?.removeView(grp.container)
+            // 按实际父容器摘：主屏组挂 flSurface，副屏组挂 Presentation 的根（那块根可能已经被 dismiss 掉）
+            (grp.container.parent as? ViewGroup)?.removeView(grp.container)
             for (winId in grp.members) winShareGroup.remove(winId)
         }
         shareGroups.clear()
+        auxShareGroups.clear()
     }
 
     /**
@@ -6622,12 +6675,17 @@ class MainActivity : AppCompatActivity() {
         // 墙板整组换格（applyPanelSource 直接调这里，不经过原地闸门）：组是按格子键索引的，
         // 组名不跟着换，下一次配置落地就会拿旧名跟新解析比，误判成结构变化 → 整屏重建（白漏一份 dma-buf）。
         // 目标格已被另一组占着则维持原名（换名等于并组），留给下次配置落地按新分组重建。
-        if (grp != null && grp.folderKey != folderId && !shareGroups.containsKey(folderId)) {
-            val from = grp.folderKey
-            shareGroups.remove(from)
-            grp.folderKey = folderId
-            shareGroups[folderId] = grp
-            logToFile("共享解码组 ${grp.members.size} 扇窗整组换格：$from → $folderId", "INFO", "WINDOW", "SHARE")
+        if (grp != null && grp.folderKey != folderId) {
+            // 组住在自己那块根上：查名占位、换名都得落在对应的那张表（主屏/副屏各一张）
+            val tbl = if (grp.aux) auxShareGroups else shareGroups
+            if (!tbl.containsKey(folderId)) {
+                val from = grp.folderKey
+                tbl.remove(from)
+                grp.folderKey = folderId
+                tbl[folderId] = grp
+                logToFile("共享解码组 ${grp.members.size} 扇窗${if (grp.aux) "[副屏] " else ""}整组换格：$from → $folderId",
+                    "INFO", "WINDOW", "SHARE")
+            }
         }
         val player = windowPlayers[winId] ?: run {
             Log.w(TAG, "playFolderInWindow: 找不到窗口 $winId 的播放器")
