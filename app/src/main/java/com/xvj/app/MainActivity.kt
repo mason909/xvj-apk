@@ -352,6 +352,83 @@ class MainActivity : AppCompatActivity() {
     private var auxDisplayId = -1
     /** 墙板「全关」在副屏上的盖布：与主屏 panelBlackout 同一语义、各挂各的根 */
     private var auxPanelBlackout: View? = null
+
+    // ========== 特效层（DMX 通道 2~7 / PAD·云端 fx 动作）==========
+    // 层级（自下而上）：素材窗 < LOGO < 礼物 < 全关黑布/特效黑幕 < 运维文字。
+    // 特效只改视图/播放器状态，不落 config、不进 rev；窗口重建后按这里的账重放。
+    private var fxBlackout = 0f
+    private var fxStrobeHz = 0f
+    private var fxRotateDps = 0f
+    private var fxZoom = 1f
+    private var fxLoopOn = false
+    private var fxSpeedRate = 1f
+    /** 旋转累计角（度）：每 33ms 累加，释放归零；重建后从 0 起（只保频率不保相位） */
+    private var fxAngleDeg = 0f
+    /** 频闪 50% 占空的一半相位 */
+    private var fxStrobeOn = false
+    private var fxCurtainMain: View? = null
+    private var fxCurtainAux: View? = null
+    private var fxStrobeTick: Runnable? = null
+    private var fxRotateTick: Runnable? = null
+    /** DMX 链路最近一次收帧时刻（elapsedRealtime）：0 = 本进程还没收过 */
+    private var dmxLastFrameAtMs = 0L
+    private var dmxLossLogged = false
+    private var dmxLossWatchdog: Runnable? = null
+
+    /** 礼物层（每块根一份，luma-key 与 LOGO 同结构但独立解码） */
+    private class GiftLayer {
+        var container: FrameLayout? = null
+        var canvas: ShareCanvasView? = null
+        var player: ExoPlayer? = null
+        var watchdog: Runnable? = null
+    }
+
+    private val giftMain = GiftLayer()
+    private val giftAux = GiftLayer()
+    private val GIFT_MAX_MS = 12_000L
+
+    /** 命令回执去重：cmd_id -> 已发回执原文（LRU 256，见 docs/control-actions.md） */
+    private val cmdAckCache = object : LinkedHashMap<String, String>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+            size > 256
+    }
+
+    private val fxSink = object : FxSink {
+        override fun onBlackout(alpha: Float) {
+            fxBlackout = alpha.coerceIn(0f, 1f)
+            updateFxCurtains()
+        }
+
+        override fun onStrobe(hz: Float) {
+            fxStrobeHz = hz.coerceAtLeast(0f)
+            restartFxStrobe()
+        }
+
+        override fun onRotate(degPerSec: Float) {
+            fxRotateDps = degPerSec
+            restartFxRotate()
+        }
+
+        override fun onZoom(scale: Float) {
+            fxZoom = scale
+            applyFxTransforms()
+        }
+
+        override fun onLoop(on: Boolean) {
+            fxLoopOn = on
+            applyFxPlayerSettings()
+        }
+
+        override fun onSpeed(rate: Float) {
+            fxSpeedRate = rate
+            applyFxPlayerSettings()
+        }
+    }
+
+    private val fx = FxController(
+        fxSink,
+        dmxLinkAlive = { dmxLastFrameAtMs > 0 && SystemClock.elapsedRealtime() - dmxLastFrameAtMs < 5000L }
+    )
     /** 显示增删监听（副屏热插拔）；只在没有退出到桌面时触发重建 */
     private var displayListener: DisplayManager.DisplayListener? = null
     /** 界面是否在前台（onResume 起、onPause 落）：云端「唤回」据此决定自己顶回来还是等现场按键 */
@@ -822,6 +899,8 @@ class MainActivity : AppCompatActivity() {
         ensureDefaultHome()
         // 重建自愈只管建窗前那一刻；风暴停了如果水位还趴在红线附近，靠它兜底（见 startLowWaterWatchdog）
         startLowWaterWatchdog()
+        // DMX 断信看护：3s 收不到帧就把特效全放回基线（频闪卡死不释放是安全问题）
+        startDmxFxWatchdog()
     }
 
     /**
@@ -1631,6 +1710,10 @@ class MainActivity : AppCompatActivity() {
             dmxLink?.stop()
             dmxLink = null
             dmxPrev = null
+            // 链路关了就没有"断信"可言：清掉收帧时刻，并释放 DMX 最后施加的特效
+            dmxLastFrameAtMs = 0L
+            dmxLossLogged = false
+            mqttHandler.post { fx.releaseAll() }
             return
         }
         val path = dmxPath()
@@ -1642,6 +1725,8 @@ class MainActivity : AppCompatActivity() {
             dmxLink = null
         }
         dmxPrev = null
+        dmxLastFrameAtMs = 0L
+        dmxLossLogged = false
         dmxLink = DmxLink(
             path = path,
             baud = baud,
@@ -2389,16 +2474,47 @@ class MainActivity : AppCompatActivity() {
      * 已在主线程（DmxLink 把帧 post 过来了）。
      */
     private fun handleDmxFrame(frame: DmxFrame) {
-        val prev = dmxPrev
-        dmxPrev = frame.channels.copyOf()
-        if (prev == null) {
-            logToFile("DMX 首帧已收（基线不触发）: ${frame.summary()}", "INFO", "DMX", "FRAME")
+        dmxLastFrameAtMs = SystemClock.elapsedRealtime()
+        if (dmxLossLogged) {
+            dmxLossLogged = false
+            logToFile("DMX 恢复收帧，特效重新受控", "INFO", "DMX", "FRAME")
+        }
+        // 退出到桌面期间画面不在我们手里：只滚动基线，不切格也不施加特效（唤回后从当时值重新开始）
+        if (exited) {
+            dmxPrev = frame.channels.copyOf()
             return
         }
+        val prev = dmxPrev
+        dmxPrev = frame.channels.copyOf()
+        val first = prev == null
+        if (first) {
+            logToFile("DMX 首帧已收（基线不触发）: ${frame.summary()}", "INFO", "DMX", "FRAME")
+        }
+        // 通道 2..7 是电平：值就是状态，首帧/死区/节流由 FxController 统一判
+        for ((ch, kind) in DMX_FX_CHANNELS) {
+            val v = frame.channels.getOrNull(ch - 1) ?: continue
+            val r = fx.apply(kind, v, FxOwner.DMX)
+            if (r is FxResult.Applied || r is FxResult.Released) {
+                val from = prev?.getOrNull(ch - 1) ?: 0
+                logToFile("DMX 特效 $kind $from→$v（${fxDescribe(kind, v)}）", "INFO", "DMX", "FX")
+            }
+        }
+        if (first) return
+        // 通道 1 仍是事件：值变化且非零才当"按了一次"
         val v = frame.channels.getOrNull(DMX_FOLDER_CHANNEL) ?: return
-        if (v == 0 || v == prev.getOrElse(DMX_FOLDER_CHANNEL) { -1 }) return
+        if (v == 0 || v == (prev?.getOrNull(DMX_FOLDER_CHANNEL) ?: -1)) return
         if (v > DMX_FOLDER_MAX) return
         onDmxTrigger(if (v < 10) "0$v" else "$v", v)
+    }
+
+    /** 日志用：raw 换算成人能读的物理量 */
+    private fun fxDescribe(kind: FxKind, raw: Int): String = when (kind) {
+        FxKind.BLACKOUT -> "alpha %.2f".format(FxController.blackoutAlpha(raw))
+        FxKind.STROBE -> "%.1fHz".format(FxController.strobeHz(raw))
+        FxKind.ROTATE -> "%.1f°/s".format(FxController.rotateDegPerSec(raw))
+        FxKind.ZOOM -> "%.2fx".format(FxController.zoomScale(raw))
+        FxKind.LOOP -> if (FxController.loopOn(raw)) "持有" else "释放"
+        FxKind.SPEED -> "%.2fx".format(FxController.speedRate(raw))
     }
 
     /** 一路通道变动 → 一次墙板式按键（同格再按 = 下一支，见 applyPanelSource） */
@@ -3098,7 +3214,31 @@ class MainActivity : AppCompatActivity() {
         try {
             val cmd = JSONObject(json)
             val action = cmd.getString("action")
+            val cmdId = cmd.optString("cmd_id", "")
             logToFile("收到命令: $action", "INFO", "MQTT", "COMMAND")
+            var ackDone = false
+            /** 同步路径的收尾回执；异步分支自己 publishAck 并先把 ackDone 置真 */
+            fun ack(ok: Boolean, err: String? = null) {
+                if (cmdId.isEmpty() || ackDone) return
+                ackDone = true
+                publishAck(cmdId, ok, err)
+            }
+            if (cmdId.isNotEmpty()) {
+                // 命令来在 Paho 线程、回执写主线程，同一张 LRU 两处碰，读写统一加锁
+                val cached = synchronized(cmdAckCache) { cmdAckCache[cmdId] }
+                if (cached != null) {
+                    logToFile("命令 $cmdId 重复下发，回放缓存回执", "INFO", "MQTT", "ACK")
+                    publishAckPayload(cached)
+                    return
+                }
+                val ts = cmd.optLong("ts", 0L)
+                val ttl = cmd.optLong("ttl_ms", 0L)
+                if (ts > 0 && ttl > 0 && System.currentTimeMillis() - ts > ttl) {
+                    ackDone = true
+                    publishAck(cmdId, false, "TIMEOUT")
+                    return
+                }
+            }
 
             when (action) {
                 "stop" -> {
@@ -3396,13 +3536,109 @@ class MainActivity : AppCompatActivity() {
                         else endPreview(folderId, "手工停止")
                     }
                 }
+                // ===== 受控 VJ 动作（PAD / 云端，见 docs/control-actions.md）=====
+                // 信封：{cmd_id, action, ts, ttl_ms, ...}；结果一律回 xvj/device/<id>/ack。
+                // 动作只落到与 485/DMX 同一套执行入口（帧→文件夹 / FxController），不另开一条播放链。
+                "fx" -> {
+                    val kindName = cmd.optString("kind", "").uppercase()
+                    val kind = FxKind.values().firstOrNull { it.name == kindName }
+                    val value = cmd.optDouble("value", 0.0).toFloat()
+                    if (kind == null) {
+                        ack(false, "UNKNOWN")
+                    } else {
+                        ackDone = true
+                        mqttHandler.post {
+                            if (exited) {
+                                publishAck(cmdId, false, "OFFLINE")
+                                return@post
+                            }
+                            val raw = FxController.rawOf(kind, value)
+                            when (fx.apply(kind, raw, FxOwner.REMOTE)) {
+                                FxResult.RejectedBusy -> {
+                                    logToFile("远端特效 $kind=$value：DMX 正持有，回 BUSY", "INFO", "FX", "BUSY")
+                                    publishAck(cmdId, false, "BUSY")
+                                }
+                                else -> {
+                                    logToFile("远端特效 $kind=$value（raw $raw）", "INFO", "FX", "APPLY")
+                                    publishAck(cmdId, true)
+                                }
+                            }
+                        }
+                    }
+                }
+                "fx_clear" -> {
+                    ackDone = true
+                    mqttHandler.post {
+                        fx.releaseAll()
+                        logToFile("远端特效全部释放", "INFO", "FX", "CLEAR")
+                        publishAck(cmdId, true)
+                    }
+                }
+                "apply_material" -> {
+                    val folderKey = sceneFolderKey(cmd.optString("scene", "A"), cmd.optInt("folder", 30))
+                    val material = cmd.optString("material", "")
+                    val target = cmd.optString("window", "main").lowercase()
+                    ackDone = true
+                    mqttHandler.post { applyRemoteMaterial(folderKey, material, target, cmdId) }
+                }
+                "gift_play" -> {
+                    val folderKey = sceneFolderKey(cmd.optString("scene", "B"), cmd.optInt("folder", 30))
+                    val material = cmd.optString("material", "")
+                    ackDone = true
+                    mqttHandler.post { startGift(folderKey, material, cmdId) }
+                }
+                "pause_all" -> {
+                    ackDone = true
+                    mqttHandler.post {
+                        val players = windowPlayers.values.toSet()
+                        if (players.isEmpty()) {
+                            publishAck(cmdId, false, "OFFLINE")
+                        } else {
+                            players.forEach { it.playWhenReady = false }
+                            logToFile("远端暂停：${players.size} 路播放器", "INFO", "FX", "PAUSE")
+                            publishAck(cmdId, true)
+                        }
+                    }
+                }
+                "resume_all" -> {
+                    ackDone = true
+                    mqttHandler.post {
+                        when (fx.apply(FxKind.BLACKOUT, 0, FxOwner.REMOTE)) {
+                            FxResult.RejectedBusy -> publishAck(cmdId, false, "BUSY")
+                            else -> {
+                                val players = windowPlayers.values.toSet()
+                                players.forEach {
+                                    it.playWhenReady = true
+                                    it.play()
+                                }
+                                logToFile("远端继续：撤特效黑幕，${players.size} 路播放器恢复", "INFO", "FX", "RESUME")
+                                publishAck(cmdId, true)
+                            }
+                        }
+                    }
+                }
+                "stop_all" -> {
+                    ackDone = true
+                    mqttHandler.post {
+                        when (fx.apply(FxKind.BLACKOUT, 255, FxOwner.REMOTE)) {
+                            FxResult.RejectedBusy -> publishAck(cmdId, false, "BUSY")
+                            else -> {
+                                logToFile("远端全关：盖特效黑幕（播放继续）", "INFO", "FX", "BLACKOUT")
+                                publishAck(cmdId, true)
+                            }
+                        }
+                    }
+                }
                 else -> {
                     // 白名单外的 action（服务端 DEVICE_ACTIONS 已拦一道，这里只是漏网兜底）：
                     // 不留一行的话，现场"发了命令没反应"只能靠猜
                     Log.w(TAG, "Unknown command action: $action")
                     logToFile("未知命令 action=$action，已忽略", "WARN", "MQTT", "COMMAND")
+                    ack(false, "UNKNOWN")
                 }
             }
+            // 同步路径兜底回执：分支里没自报结果的（配置类命令）走这里
+            ack(true)
         } catch (e: Exception) {
             Log.e(TAG, "Command parse error: ${e.message}")
             logToFile("命令处理异常: ${e.message}", "ERROR", "MQTT", "COMMAND")
@@ -4041,6 +4277,9 @@ class MainActivity : AppCompatActivity() {
         // 低水位看护也停：下面 removeCallbacksAndMessages 虽会带走它，这里显式收掉可防以后改成别的 Handler
         lowWaterWatchdog?.let { mqttHandler.removeCallbacks(it) }
         lowWaterWatchdog = null
+        // DMX 断信看护同口径（链接已在上方收掉，留着它只会每秒空转）
+        dmxLossWatchdog?.let { mqttHandler.removeCallbacks(it) }
+        dmxLossWatchdog = null
         // 副屏：先摘监听再收演示窗口（窗口里的视图随 releaseAllWindows 一起摘）
         displayListener?.let { l ->
             (getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)?.unregisterDisplayListener(l)
@@ -5361,6 +5600,9 @@ class MainActivity : AppCompatActivity() {
         refreshLogoLayer(scenes)
         // 窗口齐了才给每扇窗放运维面板；放完 applyStatusUi 会把当前文案落到新面板上
         refreshWindowStatusOverlays()
+        // 特效覆盖表重放（旋转/缩放/黑幕/循环/速度）并重排层级：新窗口是后加的，会盖在礼物与幕布上
+        fx.onWindowsRebuilt()
+        restackFxLayers()
         appliedScenes = scenes
         appliedScenesFp = fp
         appliedPlaySettingsJson = playSettingsJson(scenes)
@@ -5828,6 +6070,8 @@ class MainActivity : AppCompatActivity() {
         windowNames[winId] = w.optString("name", "")
         // 布局完成后应用截取/旋转/镜像（取景与矩阵中心都依赖实际视图尺寸），未就绪则等首次布局再补
         container.post { applyTransformWhenReady(view, w) }
+        // 特效旋转/缩放叠在窗口容器上：新窗要按当前特效账补一次（窗口重建后重放）
+        container.post { applyFxTransforms() }
         val cr = cropRect(w)
         Log.d(TAG, "创建窗口: id=$winId type=$type size=${width}x${height} pos=($x,$y)${if (root === auxRoot) " [副屏]" else ""} opacity=$opacity brightness=$effB flip=${w.optString("flip","none")} rot=${w.optInt("rotation",0)} crop=(${cr[0]},${cr[1]},${cr[2]},${cr[3]})")
     }
@@ -6737,6 +6981,13 @@ class MainActivity : AppCompatActivity() {
         player.volume = 1f
         if (clock != null) player.setMediaItems(playlist, clock.index.coerceIn(0, playlist.size - 1), clock.positionMs)
         else player.setMediaItems(playlist)
+        // 特效层的 LOOP/速度要在每一次换清单（换格/重建/分批起播）后重新落到这一路
+        player.repeatMode = when {
+            fxLoopOn -> Player.REPEAT_MODE_ONE
+            loopPlay -> Player.REPEAT_MODE_ALL
+            else -> Player.REPEAT_MODE_OFF
+        }
+        player.setPlaybackSpeed(fxSpeedRate)
         player.prepare()
         Log.d(TAG, "窗口 $winId 开始播放 $folderId -> ${physicalDir.absolutePath} (${videos.size}个视频)")
         logToFile("窗口 $winId 开始播放 $folderId (${videos.size}个视频，${if (ps.shuffle) "随机" else "顺序"}循环" +
@@ -7175,6 +7426,8 @@ class MainActivity : AppCompatActivity() {
      * 注意不清 windowContentSigs：那由下一次 applySceneConfigs 自己清。
      */
     private fun releaseAllWindows() {
+        // 礼物层自带独立解码器：随窗口一起收，收完再依次放素材窗
+        stopAllGifts()
         // 同 applySceneConfigs：先清试播账，再放播放器（否则看门狗/回调会对着已释放实例恢复）
         abortAllPreviews("窗口全部释放")
         windowPlayers.values.forEach { it.release() }
@@ -7199,6 +7452,8 @@ class MainActivity : AppCompatActivity() {
         appliedPlaySettingsJson = null
         // 屏上次序账同理作废：留着它，stop 之后同一份配置的 update_windows 会被比成"没变"
         appliedWindowOrder = emptyList()
+        // 特效账一并清零：窗口都没了，留着频闪/黑幕只会在下次重建时莫名带上
+        fx.releaseAll()
         Log.d(TAG, "释放所有窗口资源")
     }
 
@@ -7492,10 +7747,317 @@ class MainActivity : AppCompatActivity() {
             auxPanelBlackout?.let { auxRoot?.removeView(it) }
             auxPanelBlackout = null
         }
+        // 全关与特效黑幕是取 max 合成的：墙板这边一翻，特效幕布的有效 alpha 也跟着变（全关期间恒 1）
+        updateFxCurtains()
         // 提示文字属于运维层：debug 开着时要压在黑布上面，关着时整层不见
         applyDebugUi()
         logToFile("墙板${if (on) "全关" else "全开"}帧 $hex：${if (on) "所有窗口盖黑，播放继续" else "撤掉黑布，回到原画面"}",
             "INFO", "WALLPANEL", "FRAME")
+    }
+
+    // ================= 特效层（DMX 通道 2~7 / 远端 fx 动作） =================
+    // 实现口径见 docs/dmx-fx-channels.md：黑幕/频闪调 alpha，旋转缩放改窗口容器变换，
+    // LOOP/速度改播放器参数；窗口重建后由 onWindowsRebuilt 重放。全部只在主线程。
+
+    /** 黑幕有效 alpha = max(墙板全关, 特效黑场)；频闪再按 50% 占空压到 1/0 */
+    private fun updateFxCurtains() {
+        val base = maxOf(if (panelBlackoutOn) 1f else 0f, fxBlackout)
+        // 墙板全关始终盖得住：频闪不许把全关打成半透
+        val shown = if (panelBlackoutOn) 1f else if (fxStrobeHz > 0f) (if (fxStrobeOn) 1f else 0f) else base
+        applyFxCurtain(flSurface, true, shown)
+        applyFxCurtain(auxRoot, false, shown)
+    }
+
+    private fun applyFxCurtain(root: FrameLayout?, isMain: Boolean, alpha: Float) {
+        if (root == null) return
+        val cur = if (isMain) fxCurtainMain else fxCurtainAux
+        // 频闪期间保留视图只改 alpha：每半周期 add/remove 一次会把主线程来回折腾
+        if (alpha <= 0.001f && fxStrobeHz <= 0f) {
+            if (cur != null) {
+                (cur.parent as? ViewGroup)?.removeView(cur)
+                if (isMain) fxCurtainMain = null else fxCurtainAux = null
+            }
+            return
+        }
+        val created = cur == null
+        val v = cur ?: View(this).apply {
+            setBackgroundColor(Color.BLACK)
+            isClickable = false
+            root.addView(this, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }
+        if (isMain) fxCurtainMain = v else fxCurtainAux = v
+        v.alpha = alpha
+        // 新窗口/礼物是后加的，会盖在幕布上面；每帧都顶一次，顺序才不会漂
+        v.bringToFront()
+        if (created) applyDebugUi()
+    }
+
+    /** 礼物 < 全关黑布 < 特效黑幕 < 运维文字：窗口重建或礼物起播后统一重排一次 */
+    private fun restackFxLayers() {
+        giftMain.container?.bringToFront()
+        giftAux.container?.bringToFront()
+        panelBlackout?.bringToFront()
+        auxPanelBlackout?.bringToFront()
+        fxCurtainMain?.bringToFront()
+        fxCurtainAux?.bringToFront()
+        applyDebugUi()
+    }
+
+    private fun restartFxStrobe() {
+        fxStrobeTick?.let { mqttHandler.removeCallbacks(it) }
+        fxStrobeTick = null
+        fxStrobeOn = false
+        if (fxStrobeHz <= 0f) {
+            updateFxCurtains()
+            return
+        }
+        val tick = object : Runnable {
+            override fun run() {
+                fxStrobeOn = !fxStrobeOn
+                updateFxCurtains()
+                mqttHandler.postDelayed(this, (500f / fxStrobeHz).toLong().coerceIn(10L, 500L))
+            }
+        }
+        fxStrobeTick = tick
+        mqttHandler.post(tick)
+    }
+
+    private fun restartFxRotate() {
+        fxRotateTick?.let { mqttHandler.removeCallbacks(it) }
+        fxRotateTick = null
+        if (fxRotateDps == 0f) {
+            // 释放：角度归零并立刻复位（DMX 表里 128 也是释放）
+            fxAngleDeg = 0f
+            applyFxTransforms()
+            return
+        }
+        val tick = object : Runnable {
+            override fun run() {
+                fxAngleDeg = (fxAngleDeg + fxRotateDps / 30f + 360f) % 360f
+                applyFxTransforms()
+                mqttHandler.postDelayed(this, 33L)
+            }
+        }
+        fxRotateTick = tick
+        mqttHandler.post(tick)
+    }
+
+    /** 特效变换叠在配置变换之外：配置旋转/裁剪作用在 TextureView，这里只动窗口容器 */
+    private fun applyFxTransforms() {
+        val deg = fxAngleDeg
+        val scale = fxZoom
+        for (v in windowViews.values.toSet()) {
+            v.rotation = deg
+            v.scaleX = scale
+            v.scaleY = scale
+        }
+    }
+
+    private fun applyFxPlayerSettings() {
+        val mode = when {
+            fxLoopOn -> Player.REPEAT_MODE_ONE
+            loopPlay -> Player.REPEAT_MODE_ALL
+            else -> Player.REPEAT_MODE_OFF
+        }
+        for (p in windowPlayers.values.toSet()) {
+            p.repeatMode = mode
+            p.setPlaybackSpeed(fxSpeedRate)
+        }
+    }
+
+    /** 3s 收不到 DMX 帧 ⇒ 全部特效释放；复联后首帧重新只记基线（见 FxController） */
+    private fun startDmxFxWatchdog() {
+        dmxLossWatchdog?.let { mqttHandler.removeCallbacks(it) }
+        val tick = object : Runnable {
+            override fun run() {
+                val last = dmxLastFrameAtMs
+                if (!dmxLossLogged && last > 0 && SystemClock.elapsedRealtime() - last >= 3000L) {
+                    dmxLossLogged = true
+                    fx.releaseAll()
+                    logToFile("DMX LOST：3s 未收到帧，特效全部释放（播放与格子保持）", "WARN", "DMX", "LOST")
+                }
+                mqttHandler.postDelayed(this, 1000L)
+            }
+        }
+        dmxLossWatchdog = tick
+        mqttHandler.postDelayed(tick, 1000L)
+    }
+
+    /** "A"/30 → "A30"；越界夹到 1..99，非法 scene 按 A 处理 */
+    private fun sceneFolderKey(scene: String, folder: Int): String {
+        val prefix = if (scene.equals("B", true)) "B" else "A"
+        val n = folder.coerceIn(1, 99)
+        return prefix + if (n < 10) "0$n" else "$n"
+    }
+
+    private fun rootOfWinView(winId: String): ViewGroup? = windowViews[winId]?.parent as? ViewGroup
+
+    /**
+     * PAD 素材点播：把目标屏上在播这一格的窗口（共享组取基准那一路）换成单只素材。
+     * 只换 playlist，不开第二路解码；切格/重建/墙板照常按 config 恢复。
+     */
+    private fun applyRemoteMaterial(folderKey: String, filename: String, target: String, cmdId: String) {
+        if (exited) {
+            publishAck(cmdId, false, "OFFLINE")
+            return
+        }
+        val dir = materialDirOf(folderKey)
+        val file = dir?.let { materialFileOf(it, filename) }
+        if (file == null || !file.exists()) {
+            logToFile("素材点播拒绝：找不到 $folderKey/$filename", "WARN", "PLAYBACK", "MATERIAL")
+            publishAck(cmdId, false, "CONFLICT")
+            return
+        }
+        val root: ViewGroup? = if (target == "second") auxRoot else flSurface
+        if (root == null) {
+            logToFile("素材点播拒绝：目标屏${if (target == "second") "副屏" else "主屏"}不在", "WARN", "PLAYBACK", "MATERIAL")
+            publishAck(cmdId, false, "CONFLICT")
+            return
+        }
+        val onFolder = videoSurfaces.entries
+            .filter { it.value.folderKey == folderKey && rootOfWinView(it.key) === root && windowPlayers.containsKey(it.key) }
+            .map { it.key }.sorted()
+        val winId = onFolder.firstOrNull { winShareGroup[it]?.leaderId == it } ?: onFolder.firstOrNull()
+            ?: videoSurfaces.entries
+                .filter { rootOfWinView(it.key) === root && windowPlayers.containsKey(it.key) }
+                .map { it.key }.sorted().firstOrNull()
+        val player = winId?.let { windowPlayers[it] }
+        if (winId == null || player == null) {
+            logToFile("素材点播拒绝：目标屏没有可播的素材窗", "WARN", "PLAYBACK", "MATERIAL")
+            publishAck(cmdId, false, "CONFLICT")
+            return
+        }
+        // 单只素材用 OFF/ONE 才能"播完停住/循环"；墙上切格会把 playlist 整套换掉，自然退出点播
+        player.repeatMode = if (fxLoopOn) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_ALL
+        player.setMediaItems(listOf(MediaItem.fromUri(Uri.fromFile(file))))
+        player.setPlaybackSpeed(fxSpeedRate)
+        player.prepare()
+        player.playWhenReady = true
+        logToFile("素材点播：$folderKey/$filename → 窗口 $winId（${if (target == "second") "副屏" else "主屏"}）",
+            "INFO", "PLAYBACK", "MATERIAL")
+        publishAck(cmdId, true)
+    }
+
+    /** PAD 送礼：两块根各一层 luma-key 画布 + 独立解码，播完/12s 自动收层 */
+    private fun startGift(folderKey: String, filename: String, cmdId: String) {
+        if (exited) {
+            publishAck(cmdId, false, "OFFLINE")
+            return
+        }
+        if (panelBlackoutOn) {
+            logToFile("礼物被拒：墙板全关中", "INFO", "PLAYBACK", "GIFT")
+            publishAck(cmdId, false, "BUSY")
+            return
+        }
+        // 礼物要再开一到两路解码（两块根各一路），内存不够时宁可拒绝也不把整机推向 lmkd
+        val avail = availableMemMb()
+        if (avail in 1 until PREVIEW_MIN_AVAIL_MB) {
+            logToFile("礼物被拒：可用内存仅 ${avail}MB（红线 ${PREVIEW_MIN_AVAIL_MB}MB）", "WARN", "PLAYBACK", "GIFT")
+            publishAck(cmdId, false, "CONFLICT")
+            return
+        }
+        val dir = materialDirOf(folderKey)
+        val file = dir?.let { materialFileOf(it, filename) }
+        if (file == null || !file.exists()) {
+            logToFile("礼物起播失败：找不到 $folderKey/$filename", "WARN", "PLAYBACK", "GIFT")
+            publishAck(cmdId, false, "CONFLICT")
+            return
+        }
+        stopAllGifts()
+        val main = startGiftOn(flSurface, giftMain, file)
+        val aux = startGiftOn(auxRoot, giftAux, file)
+        if (!main && !aux) {
+            logToFile("礼物起播失败：两块屏都没有可挂的根", "WARN", "PLAYBACK", "GIFT")
+            publishAck(cmdId, false, "CONFLICT")
+            return
+        }
+        logToFile("礼物起播：$folderKey/$filename（主屏 ${if (main) "有" else "无"}，副屏 ${if (aux) "有" else "无"}）",
+            "INFO", "PLAYBACK", "GIFT")
+        publishAck(cmdId, true)
+    }
+
+    private fun startGiftOn(root: FrameLayout?, layer: GiftLayer, file: File): Boolean {
+        if (root == null || root.width <= 0 || root.height <= 0) return false
+        val canvas = ShareCanvasView(this, lumaKey = true)
+        val container = FrameLayout(this)
+        container.addView(canvas, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(container, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        canvas.setMembers(listOf(ShareCanvasView.Member(
+            winId = "gift", left = 0, top = 0, width = root.width, height = root.height,
+            alpha = 1f, brightness = 1f, crop = floatArrayOf(0f, 0f, 1f, 1f),
+            rotation = 0, flip = "none"
+        )))
+        val player = buildExoPlayer().apply {
+            repeatMode = Player.REPEAT_MODE_OFF
+            volume = 0f
+            playWhenReady = true
+        }
+        canvas.onDecoderSurface = { surf -> player.setVideoSurface(surf) }
+        player.addListener(object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                canvas.setDecoderSize(videoSize.width, videoSize.height)
+            }
+
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_ENDED) stopGiftOn(root, layer)
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                logToFile("礼物解码失败：${error.errorCodeName} ${error.message ?: ""}", "ERROR", "PLAYBACK", "GIFT")
+                stopGiftOn(root, layer)
+            }
+        })
+        player.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+        player.prepare()
+        layer.container = container
+        layer.canvas = canvas
+        layer.player = player
+        layer.watchdog = Runnable { stopGiftOn(root, layer) }.also { mqttHandler.postDelayed(it, GIFT_MAX_MS) }
+        restackFxLayers()
+        return true
+    }
+
+    private fun stopGiftOn(root: FrameLayout?, layer: GiftLayer) {
+        layer.watchdog?.let { mqttHandler.removeCallbacks(it) }
+        layer.watchdog = null
+        layer.player?.release()
+        layer.player = null
+        layer.canvas?.shutdown()
+        layer.canvas = null
+        layer.container?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        layer.container = null
+    }
+
+    private fun stopAllGifts() {
+        stopGiftOn(flSurface, giftMain)
+        stopGiftOn(auxRoot, giftAux)
+    }
+
+    // ---------------- 命令回执 ----------------
+    /** 回执走设备私有主题（与命令同一条鉴权），原文缓存 256 条给重复下发回放 */
+    private fun publishAck(cmdId: String, ok: Boolean, err: String? = null) {
+        if (cmdId.isEmpty()) return
+        val id = prefs.getString("device_id", null)?.takeIf { it.isNotEmpty() }
+            ?: deviceId.takeIf { it.isNotEmpty() } ?: return
+        val payload = JSONObject().apply {
+            put("cmd_id", cmdId)
+            put("ok", ok)
+            if (!ok && !err.isNullOrEmpty()) put("err", err)
+            if (appliedRev.isNotEmpty()) put("rev", appliedRev)
+            put("ts", System.currentTimeMillis())
+        }.toString()
+        synchronized(cmdAckCache) { cmdAckCache[cmdId] = payload }
+        mqttClient?.publish("xvj/device/$id/ack", payload.toByteArray(), 1, false)
+        logToFile("命令回执 cmd_id=$cmdId ok=$ok${if (!ok) " err=${err ?: ""}" else ""}", "INFO", "MQTT", "ACK")
+    }
+
+    private fun publishAckPayload(payload: String) {
+        val id = prefs.getString("device_id", null)?.takeIf { it.isNotEmpty() }
+            ?: deviceId.takeIf { it.isNotEmpty() } ?: return
+        mqttClient?.publish("xvj/device/$id/ack", payload.toByteArray(), 1, false)
     }
 
     /** 黑布盖到根容器最后一层（覆盖顺序只能靠 bringToFront，窗口容器都是 addView 进来的） */
