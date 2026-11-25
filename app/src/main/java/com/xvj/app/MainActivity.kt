@@ -1925,13 +1925,12 @@ class MainActivity : AppCompatActivity() {
         val allowB = logoIdsOf(wins.optJSONArray("B"))
         if (allowA.isEmpty() && allowB.isEmpty()) return emptyList()
         val out = ArrayList<ShareCanvasView.Member>()
-        val band = auxBand()
         for ((winId, w) in enabledWindowsSorted(scenes)) {
             if (winId !in allowA && winId !in allowB) continue
             val view = windowViews[winId] ?: continue
             if (view.visibility != View.VISIBLE) continue
             // LOGO 画布只挂在主根上：副屏窗口暂不叠 LOGO（一块画布不能同时挂两块根）
-            if (band != null && windowOnAux(w, band)) continue
+            if (auxDesigned(w)) continue
             // 第二道闸：这一窗此刻播的那一格开了 LOGO 才出（与云端 playSettingsValue 同一条件）
             val folderKey = videoSurfaces[winId]?.folderKey?.takeIf { it.isNotEmpty() }
                 ?: resolveWindowFolder(scenes, w.optJSONObject("content") ?: JSONObject(), winId)
@@ -2080,12 +2079,11 @@ class MainActivity : AppCompatActivity() {
         val rows = 12
         val cols = Math.round(rows * srcW.toFloat() / srcH).coerceIn(2, 64)
         val out = ArrayList<FloatArray>()
-        val band = auxBand()
         for ((winId, w) in enabledWindowsSorted(scenes)) {
             if (winId !in allowA && winId !in allowB) continue
             if (windowContentSigs[winId]?.startsWith("HDMI|") == true) continue
             // 网格与 LOGO 画布同根（主根）：副屏窗口不出网格
-            if (band != null && windowOnAux(w, band)) continue
+            if (auxDesigned(w)) continue
             val view = windowViews[winId] ?: continue
             if (view.visibility != View.VISIBLE) continue
             val g = windowGeom(w)
@@ -5181,7 +5179,8 @@ class MainActivity : AppCompatActivity() {
                 put("name", "窗口1")
                 put("x", 0)
                 put("y", 0)
-                put("width", designW)
+                // 组合画布的房间没配窗：默认窗只铺主区，别横跨整幅组合画布（副屏那边留空）
+                put("width", if (combinedCanvas) mainRegionW() else designW)
                 put("height", designH)
                 put("zIndex", 1)
                 put("content", defaultContent)
@@ -5200,19 +5199,26 @@ class MainActivity : AppCompatActivity() {
                 // 播哪一格先解析出来：同格 ≥2 扇要在起播放器之前就认成一组，等各路解码各建好了再合就晚了
                 PlanWindow(winId, w, content, resolveWindowFolder(scenes, content, winId))
             }
-            planFolders = plan.mapNotNull { it.folderId }.distinct()
+            // 副屏关着（demo window 不在）：按设计口径归副屏的窗口先不建 —— 那块屏没亮，建了也只在
+            // 主屏外空转一解码器。配置照记（签名/窗口名），副屏回来时热插拔会整屏重建补上。
+            val livePlan = if (auxRoot == null) plan.filter { !auxDesigned(it.win) } else plan
+            for (p in plan) {
+                if (p in livePlan) continue
+                windowContentSigs[p.winId] = contentSignature(p.content)
+                windowNames[p.winId] = p.win.optString("name", "")
+            }
+            planFolders = livePlan.mapNotNull { it.folderId }.distinct()
             // 纯色 / HDMI 窗口本来就零解码，不掺进共享组；副屏那几扇也单独解码 ——
             // 共享画布是一块挂在主根上的 GL，跨两块屏的成员并不进同一张画布（见副屏渲染段注释）
-            val band = auxBand()
-            val groupsByFolder = plan.filter { isVideoContentType(it.content) && it.folderId != null }
-                .filter { band == null || !windowOnAux(it.win, band) }
+            val groupsByFolder = livePlan.filter { isVideoContentType(it.content) && it.folderId != null }
+                .filter { !auxDesigned(it.win) }
                 .groupBy { it.folderId!! }
                 .filterValues { it.size >= 2 }
             // 组的画布放在"该组最上层那扇成员"原来的 z 位置：下面的窗口照常透出来，
             // 被并集矩形盖到的别组窗口则按这一层的 z 被压过去（共享解码的唯一取舍，见 ShareCanvasView）
             val lastIdxOfGroup = HashMap<String, Int>()
-            for ((idx, p) in plan.withIndex()) p.folderId?.let { if (groupsByFolder.containsKey(it)) lastIdxOfGroup[it] = idx }
-            for ((idx, p) in plan.withIndex()) {
+            for ((idx, p) in livePlan.withIndex()) p.folderId?.let { if (groupsByFolder.containsKey(it)) lastIdxOfGroup[it] = idx }
+            for ((idx, p) in livePlan.withIndex()) {
                 val fk = p.folderId
                 if (fk != null && groupsByFolder.containsKey(fk)) {
                     if (lastIdxOfGroup[fk] == idx) createShareGroup(fk, groupsByFolder[fk]!!)
@@ -5225,7 +5231,7 @@ class MainActivity : AppCompatActivity() {
             val pacingMs = startPacingMs()
             if (pacingMs > 0) logToFile("低内存分批起播：每扇间隔 ${pacingMs}ms", "WARN", "PLAYBACK", "START")
             var paced = 0
-            for (p in plan) {
+            for (p in livePlan) {
                 val fk = p.folderId ?: continue
                 if (pacingMs > 0 && paced > 0) {
                     val delay = minOf(paced * pacingMs, 3 * pacingMs)
@@ -5290,9 +5296,8 @@ class MainActivity : AppCompatActivity() {
         // 同格 ≥2 扇才成组：组按"成员构成"比对，不按格子名 —— 墙板换格/勾了跟随是同一组人整组换到另一格，
         // 解码路数与画布都不变，原地换清单就够；只有成员增删（含两组并到一格）才必须重建。
         // 口径与 createWindowsForScenes 一致：副屏窗口不进主根上的共享画布。
-        val band = auxBand()
         val desiredGroups = plan.filter { isVideoContentType(it.content) && it.folderId != null }
-            .filter { band == null || !windowOnAux(it.win, band) }
+            .filter { !auxDesigned(it.win) }
             .groupBy { it.folderId!! }.filterValues { it.size >= 2 }
             .mapValues { entry -> entry.value.map { it.winId }.toSet() }
         if (shareGroups.values.map { it.members.toSet() }.toSet() != desiredGroups.values.toSet()) return false
@@ -5311,13 +5316,15 @@ class MainActivity : AppCompatActivity() {
         for (p in plan) {
             val oldSig = windowContentSigs[p.winId] ?: return false
             val newSig = contentSignature(p.content)
+            // 副屏关着时按设计口径归副屏的窗没建（见 createWindowsForScenes）：配置照比，清单等副屏回来重建再拉
+            val live = windowViews[p.winId] != null
             if (oldSig != newSig) {
                 if (!isVideoContentSig(oldSig) || !isVideoContentSig(newSig)) return false
-                refresh.add(p)
+                if (live) refresh.add(p)
                 continue
             }
             val folderId = p.folderId
-            if (!isVideoContentSig(newSig) || folderId == null) continue
+            if (!isVideoContentSig(newSig) || folderId == null || !live) continue
             val surf = videoSurfaces[p.winId] ?: return false
             if ((settingsChanged && surf.settings.shuffle != playSettingsOf(scenes, folderId).shuffle) ||
                 playlistStale(folderId)) refresh.add(p)
@@ -5332,7 +5339,7 @@ class MainActivity : AppCompatActivity() {
         // 次序与签名上面已对齐，这里判不出结构变化，只会原地改视图几何并把共享画布按并集重算一次
         applyLiveWindowUpdate(scenes)
         // 播放设置里的点歌屏开关也走这条原地路：只改 HDMI 窗显隐，不停不重建视频播放器
-        applyHdmiVisibility(scenes, plan.mapNotNull { it.folderId })
+        applyHdmiVisibility(scenes, plan.filter { windowViews[it.winId] != null }.mapNotNull { it.folderId })
         logToFile("配置原地应用：${plan.size} 扇窗只换 ${refresh.size} 路清单，播放器零释放（指纹 $fp）", "INFO", "WINDOW", "INPLACE")
         return true
     }
@@ -5942,29 +5949,36 @@ class MainActivity : AppCompatActivity() {
     /** 房间基准是不是"双屏合一"画布：宽高比 ≥ 2.4（16:9 / 21:9 都到不了）。左半 16:9 归主屏，右边带子归副屏 */
     private val combinedCanvas: Boolean get() = designW >= designH * 2.4f
 
+    /** 主区宽度（设计坐标）：组合画布左起一块 16:9 归主屏，5760×2160 → 3840 */
+    private fun mainRegionW(): Int = Math.round(designH * 16f / 9f)
+
     /**
      * 副屏在基准里占的那条带 [x, y, w, h]（设计坐标）：主屏 16:9 从 0 起，剩下的宽度归副屏、同比例居中。
-     * 5760×2160 → [3840, 540, 1920, 1080]；7680×2160 → [3840, 0, 3840, 2160]。
-     * null = 不是双屏基准，或本机此刻没有副屏在渲染（单口 / 切片档 / 副屏移出）。
+     * 5760×2160 → [3840, 540, 1920, 1080]。
+     * null = 不是双屏基准，或本机此刻没有副屏在渲染（单口 / 副屏移出）——
+     * 副屏关着时主屏仍按主区 [0,0,mainW,designH] 铺，不把整幅组合画布压进主屏。
      */
     private fun auxBand(): IntArray? {
         if (!combinedCanvas || auxRoot == null) return null
-        val mainW = Math.round(designH * 16f / 9f)
+        val mainW = mainRegionW()
         val auxW = designW - mainW
         if (auxW <= 0) return null
         val auxH = Math.round(auxW * 9f / 16f).coerceAtMost(designH)
         return intArrayOf(mainW, (designH - auxH) / 2, auxW, auxH)
     }
 
-    /** 这扇窗归副屏吗：窗口中心落在副屏带里就算（跨带的窗按中心整扇归一边，不切开） */
-    private fun windowOnAux(w: JSONObject, band: IntArray? = auxBand()): Boolean {
-        val b = band ?: return false
-        return w.optInt("x", 0) + w.optInt("width", designW) / 2 >= b[0]
-    }
+    /**
+     * 这扇窗按设计口径归副屏吗：窗口中心落在主区右侧就算（跨带的窗按中心整扇归一边，不切开）。
+     * 与副屏此刻在不在无关 —— 副屏关着时这类窗口就不建，等副屏回来由热插拔重建补上。
+     * 7680 切片档（宽高比 ≥3）沿用老口径（主口扫右半），不走副屏带。
+     */
+    private fun auxDesigned(w: JSONObject): Boolean =
+        combinedCanvas && designW < designH * 3f &&
+            w.optInt("x", 0) + w.optInt("width", designW) / 2 >= mainRegionW()
 
     /** 这扇窗的视图该挂哪个根：副屏窗口进 Presentation，其余都在主根上（窗口面板/LOGO 同口径） */
     private fun rootForWindow(w: JSONObject): FrameLayout? =
-        if (auxBand() != null && windowOnAux(w)) auxRoot else flSurface
+        if (auxDesigned(w)) auxRoot else flSurface
 
     /** 屏上视图该挂的根和它此刻挂的不一致（副屏接入/移出/关）：结构变化，原地改不出来，必须整屏重建 */
     private fun windowParentMismatch(windows: List<Pair<String, JSONObject>>): Boolean {
@@ -6057,7 +6071,7 @@ class MainActivity : AppCompatActivity() {
         val before = auxDisplayId
         val on = syncAuxPresentation()
         if ((before != -1) == on) return
-        logToFile("副屏状态变化（$why）：${if (on) "已接入，按新配置重建画面" else "已断开，副屏窗口收回主屏"}",
+        logToFile("副屏状态变化（$why）：${if (on) "已接入，按新配置重建画面" else "已断开，副屏窗口暂不渲染（主屏保持主区）"}",
             "INFO", "WINDOW", "AUX")
         val cached = appliedScenes ?: prefs.getString("scenes_json", null)?.let {
             try { JSONObject(it) } catch (e: Exception) { null }
@@ -6066,20 +6080,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 本机承担画布哪一块（设计坐标 [x, y, w, h]）。双屏合一的房间基准（宽高比 ≥ 2.4，16:9/21:9 都到不了）
-     * 且本机 1080/eDP 链关着（默认，或管理台关了副屏；见【A-18】）时，本机只是那块画布的主屏半屏 ——
-     * 台架 8K 口现在出来的是一块 3840×2160，正是 7680×2160 画布的右半 ——
-     * 所以只取右半、1:1 落屏（与编辑器 _canvasView 同一口径）。
-     * 副屏开着、本机没有这条显示链（null，编辑器画整幅）或屏自己就够宽（原生 7680）时照旧整幅。
+     * 本机承担画布哪一块（设计坐标 [x, y, w, h]）。组合画布（宽高比 ≥ 2.4）的约定是左起一块 16:9 归主屏、
+     * 右边剩下的归副屏（见 [auxBand]）：副屏开着时主屏照旧只落左半主区；副屏关着时主屏也只落主区，
+     * 不把整幅组合画布压进 16:9 屏（否则主屏窗口与副屏窗口会一起被横压、裁错位）。
+     * 例外只有老 7680 切片档（宽高比 ≥3）：那个档位主口物理上扫的是右半，保留右半口径。
      */
     private fun canvasView(screen: IntArray = screenPx()): IntArray {
-        // 副屏在渲染：主屏只承担左半（16:9 主区），右带归副屏 —— 换算见 windowGeom 的 auxBand 分支
         val band = auxBand()
         if (band != null) return intArrayOf(0, 0, band[0], designH)
-        if (designW < designH * 2.4f) return intArrayOf(0, 0, designW, designH)
-        if (readSecondaryDisplayOn() != false) return intArrayOf(0, 0, designW, designH)
-        if (screen[0].toFloat() / screen[1] >= 2.4f) return intArrayOf(0, 0, designW, designH)
-        return intArrayOf(designW / 2, 0, designW / 2, designH)
+        if (!combinedCanvas) return intArrayOf(0, 0, designW, designH)
+        if (designW >= designH * 3f && screen[0].toFloat() / screen[1] < 2.4f) {
+            return intArrayOf(designW / 2, 0, designW / 2, designH)
+        }
+        return intArrayOf(0, 0, mainRegionW(), designH)
     }
 
     /**
@@ -6095,7 +6108,7 @@ class MainActivity : AppCompatActivity() {
         val band = auxBand()
         if (band != null) {
             // 副屏窗口按副屏真实像素换算；主屏窗口只认左半（[0,0,mainW,designH]），两轴各算各的
-            return if (windowOnAux(w, band)) geomIn(w, band, auxScreenPx())
+            return if (auxDesigned(w)) geomIn(w, band, auxScreenPx())
             else geomIn(w, intArrayOf(0, 0, band[0], designH), screen)
         }
         return geomIn(w, canvasView(screen), screen)
