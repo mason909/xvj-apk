@@ -4819,15 +4819,18 @@ class MainActivity : AppCompatActivity() {
      * android.hardware.* 服务。
      * 匹配串写成 [m]edia：su、sh、grep 自己的命令行都原样带着这串模式文本，不加这层会被自己的
      * 正则命中、连脚本一起 kill（#355 实测退出码 137：HAL 死了，日志却报失败）。
-     * @return 杀掉的解码器进程数；脚本超时或 su 没起来时 -1
+     * 每杀一个就回一行计数：低水位时 execAsRoot 的 8s 预算会把脚本中途销毁，
+     * 只在结尾 echo 的话杀已落地也数不出来，白记一笔「脚本失败」（台架 11-24 15:34 实测 359MB→1377MB 却报失败）。
+     * @return 杀掉的解码器进程数（取最后一行计数）；一次都没回账时 -1
      */
     private fun killDecodeHal(): Int {
         val (_, out) = execAsRoot(
             "k=0; for f in \$(grep -la '[m]edia.c2@1.*-service' /proc/[0-9]*/cmdline 2>/dev/null); do " +
-                "p=\${f#/proc/}; p=\${p%/cmdline}; kill -9 \"\$p\" 2>/dev/null && k=\$((k+1)); done; " +
+                "p=\${f#/proc/}; p=\${p%/cmdline}; " +
+                "kill -9 \"\$p\" 2>/dev/null && { k=\$((k+1)); echo xvj-killed=\$k; }; done; " +
                 "echo xvj-killed=\$k",
             8_000)
-        return Regex("xvj-killed=(\\d+)").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+        return Regex("xvj-killed=(\\d+)").findAll(out).lastOrNull()?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
     /**
