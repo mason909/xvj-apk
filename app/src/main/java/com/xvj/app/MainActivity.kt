@@ -5300,12 +5300,19 @@ class MainActivity : AppCompatActivity() {
                 .filterValues { it.size >= 2 }
             // 组的画布放在"该组最上层那扇成员"原来的 z 位置：下面的窗口照常透出来，
             // 被并集矩形盖到的别组窗口则按这一层的 z 被压过去（共享解码的唯一取舍，见 ShareCanvasView）
+            // 只记组成员的下标：同格的副屏窗不是成员，它排在更后面也不能把建组的位置顶走
             val lastIdxOfGroup = HashMap<String, Int>()
-            for ((idx, p) in livePlan.withIndex()) p.folderId?.let { if (groupsByFolder.containsKey(it)) lastIdxOfGroup[it] = idx }
+            for ((idx, p) in livePlan.withIndex()) {
+                val fk = p.folderId ?: continue
+                if (groupsByFolder[fk]?.any { it.winId == p.winId } == true) lastIdxOfGroup[fk] = idx
+            }
             for ((idx, p) in livePlan.withIndex()) {
                 val fk = p.folderId
-                if (fk != null && groupsByFolder.containsKey(fk)) {
-                    if (lastIdxOfGroup[fk] == idx) createShareGroup(fk, groupsByFolder[fk]!!)
+                // 只看"这一扇是不是组成员"，不能只看格子名：副屏窗不进组（每组只在主根上画），
+                // 但它照样可能播主屏那组同一格 —— 按名字跳会把副屏窗整扇漏建（无视图、无播放器，永远黑）
+                val grpItems = if (fk != null) groupsByFolder[fk] else null
+                if (fk != null && grpItems != null && grpItems.any { it.winId == p.winId }) {
+                    if (lastIdxOfGroup[fk] == idx) createShareGroup(fk, grpItems)
                     continue
                 }
                 createWindowView(p.winId, p.win)
