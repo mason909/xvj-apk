@@ -179,6 +179,8 @@ import android.view.Gravity
 import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.RenderEffect
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapShader
@@ -362,6 +364,9 @@ class MainActivity : AppCompatActivity() {
     private var fxZoom = 1f
     private var fxLoopOn = false
     private var fxSpeedRate = 1f
+    private var fxColorCode = 0
+    private var fxColorMain: View? = null
+    private var fxColorAux: View? = null
     /** 旋转累计角（度）：每 33ms 累加，释放归零；重建后从 0 起（只保频率不保相位） */
     private var fxAngleDeg = 0f
     /** 频闪 50% 占空的一半相位 */
@@ -422,6 +427,11 @@ class MainActivity : AppCompatActivity() {
         override fun onSpeed(rate: Float) {
             fxSpeedRate = rate
             applyFxPlayerSettings()
+        }
+
+        override fun onColor(code: Int) {
+            fxColorCode = code.coerceIn(0, FxColor.values().size)
+            restackFxLayers()
         }
     }
 
@@ -2515,6 +2525,7 @@ class MainActivity : AppCompatActivity() {
         FxKind.ZOOM -> "%.2fx".format(FxController.zoomScale(raw))
         FxKind.LOOP -> if (FxController.loopOn(raw)) "持有" else "释放"
         FxKind.SPEED -> "%.2fx".format(FxController.speedRate(raw))
+        FxKind.COLOR -> FxColor.values().firstOrNull { it.code == raw }?.name ?: "原色"
     }
 
     /** 一路通道变动 → 一次墙板式按键（同格再按 = 下一支，见 applyPanelSource） */
@@ -3552,7 +3563,19 @@ class MainActivity : AppCompatActivity() {
                                 publishAck(cmdId, false, "OFFLINE")
                                 return@post
                             }
+                            if (kind == FxKind.COLOR &&
+                                (!value.isFinite() || value != value.toInt().toFloat() || value !in 0f..6f)
+                            ) {
+                                logToFile("远端色彩值非法：$value", "WARN", "FX", "CONFLICT")
+                                publishAck(cmdId, false, "CONFLICT")
+                                return@post
+                            }
                             val raw = FxController.rawOf(kind, value)
+                            if (kind == FxKind.COLOR && raw == FxColor.MONO.code && Build.VERSION.SDK_INT < 31) {
+                                logToFile("远端黑白特效需要 Android 12", "WARN", "FX", "CONFLICT")
+                                publishAck(cmdId, false, "CONFLICT")
+                                return@post
+                            }
                             when (fx.apply(kind, raw, FxOwner.REMOTE)) {
                                 FxResult.RejectedBusy -> {
                                     logToFile("远端特效 $kind=$value：DMX 正持有，回 BUSY", "INFO", "FX", "BUSY")
@@ -6435,6 +6458,8 @@ class MainActivity : AppCompatActivity() {
         // 副屏那块 LOGO 层跟着根一起作废：解码器不放，白占一路；画布不 shutdown，GL 上下文留着也是漏
         dropLogoLayer(logoAux)
         auxPanelBlackout = null
+        fxCurtainAux = null
+        fxColorAux = null
         auxRoot = null
         auxDisplayId = -1
         val p = auxPresentation ?: return
@@ -7757,7 +7782,55 @@ class MainActivity : AppCompatActivity() {
 
     // ================= 特效层（DMX 通道 2~7 / 远端 fx 动作） =================
     // 实现口径见 docs/dmx-fx-channels.md：黑幕/频闪调 alpha，旋转缩放改窗口容器变换，
-    // LOOP/速度改播放器参数；窗口重建后由 onWindowsRebuilt 重放。全部只在主线程。
+    // LOOP/速度改播放器参数；PAD 色彩保持与窗口重建后由 onWindowsRebuilt 重放。全部只在主线程。
+
+    /** 纯色用不透明覆盖层；黑白只对 TextureView 去色，运维文字与黑幕不跟着变色。 */
+    private fun applyFxColor() {
+        val mono = fxColorCode == FxColor.MONO.code
+        applyMonoEffect(flSurface, mono)
+        applyMonoEffect(auxRoot, mono)
+        val argb = when (fxColorCode) {
+            FxColor.RED.code -> Color.rgb(255, 45, 45)
+            FxColor.ICE_BLUE.code -> Color.rgb(121, 220, 255)
+            FxColor.GREEN.code -> Color.rgb(25, 230, 107)
+            FxColor.MAGENTA.code -> Color.rgb(255, 63, 164)
+            FxColor.GOLD.code -> Color.rgb(255, 208, 46)
+            else -> 0
+        }
+        applyFxColorLayer(flSurface, true, argb)
+        applyFxColorLayer(auxRoot, false, argb)
+    }
+
+    private fun applyMonoEffect(view: View?, on: Boolean) {
+        if (Build.VERSION.SDK_INT < 31) return
+        if (view is TextureView) {
+            view.renderEffect = if (on) {
+                RenderEffect.createColorMatrixEffect(ColorMatrix().apply { setSaturation(0f) })
+            } else null
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) applyMonoEffect(view.getChildAt(i), on)
+        }
+    }
+
+    private fun applyFxColorLayer(root: FrameLayout?, isMain: Boolean, argb: Int) {
+        if (root == null) return
+        val cur = if (isMain) fxColorMain else fxColorAux
+        if (argb == 0) {
+            if (cur != null) {
+                root.removeView(cur)
+                if (isMain) fxColorMain = null else fxColorAux = null
+            }
+            return
+        }
+        val v = cur ?: View(this).apply {
+            isClickable = false
+            root.addView(this, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }
+        v.setBackgroundColor(argb)
+        if (isMain) fxColorMain = v else fxColorAux = v
+    }
 
     /** 黑幕有效 alpha = max(墙板全关, 特效黑场)；频闪再按 50% 占空压到 1/0 */
     private fun updateFxCurtains() {
@@ -7793,10 +7866,13 @@ class MainActivity : AppCompatActivity() {
         if (created) applyDebugUi()
     }
 
-    /** 礼物 < 全关黑布 < 特效黑幕 < 运维文字：窗口重建或礼物起播后统一重排一次 */
+    /** 礼物 < 纯色 < 全关黑布 < 特效黑幕 < 运维文字：窗口重建或礼物起播后统一重排一次 */
     private fun restackFxLayers() {
+        applyFxColor()
         giftMain.container?.bringToFront()
         giftAux.container?.bringToFront()
+        fxColorMain?.bringToFront()
+        fxColorAux?.bringToFront()
         panelBlackout?.bringToFront()
         auxPanelBlackout?.bringToFront()
         fxCurtainMain?.bringToFront()

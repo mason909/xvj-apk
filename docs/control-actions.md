@@ -40,7 +40,7 @@
 | --- | --- | --- | --- |
 | `apply_material` | `scene` A/B、`folder` 1..99、`material` 文件名、`window` main/second | 目标屏上在播这一格的窗口（共享组取基准）换成单只素材 | 只换 playlist，不开第二路解码；切格/重建/墙板照常恢复轮播 |
 | `gift_play` | `scene` A/B、`folder` 1..99、`material` 文件名 | 主/副两块根各一层 luma-key 画布 + 独立解码 | 播完或 12s 自动收层；墙板全关中回 `BUSY` |
-| `fx` | `kind` ∈ BLACKOUT/STROBE/ROTATE/ZOOM/LOOP/SPEED、`value` 浮点 | `FxController.apply(..., REMOTE)` | 与 DMX 同一状态机；DMX 正持有该特效时回 `BUSY` |
+| `fx` | `kind` ∈ BLACKOUT/STROBE/ROTATE/ZOOM/LOOP/SPEED/COLOR、`value` 浮点 | `FxController.apply(..., REMOTE)` | 与 DMX 同一状态机；DMX 正持有该特效时回 `BUSY`；COLOR 只走远端 |
 | `fx_clear` | — | `FxController.releaseAll()` | 全部特效回基线 |
 | `pause_all` | — | 所有窗口播放器 `playWhenReady = false` | 无播放器回 `OFFLINE` |
 | `resume_all` | — | 撤远端黑幕 + 恢复所有播放器 | 黑幕被 DMX 持有回 `BUSY` |
@@ -56,16 +56,20 @@
 | ZOOM | 1..2（倍，绕窗口中心） | 1 |
 | LOOP | ≥0.5 = 开（只循环当前素材） | <0.5 |
 | SPEED | 0.25..2.0 | 1 |
+| COLOR | 整数 0..6：0 原色、1 全红、2 冰蓝、3 黑白、4 全绿、5 玫红、6 金色 | 0 |
+
+COLOR 的 1/2/4/5/6 是**不透明纯色覆盖**，整屏（主屏与副屏）一起变色并保持，不保留素材灰度；3 只把素材 TextureView 去色、保留明暗，黑幕和运维文字不变。0 撤掉覆盖与去色。Android 12 以下黑白回 `CONFLICT`。
 
 未实现（本期不给入口）：`switch_scene`（设备侧没有运行时切幕入口）、任何配置写入（apply_material 不写 config/rev）。
 
 ## 3. 设备侧行为
 
-- **单一落点**：特效只经 `FxController`（`app/src/main/java/com/xvj/app/FxController.kt`），DMX 通道 2..7 与 PAD 的 `fx` 共用它；不存在第二份实现。
-- **层级**（自下而上）：素材窗 < LOGO < 礼物 < 全关黑布/特效黑幕 < 运维文字。礼物与黑幕都是运行期加进两块根，收层/重建后按账重排（`restackFxLayers`）。
+- **单一落点**：特效只经 `FxController`（`app/src/main/java/com/xvj/app/FxController.kt`），DMX 通道 2..7 与 PAD 的 `fx` 共用它；COLOR 不占 DMX 通道，只接受 REMOTE，不存在第二份实现。
+- **层级**（自下而上）：素材窗 < LOGO < 礼物 < 纯色覆盖 < 全关黑布/特效黑幕 < 运维文字。礼物、纯色与黑幕都是运行期加进两块根，收层/重建后按账重排（`restackFxLayers`）。
 - **黑幕合成**：有效 alpha = max(墙板全关 ? 1 : 0, 特效黑场)；频闪在此基础上 50% 占空。墙板全关期间频闪不生效（全关始终盖得住）。
 - **旋转/缩放**：作用在窗口容器（配置的裁剪/旋转/镜像是 TextureView 内部的另一层），绕窗口中心；窗口重建后按覆盖表重放。
-- **LOOP / 速度**：改播放器参数，换清单/重建后由 `playFolderInWindow` 重新落一次；LOOP 释放后回 `loopPlay ? ALL : OFF`。
+- **LOOP / 速度**：改播放器参数，换清单/重建后由 `playFolderInWindow` 重新落一次；LOOP 释放后回 `loopPlay ? ALL : OFF`。这两项仍可由 DMX 使用，但 PAD 已移除对应按钮。
+- **色彩保持**：COLOR 与黑场独立；按住黑场时盖住当前色彩，松手恢复此前保持的色彩。切格、窗口重建、礼物起播与副屏热插拔都会重放色彩层。
 - **不落 config、不进 rev**；退出到桌面 / `stop` / 释放全部窗口时特效与礼物一并释放。
 - **DMX 所有权**：链路 5s 内收过帧且该通道非零 ⇒ DMX 持有，此时 PAD 对同一特效的写回 `BUSY`；链路 3s 收不到帧 ⇒ 全部特效释放并记 `DMX LOST`。
 
@@ -91,3 +95,6 @@
 5. `apply_material` 点 A30 某只 → 目标屏换单只；墙板切格后恢复正常轮播；
 6. `gift_play` → 两屏都出礼物层，播完自动收；全关期间送礼回 `BUSY`；
 7. 断网 2s 后点按 → 云端 503/超时，现场画面不动。
+8. 六色逐个点击：主副屏同时变色且保持；切格、重建、送礼后颜色仍在；五个彩色块不露素材灰度。
+9. 黑白：主副屏素材只去色、明暗仍在，黑幕与 debug 文字不变；原色撤销。
+10. 黑场钢琴键：按下全黑，松手恢复此前保持的色彩；取消触摸也会释放；DMX 持有黑场时 PAD 回 `BUSY`。

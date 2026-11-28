@@ -1,6 +1,6 @@
 # DMX512 特效通道表（XVJ 灯头规格书）
 
-2026-11-25 定。设计已冻结，实现随特效层一起进（当前 APK 只认通道 1）。
+2026-11-25 定。DMX 通道 1 是切格，通道 2~7 是六个特效；PAD 色彩 COLOR 只走远端，不占 DMX 通道。
 
 一句话：**通道 1 是事件（切格），通道 2~7 是状态（特效），一个通道一个特效；0 一律表示"释放/让权"。**
 
@@ -49,11 +49,12 @@
 | 循环 | 特效 LOOP 持有 ⇒ `REPEAT_MODE_ONE`；释放后回 `loopPlay ? ALL : OFF`（config `loop`） |
 | 旋转/缩放 | 配置变换（crop→scale→rotate→flip）之后再叠特效矩阵，绕窗口中心；窗口重建后按覆盖表重放 |
 | 作用域 | 特效作用于**该机所有素材窗**（两块屏），不受格子 `play_settings.dmx` 闸限制 —— 那个闸管的是"这格允许被切"，不是特效能到哪 |
+| PAD 色彩 | COLOR 不占 DMX 通道；1/2/4/5/6 为不透明纯色覆盖，3 为 TextureView 去色，0 回原色；主副屏同步，窗口重建后重放 |
 
 ## 5. 设备侧接口（唯一落点）
 
 ```kotlin
-enum class FxKind { BLACKOUT, STROBE, ROTATE, ZOOM, LOOP, SPEED }
+enum class FxKind { BLACKOUT, STROBE, ROTATE, ZOOM, LOOP, SPEED, COLOR }
 enum class FxOwner { DMX, REMOTE }          // REMOTE = PAD / 云端
 
 sealed interface FxResult {
@@ -71,6 +72,7 @@ interface FxSink {
     fun onZoom(scale: Float)       // 1f = 原样
     fun onLoop(on: Boolean)
     fun onSpeed(rate: Float)       // 1f = 原速
+    fun onColor(code: Int)         // 0 原色；1..6 固定色彩线序，只由 REMOTE 调用
 }
 
 class FxController(private val sink: FxSink) {

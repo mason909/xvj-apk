@@ -8,7 +8,12 @@ import android.os.SystemClock
  *
  * 只允许在主线程调用（sink 直接改 View/Player）。
  */
-enum class FxKind { BLACKOUT, STROBE, ROTATE, ZOOM, LOOP, SPEED }
+enum class FxKind { BLACKOUT, STROBE, ROTATE, ZOOM, LOOP, SPEED, COLOR }
+
+/** PAD 色彩控制面固定线序；0 = 原色，3 = 保留明暗的黑白，其余为不透明纯色。 */
+enum class FxColor(val code: Int) {
+    RED(1), ICE_BLUE(2), MONO(3), GREEN(4), MAGENTA(5), GOLD(6)
+}
 
 enum class FxOwner { DMX, REMOTE }
 
@@ -26,6 +31,7 @@ interface FxSink {
     fun onZoom(scale: Float)
     fun onLoop(on: Boolean)
     fun onSpeed(rate: Float)
+    fun onColor(code: Int)
 }
 
 /** 通道号 - 1 是帧数组下标；通道 1 是切格事件，不在这张表里 */
@@ -82,6 +88,7 @@ class FxController(
                 value <= 1f -> Math.round(1f + (value - 0.25f) / 0.75f * 127f)
                 else -> (128 + Math.round((value - 1f) * 127f)).coerceAtMost(255)
             }
+            FxKind.COLOR -> Math.round(value).takeIf { it in 0..FxColor.values().size } ?: 0
         }.coerceIn(0, 255)
     }
 
@@ -140,6 +147,7 @@ class FxController(
             FxKind.ZOOM -> sink.onZoom(zoomScale(raw))
             FxKind.LOOP -> sink.onLoop(loopOn(raw))
             FxKind.SPEED -> sink.onSpeed(speedRate(raw))
+            FxKind.COLOR -> sink.onColor(raw)
         }
         return if (released) FxResult.Released else FxResult.Applied
     }
@@ -181,6 +189,7 @@ class FxController(
             FxKind.ZOOM -> sink.onZoom(zoomScale(raw))
             FxKind.LOOP -> sink.onLoop(loopOn(raw))
             FxKind.SPEED -> sink.onSpeed(speedRate(raw))
+            FxKind.COLOR -> sink.onColor(raw)
         }
     }
 
