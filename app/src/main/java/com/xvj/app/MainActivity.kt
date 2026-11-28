@@ -180,7 +180,6 @@ import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
-import android.graphics.RenderEffect
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapShader
@@ -367,6 +366,7 @@ class MainActivity : AppCompatActivity() {
     private var fxColorCode = 0
     private var fxColorMain: View? = null
     private var fxColorAux: View? = null
+    private var monoEffectWarned = false
     /** 旋转累计角（度）：每 33ms 累加，释放归零；重建后从 0 起（只保频率不保相位） */
     private var fxAngleDeg = 0f
     /** 频闪 50% 占空的一半相位 */
@@ -7804,9 +7804,20 @@ class MainActivity : AppCompatActivity() {
     private fun applyMonoEffect(view: View?, on: Boolean) {
         if (Build.VERSION.SDK_INT < 31) return
         if (view is TextureView) {
-            view.renderEffect = if (on) {
-                RenderEffect.createColorMatrixEffect(ColorMatrix().apply { setSaturation(0f) })
-            } else null
+            try {
+                // CI 的 android.jar 未暴露 RenderEffect，运行时反射调用 API 31 接口。
+                val effectClass = Class.forName("android.graphics.RenderEffect")
+                val effect = if (on) {
+                    effectClass.getMethod("createColorMatrixEffect", ColorMatrix::class.java)
+                        .invoke(null, ColorMatrix().apply { setSaturation(0f) })
+                } else null
+                View::class.java.getMethod("setRenderEffect", effectClass).invoke(view, effect)
+            } catch (_: ReflectiveOperationException) {
+                if (!monoEffectWarned) {
+                    monoEffectWarned = true
+                    logToFile("黑白特效不可用", "WARN", "FX", "CONFLICT")
+                }
+            }
         }
         if (view is ViewGroup) {
             for (i in 0 until view.childCount) applyMonoEffect(view.getChildAt(i), on)
